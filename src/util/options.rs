@@ -48,6 +48,8 @@ pub enum PlanSelector {
     MarkCompact,
     /// An Immix collector that uses a sticky mark bit to allow generational behaviors without a copying nursery.
     StickyImmix,
+
+    MyGC //<@<@<@<@<@<@<@<@<@<@ GUY ADDED THIS
 }
 
 /// MMTk option for perf events

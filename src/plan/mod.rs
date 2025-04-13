@@ -13,6 +13,8 @@
 //!
 //! For more about implementing a plan, it is recommended to read the [MMTk tutorial](/docs/tutorial/Tutorial.md).
 
+pub mod mygc; //<@<@<@<@<@<@<@<@<@ GUY ADDED THIS
+
 mod barriers;
 pub use barriers::BarrierSelector;
 
