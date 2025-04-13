@@ -29,7 +29,7 @@ Cargo.lock
 /test_mmtk_32
 
 # Generated for testing tutorial code build
-/src/plan/mygc
+# /src/plan/mygc
 
 # Python script cache
 __pycache__
