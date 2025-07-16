@@ -327,6 +327,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     }
 
     fn inc(&self, o: ObjectReference) -> bool {
+
         self.rc.inc(o) == Ok(0)
     }
 

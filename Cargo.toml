@@ -90,6 +90,9 @@ harness = false
 [features]
 # default = ["sanity"]
 default = [
+    "lxr_no_evac",
+    "lxr_stw",
+    "lxr_rc_bits_4",
     "perf_counter",
     "dep:sysinfo",
     "dep:regex",
