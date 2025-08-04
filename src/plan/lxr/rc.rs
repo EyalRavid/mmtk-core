@@ -327,8 +327,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     }
 
     fn inc(&self, o: ObjectReference) -> bool {
-
-        self.rc.inc(o) == Ok(0)
+        let old_val = self.rc.inc(o).unwrap();
+        assert!(old_val < MAX_REF_COUNT - 1);
+        //self.rc.inc(o) == Ok(0)
+        old_val == 0
     }
 
     fn dont_evacuate(&self, o: ObjectReference, los: bool) -> bool {
@@ -1022,6 +1024,11 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             });
             if result == Ok(1) && is_los {
                 lxr.los().rc_free(o);
+            }
+            else if result != Ok(1){
+                //candidate
+                let mut candidates = lxr.cycle_candidates.lock().unwrap();
+                candidates.push(o);
             }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {

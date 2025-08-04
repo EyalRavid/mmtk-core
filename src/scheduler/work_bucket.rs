@@ -357,6 +357,7 @@ pub enum WorkBucketStage {
     /// resources and setting states in plans, spaces, GC workers, mutators, etc.
     Release,
     STWRCDecsAndSweep,
+    CycleCollection,
     /// Resume mutators and end GC.
     Final,
 }

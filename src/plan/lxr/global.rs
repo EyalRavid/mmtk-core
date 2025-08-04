@@ -6,7 +6,7 @@ use crate::mmtk::VM_MAP;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::{BasePlan, CreateGeneralPlanArgs, CreateSpecificPlanArgs};
 use crate::plan::immix::Pause;
-use crate::plan::lxr::gc_work::FastRCPrepare;
+use crate::plan::lxr::gc_work::{CycleCollector, FastRCPrepare};
 use crate::plan::AllocationSemantics;
 use crate::plan::MutatorContext;
 use crate::plan::Plan;
@@ -24,10 +24,11 @@ use crate::util::constants::*;
 use crate::util::copy::*;
 use crate::util::heap::layout::vm_layout::*;
 use crate::util::heap::{PageResource, SpaceStats, VMRequest};
+use crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::metadata::MetadataSpec;
 use crate::util::options::{GCTriggerSelector, Options};
-use crate::util::rc::{RefCountHelper, RC_LOCK_BIT_SPEC, RC_TABLE};
+use crate::util::rc::{RefCountHelper, RC_LOCK_BIT_SPEC, RC_TABLE, STRONG_RC_TABLE};
 #[cfg(feature = "sanity")]
 use crate::util::sanity::sanity_checker::*;
 use crate::util::{metadata, Address, ObjectReference};
@@ -42,7 +43,7 @@ use spin::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::time::SystemTime;
-
+use std::cell::RefCell;
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -97,6 +98,7 @@ pub struct LXR<VM: VMBinding> {
     pub(super) barrier_decs: AtomicUsize,
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
+    pub cycle_candidates: Mutex<Vec<ObjectReference>>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
@@ -542,6 +544,8 @@ impl<VM: VMBinding> LXR<VM> {
                     .extract_side_spec(),
             ),
             MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
+            MetadataSpec::OnSide(OBJ_COLOR_TABLE),
+            //MetadataSpec::OnSide(STRONG_RC_TABLE),
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
         let options = args.options.clone();
@@ -579,6 +583,7 @@ impl<VM: VMBinding> LXR<VM> {
             rc: RefCountHelper::NEW,
             gc_cause: Atomic::new(GCCause::Unknown),
             barrier_decs: AtomicUsize::default(),
+            cycle_candidates: Mutex::new(Vec::new()),
         });
 
         lxr.update_fixed_alloc_trigger();
@@ -913,6 +918,9 @@ impl<VM: VMBinding> LXR<VM> {
         // Release global/collectors/mutators
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<LXRGCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
+
+        // New cycleCollection Phaze. corrently only prints "GOT TO CYCLE COLLECTION PHAZE"
+        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector);
     }
 
     fn dump_memory(&self, pause: Pause) {

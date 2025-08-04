@@ -1,8 +1,10 @@
 use super::cm::LXRWeakRefProcessEdges;
 use super::LXR;
 use crate::scheduler::{gc_work::*, GCWork, GCWorker};
+use crate::util::ObjectReference;
 use crate::{vm::*, Plan, MMTK};
-
+use crate::util::rc::RC_TABLE;
+use atomic::Ordering;
 pub(super) struct LXRGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
 impl<E: ProcessEdgesWork> crate::scheduler::GCWorkContext for LXRGCWorkContext<E> {
@@ -38,5 +40,30 @@ impl<VM: VMBinding> GCWork<VM> for ReleaseLOSNursery {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         lxr.los().release_rc_nursery_objects();
+    }
+}
+
+
+pub struct CycleCollector;
+
+impl<VM: VMBinding> GCWork<VM> for CycleCollector {
+    fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        println!("GOT TO CYCLE COLLECTION PHAZE");
+        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        let candidates = lxr.cycle_candidates.lock().unwrap();
+        for obj in candidates.iter(){
+            //println!("##################");
+            //println!("obj in adress: {} Has rc of: {}", (*obj).to_raw_address(), RC_TABLE.load_atomic::<u16>((*obj).to_raw_address(), Ordering::Relaxed));
+            if RC_TABLE.load_atomic::<u16>((*obj).to_raw_address(), Ordering::Relaxed) > 0{
+                self.mark(*obj);
+            }
+        
+        }  
+    }
+}
+
+impl CycleCollector{
+    fn mark(&self, o: ObjectReference){
+        
     }
 }
