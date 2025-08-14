@@ -92,7 +92,7 @@ harness = false
 default = [
     "lxr_no_evac",
     "lxr_stw",
-    "lxr_rc_bits_4",
+    "lxr_rc_bits_8",
     "perf_counter",
     "dep:sysinfo",
     "dep:regex",

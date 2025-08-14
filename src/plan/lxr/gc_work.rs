@@ -1,10 +1,26 @@
 use super::cm::LXRWeakRefProcessEdges;
-use super::LXR;
+use super::{barrier, LXR};
 use crate::scheduler::{gc_work::*, GCWork, GCWorker};
 use crate::util::ObjectReference;
 use crate::{vm::*, Plan, MMTK};
 use crate::util::rc::RC_TABLE;
+use crate::util::rc::STRONG_RC_TABLE;
+use crate::util::rc::IN_STACK_TABLE;
 use atomic::Ordering;
+use crate::util::rc::OBJ_COLOR_TABLE;
+use crate::util::address::CLDScanPolicy;
+use crate::util::address::RefScanPolicy;
+use std::marker::PhantomData;
+use crate::vm;
+use crate::vm::slot::Slot;
+use crate::util::VMWorkerThread;
+use crate::util::VMThread;
+use crate::plan::SlotIterator;
+use crate::vm::{Scanning, VMBinding};
+use crate::policy::space::Space;
+use crate::policy::immix::block::Block;
+use crate::util::rc::RefCountHelper;
+use crate::vm::slot::MemorySlice;
 pub(super) struct LXRGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
 impl<E: ProcessEdgesWork> crate::scheduler::GCWorkContext for LXRGCWorkContext<E> {
@@ -34,6 +50,7 @@ impl<VM: VMBinding> GCWork<VM> for FastRCPrepare {
     }
 }
 
+
 pub struct ReleaseLOSNursery;
 
 impl<VM: VMBinding> GCWork<VM> for ReleaseLOSNursery {
@@ -44,26 +61,237 @@ impl<VM: VMBinding> GCWork<VM> for ReleaseLOSNursery {
 }
 
 
-pub struct CycleCollector;
 
-impl<VM: VMBinding> GCWork<VM> for CycleCollector {
+
+pub const BLACK: u8 = 0;
+pub const GREY: u8 = 1;
+pub const WHITE: u8 = 2;
+pub struct CycleCollector<VM: VMBinding>{
+    rc : RefCountHelper<VM>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        println!("GOT TO CYCLE COLLECTION PHAZE");
-        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
-        let candidates = lxr.cycle_candidates.lock().unwrap();
-        for obj in candidates.iter(){
-            //println!("##################");
-            //println!("obj in adress: {} Has rc of: {}", (*obj).to_raw_address(), RC_TABLE.load_atomic::<u16>((*obj).to_raw_address(), Ordering::Relaxed));
-            if RC_TABLE.load_atomic::<u16>((*obj).to_raw_address(), Ordering::Relaxed) > 0{
-                self.mark(*obj);
-            }
-        
-        }  
+        // println!("GOT TO CYCLE COLLECTION PHAZE");
+        // let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        // let mut  candidates = lxr.cycle_candidates.lock().unwrap();
+        // let mut real_candidate = Vec::<ObjectReference>::new();
+       
+
+        // // removing from candidates objects with 0 rc (because this objects allready freed)
+        // for obj in candidates.iter(){
+        //     if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
+        //         real_candidate.push(*obj);
+        //     }
+        // }
+        // candidates.clear();
+        // let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+        // let mut real_s_candidate = Vec::<ObjectReference>::new();
+
+        // for obj in s_candidates.iter(){
+        //     if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
+        //         real_s_candidate.push(*obj);
+        //     }
+        // }
+        // s_candidates.clear();
+
+
+        // println!("##################################");
+
+        // println!("num of regular candidates = {}", real_candidate.len());
+        // println!("num of s_rc candidates = {}", real_s_candidate.len());
+
+        // println!("##################################");
+        // println!("REACHED MARK PHAZE");
+        // for obj in real_s_candidate.iter(){
+        //     assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
+        //     self.mark(*obj);
+        // }
+        // println!("REACHED SCAN PHAZE");
+        // for obj in real_s_candidate.iter(){
+        //     self.scan(*obj);
+        // }
+        //  println!("REACHED COLLECT_WHITES PHAZE");
+        //  for obj in real_s_candidate.iter(){
+        //     assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
+        //     self.collect_whites(*obj, lxr);
+        // }
     }
 }
 
-impl CycleCollector{
+impl<VM: VMBinding> CycleCollector<VM>{
+
+    pub fn new()->CycleCollector<VM>{
+        CycleCollector::<VM>{
+            rc: RefCountHelper::NEW
+        }
+    }
+
     fn mark(&self, o: ObjectReference){
+        assert!(RC_TABLE.load_atomic::<u16>(o.to_raw_address(), Ordering::SeqCst) > 0 
+        || OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != BLACK);
+        let mut dfs_stack = Vec::<ObjectReference>::new();
+        dfs_stack.push(o);
+
+        while let Some(curr) = dfs_stack.pop() {
+            let visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
+                if let Some(x) = slot.load(){
+                    let prev = RC_TABLE.fetch_sub_atomic::<u16>(x.to_raw_address(),1 as u16, Ordering::SeqCst);
+                    if prev == 0{
+                        println!("prev = 0, object is;:{}", x);
+                        panic!();
+                    }
+                    dfs_stack.push(x);
+                }
+            };
+            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == BLACK{
+                STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),0, Ordering::SeqCst);
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),GREY, Ordering::SeqCst);
+                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+            }
+            
+        }
+    }
+
+    fn scan(&self, o: ObjectReference){
+        let mut dfs_stack = Vec::<ObjectReference>::new();
+        dfs_stack.push(o);
+
+        while let Some(curr) = dfs_stack.pop(){
+            let visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
+                if let Some(x) = slot.load(){
+                    dfs_stack.push(x);
+                }
+            };
+            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == GREY{
+                if RC_TABLE.load_atomic::<u16>(curr.to_raw_address(), Ordering::SeqCst) > 0{
+                    self.scan_black(curr);
+                }
+                else{
+                    OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),WHITE, Ordering::SeqCst);
+                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                }
+           }
+        }
+    }
+
+
+    fn scan_black(&self, o: ObjectReference){
+        println!("REACHED scan_black PHAZE");
+        let mut dfs_stack = Vec::<ObjectReference>::new();
+        dfs_stack.push(o);
+        while let Some(curr) = dfs_stack.pop(){
+            assert!(RC_TABLE.load_atomic::<u16>(curr.to_raw_address(), Ordering::SeqCst) > 0);
+            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != BLACK{
+                dfs_stack.push(curr);
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK, Ordering::SeqCst);
+                IN_STACK_TABLE.store_atomic::<u8>(curr.to_raw_address(), 1 as u8, Ordering::SeqCst);
+                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
+                    if let Some(x) = slot.load() {
+                        let prev = RC_TABLE.fetch_add_atomic::<u16>(x.to_raw_address(),1 as u16, Ordering::SeqCst);
+                        if RC_TABLE.load_atomic::<u16>(x.to_raw_address(), Ordering::SeqCst) == 0{
+                            println!("prev val = {}", prev);
+                            println!("new val = {}", RC_TABLE.load_atomic::<u16>(x.to_raw_address(), Ordering::SeqCst));
         
+                        }
+                        if IN_STACK_TABLE.load_atomic::<u8>(x.to_raw_address(), Ordering::SeqCst) == 0{
+                            let prev = STRONG_RC_TABLE.fetch_add_atomic::<u8>(x.to_raw_address(),1 as u8, Ordering::SeqCst);
+                            if prev == 255{
+                                STRONG_RC_TABLE.store_atomic::<u8>(x.to_raw_address(),255 as u8, Ordering::SeqCst);
+                            }
+                            dfs_stack.push(x);
+                        }
+                        
+                        
+                    }
+                    
+                });
+                
+            }
+            else{
+
+                IN_STACK_TABLE.store_atomic::<u8>(curr.to_raw_address(), 0 as u8, Ordering::SeqCst);
+            }
+        }
+  
+    }
+    
+
+    fn collect_whites(&self, o: ObjectReference, lxr: &LXR<VM>){
+
+        let mut dfs_stack = Vec::<ObjectReference>::new();
+        dfs_stack.push(o);
+        while let Some(curr) = dfs_stack.pop(){
+            let mut visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
+                if let Some(x) = slot.load() {
+                    dfs_stack.push(x);
+                }
+            };
+            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == WHITE{
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK, Ordering::SeqCst);
+                STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),0 as u8, Ordering::SeqCst);
+                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                self.process_dead_object(o, lxr);
+            }
+        }
+    }
+
+    fn process_dead_object(&self, o: ObjectReference, lxr: &LXR<VM>) -> bool {
+        crate::stat(|s| {
+            s.dead_mature_objects += 1;
+            s.dead_mature_volume += o.get_size::<VM>();
+
+            s.dead_mature_rc_objects += 1;
+            s.dead_mature_rc_volume += o.get_size::<VM>();
+
+            if !lxr.immix_space.in_space(o) {
+                s.dead_mature_los_objects += 1;
+                s.dead_mature_los_volume += o.get_size::<VM>();
+
+                s.dead_mature_rc_los_objects += 1;
+                s.dead_mature_rc_los_volume += o.get_size::<VM>();
+            }
+        });
+        // if self.cm_in_progress {
+        //     let marked = lxr.mark(o);
+        //     if cfg!(feature = "lxr_satb_live_bytes_counter") && marked {
+        //         crate::record_live_bytes(o.get_size::<VM>());
+        //     }
+        // }
+        // println!(" - dead {:?}", o);
+        // debug_assert_eq!(self::count(o), 0);
+        // Recursively decrease field ref counts
+        if false
+            && VM::VMScanning::is_obj_array(o)
+            && VM::VMScanning::obj_array_data(o).bytes() > 1024
+        {
+            // Buggy. Dead array can be recycled at any time.
+            unimplemented!()
+        }
+        let in_ix_space = lxr.immix_space.in_space(o);
+        if !crate::args::BLOCK_ONLY && in_ix_space {
+            self.rc.unmark_straddle_object(o);
+        }
+        if cfg!(feature = "sanity") || ObjectReference::STRICT_VERIFICATION {
+            unsafe { o.to_raw_address().store(0xdeadusize) };
+        }
+        if in_ix_space {
+            if cfg!(feature = "lxr_log_reclaim") {
+                lxr.immix_space
+                    .rc_killed_bytes
+                    .fetch_add(o.get_size::<VM>(), Ordering::Relaxed);
+            }
+            let block = Block::containing(o);
+            lxr.immix_space
+                .add_to_possibly_dead_mature_blocks(block, false);
+            false
+        } else {
+            if cfg!(feature = "lxr_log_reclaim") {
+                lxr.los()
+                    .rc_killed_bytes
+                    .fetch_add(o.get_size::<VM>(), Ordering::Relaxed);
+            }
+            true
+        }
     }
 }

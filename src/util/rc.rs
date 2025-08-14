@@ -44,6 +44,7 @@ pub const RC_STRADDLE_LINES: SideMetadataSpec =
 pub const RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::RC_TABLE;
 pub const STRONG_RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::STRONG_RC_TABLE;
 pub const OBJ_COLOR_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
+pub const IN_STACK_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::IN_STACK_TABLE;
 pub const RC_LOCK_BITS: SideMetadataSpec =
     crate::util::metadata::side_metadata::spec_defs::RC_LOCK_BITS;
 pub const RC_LOCK_BIT_SPEC: MetadataSpec = MetadataSpec::OnSide(RC_LOCK_BITS);

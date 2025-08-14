@@ -28,7 +28,7 @@ use crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::metadata::MetadataSpec;
 use crate::util::options::{GCTriggerSelector, Options};
-use crate::util::rc::{RefCountHelper, RC_LOCK_BIT_SPEC, RC_TABLE, STRONG_RC_TABLE};
+use crate::util::rc::{RefCountHelper, RC_LOCK_BIT_SPEC, RC_TABLE, STRONG_RC_TABLE, IN_STACK_TABLE};
 #[cfg(feature = "sanity")]
 use crate::util::sanity::sanity_checker::*;
 use crate::util::{metadata, Address, ObjectReference};
@@ -43,7 +43,7 @@ use spin::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::time::SystemTime;
-use std::cell::RefCell;
+use std::marker::PhantomData;
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -99,6 +99,7 @@ pub struct LXR<VM: VMBinding> {
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
     pub cycle_candidates: Mutex<Vec<ObjectReference>>,
+    pub s_cycle_candidates: Mutex<Vec<ObjectReference>>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
@@ -219,13 +220,21 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         if true {
             unreachable!();
         }
+        //println!("REACHED schedule_collection");
         if !crate::LazySweepingJobs::all_finished() {
             gc_log!([1] "WARNING: LXR Lazy Sweeping Not Finished");
             crate::counters()
                 .gc_with_unfinished_lazy_jobs
                 .fetch_add(1, Ordering::Relaxed);
         }
+
+        //comented this line and added the two after
         let pause = self.select_collection_kind();
+        // self.wait_for_decide_cycle_collection();
+        // let pause = Pause::RefCount;
+        //########################################3
+
+
         self.update_stats_after_gc_decided(pause);
         // Wait for concurrent packets
         if self.cm_in_progress() && pause == Pause::RefCount {
@@ -535,6 +544,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
 impl<VM: VMBinding> LXR<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Box<Self> {
+        println!("REACHED lxr new()");
         let immix_specs = metadata::extract_side_metadata(&[
             RC_LOCK_BIT_SPEC,
             MetadataSpec::OnSide(RC_TABLE),
@@ -545,7 +555,8 @@ impl<VM: VMBinding> LXR<VM> {
             ),
             MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
             MetadataSpec::OnSide(OBJ_COLOR_TABLE),
-            //MetadataSpec::OnSide(STRONG_RC_TABLE),
+            MetadataSpec::OnSide(IN_STACK_TABLE),
+            MetadataSpec::OnSide(STRONG_RC_TABLE),
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
         let options = args.options.clone();
@@ -584,6 +595,7 @@ impl<VM: VMBinding> LXR<VM> {
             gc_cause: Atomic::new(GCCause::Unknown),
             barrier_decs: AtomicUsize::default(),
             cycle_candidates: Mutex::new(Vec::new()),
+            s_cycle_candidates: Mutex::new(Vec::new()),
         });
 
         lxr.update_fixed_alloc_trigger();
@@ -766,7 +778,7 @@ impl<VM: VMBinding> LXR<VM> {
 
     fn select_collection_kind(&self) -> Pause {
         self.wait_for_decide_cycle_collection();
-
+  
         let emergency = self.base().global_state.is_emergency_collection();
         let user_triggered = self.base().global_state.is_user_triggered_collection();
         let cm_in_progress = self.cm_in_progress();
@@ -900,6 +912,7 @@ impl<VM: VMBinding> LXR<VM> {
     }
 
     fn schedule_rc_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        //println!("REACHED schedule_rc_collection");
         if cfg!(feature = "lxr_fixed_satb_trigger") {
             RC_PAUSES_BEFORE_SATB.fetch_add(1, Ordering::Relaxed);
         }
@@ -920,7 +933,7 @@ impl<VM: VMBinding> LXR<VM> {
             .add(Release::<LXRGCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
 
         // New cycleCollection Phaze. corrently only prints "GOT TO CYCLE COLLECTION PHAZE"
-        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector);
+        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
     }
 
     fn dump_memory(&self, pause: Pause) {
