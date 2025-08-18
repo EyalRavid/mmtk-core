@@ -72,50 +72,64 @@ pub struct CycleCollector<VM: VMBinding>{
 
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        // println!("GOT TO CYCLE COLLECTION PHAZE");
-        // let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
-        // let mut  candidates = lxr.cycle_candidates.lock().unwrap();
-        // let mut real_candidate = Vec::<ObjectReference>::new();
+        println!("GOT TO CYCLE COLLECTION PHAZE");
+        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        let mut  candidates = lxr.cycle_candidates.lock().unwrap();
+        let mut real_candidate = Vec::<ObjectReference>::new();
        
+        println!("##################################");
 
-        // // removing from candidates objects with 0 rc (because this objects allready freed)
-        // for obj in candidates.iter(){
-        //     if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
-        //         real_candidate.push(*obj);
-        //     }
-        // }
-        // candidates.clear();
-        // let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
-        // let mut real_s_candidate = Vec::<ObjectReference>::new();
+        println!("num of regular candidates before dead object removal = {}", candidates.len()); 
+        let mut num_of_dupcs = 0;  
+        // removing from candidates objects with 0 rc (because this objects allready freed)
+        for obj in candidates.iter(){
+            if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
+                if !real_candidate.contains(obj){
+                    real_candidate.push(*obj);
+                }
+                else{
+                    num_of_dupcs +=1 ;
+                }
+                
+            }
+        }
+        println!("num_of_dupcs in regular candidates = {}", num_of_dupcs); 
+        
+        candidates.clear();
+        let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+        let mut real_s_candidate = Vec::<ObjectReference>::new();
 
-        // for obj in s_candidates.iter(){
-        //     if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
-        //         real_s_candidate.push(*obj);
-        //     }
-        // }
-        // s_candidates.clear();
+        for obj in s_candidates.iter(){
+            if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
+                real_s_candidate.push(*obj);
+            }
+        }
+        println!("num of s_rc candidates before dead object removal = {}", s_candidates.len());
 
 
-        // println!("##################################");
+        s_candidates.clear();
 
-        // println!("num of regular candidates = {}", real_candidate.len());
-        // println!("num of s_rc candidates = {}", real_s_candidate.len());
 
-        // println!("##################################");
-        // println!("REACHED MARK PHAZE");
-        // for obj in real_s_candidate.iter(){
-        //     assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
-        //     self.mark(*obj);
-        // }
-        // println!("REACHED SCAN PHAZE");
-        // for obj in real_s_candidate.iter(){
-        //     self.scan(*obj);
-        // }
-        //  println!("REACHED COLLECT_WHITES PHAZE");
-        //  for obj in real_s_candidate.iter(){
-        //     assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
-        //     self.collect_whites(*obj, lxr);
-        // }
+
+
+        println!("num of regular candidates = {}", real_candidate.len());
+        println!("num of s_rc candidates = {}", real_s_candidate.len());
+
+        println!("##################################");
+
+        for obj in real_s_candidate.iter(){
+            assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
+            self.mark(*obj);
+        }
+
+        for obj in real_s_candidate.iter(){
+            self.scan(*obj);
+        }
+
+         for obj in real_s_candidate.iter(){
+            assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
+            self.collect_whites(*obj, lxr);
+        }
     }
 }
 
@@ -136,8 +150,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
         while let Some(curr) = dfs_stack.pop() {
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
                 if let Some(x) = slot.load(){
-                    let prev = RC_TABLE.fetch_sub_atomic::<u16>(x.to_raw_address(),1 as u16, Ordering::SeqCst);
-                    if prev == 0{
+                    let prev = self.rc.dec(x);
+                    if prev == Err(0){
                         println!("prev = 0, object is;:{}", x);
                         panic!();
                     }
@@ -177,7 +191,6 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
 
     fn scan_black(&self, o: ObjectReference){
-        println!("REACHED scan_black PHAZE");
         let mut dfs_stack = Vec::<ObjectReference>::new();
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop(){
@@ -188,9 +201,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 IN_STACK_TABLE.store_atomic::<u8>(curr.to_raw_address(), 1 as u8, Ordering::SeqCst);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = slot.load() {
-                        let prev = RC_TABLE.fetch_add_atomic::<u16>(x.to_raw_address(),1 as u16, Ordering::SeqCst);
+                        let prev = self.rc.inc(x);
                         if RC_TABLE.load_atomic::<u16>(x.to_raw_address(), Ordering::SeqCst) == 0{
-                            println!("prev val = {}", prev);
+                            println!("prev val = {}", prev.unwrap());
                             println!("new val = {}", RC_TABLE.load_atomic::<u16>(x.to_raw_address(), Ordering::SeqCst));
         
                         }

@@ -229,9 +229,9 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         }
 
         //comented this line and added the two after
-        let pause = self.select_collection_kind();
-        // self.wait_for_decide_cycle_collection();
-        // let pause = Pause::RefCount;
+        // let pause = self.select_collection_kind();
+        self.wait_for_decide_cycle_collection();
+        let pause = Pause::RefCount;
         //########################################3
 
 
@@ -544,7 +544,6 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
 impl<VM: VMBinding> LXR<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Box<Self> {
-        println!("REACHED lxr new()");
         let immix_specs = metadata::extract_side_metadata(&[
             RC_LOCK_BIT_SPEC,
             MetadataSpec::OnSide(RC_TABLE),

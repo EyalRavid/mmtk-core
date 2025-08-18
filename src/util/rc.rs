@@ -125,6 +125,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             if x == MAX_REF_COUNT {
+                panic!("object is stack after inc");
                 None
             } else {
                 Some(x + 1)
@@ -166,8 +167,14 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         RC_TABLE.prefetch_write(o.to_raw_address())
     }
 
+    //Eyal changed this function
+    //Originaly was:
+    // pub fn object_or_line_is_dead(&self, o: ObjectReference) -> bool {
+    //     RC_TABLE.load_byte(o.to_raw_address()) == 0
+    // }
     pub fn object_or_line_is_dead(&self, o: ObjectReference) -> bool {
-        RC_TABLE.load_byte(o.to_raw_address()) == 0
+        //RC_TABLE.load_byte(o.to_raw_address()) == 0
+        RC_TABLE.load_atomic::<u16>(o.to_raw_address(), Ordering::Relaxed) == 0
     }
 
     pub fn rc_table_range<UInt: Sized>(&self, b: Block) -> &'static [UInt] {

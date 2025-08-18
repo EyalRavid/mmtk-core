@@ -329,17 +329,17 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     fn inc(&self, o: ObjectReference) -> bool {
         //let old_val = self.rc.inc(o).unwrap();
         let old_val = self.rc.inc(o);
-        match old_val {
-            Ok(value) => {
-                if value > MAX_REF_COUNT/2{
-                    println!("obj = {} and value = {}",o, value);
-                }
+        // match old_val {
+        //     Ok(value) => {
+        //         if value > MAX_REF_COUNT/2{
+        //             println!("obj = {} and value = {}",o, value);
+        //         }
                 
-            }
-            Err(err) => {
-                eprintln!("obj = {} and err = {}", o, err);
-            }
-        }
+        //     }
+        //     Err(err) => {
+        //         eprintln!("obj = {} and err = {}", o, err);
+        //     }
+        // }
         //assert!(old_val < MAX_REF_COUNT - 1);
         //self.rc.inc(o) == Ok(0)
         //old_val == 0
@@ -1021,10 +1021,16 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             // if o.is_null() {
             //     continue;
             // }
-            assert!(self.rc.count(*o) != 0);
             if self.rc.is_dead_or_stuck(*o)
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
+                if self.rc.count(*o) == 0{
+                    panic!("obj is dead in process_decs");
+                }
+                else{
+                    panic!("obj is stuck in process_decs");
+                }
+                
                 continue;
             }
             let o =
@@ -1037,6 +1043,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             let mut is_los = false;
             let result = self.rc.clone().fetch_update(o, |c| {
                 if c == 1 && !dead {
+                    STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(),0 as u8, Ordering::SeqCst);
                     dead = true;
                     is_los = self.process_dead_object(o, lxr);
                 }
@@ -1048,6 +1055,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     Some(c - 1)
                 }
             });
+
             if result == Ok(1) && is_los {
                 lxr.los().rc_free(o);
             }
@@ -1055,16 +1063,17 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 //candidate
                 let mut candidates = lxr.cycle_candidates.lock().unwrap();
                 candidates.push(o);
+                if (STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::SeqCst) == 1){
+                    let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+                    s_candidates.push(o);
+                }
             }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {
                     self.prefetch_object(*o);
                 }
             }
-            if (STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::SeqCst) == 1){
-                let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
-                s_candidates.push(o);
-            }
+
         }
     }
 }
