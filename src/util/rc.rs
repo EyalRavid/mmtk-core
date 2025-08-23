@@ -18,6 +18,11 @@ pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
 pub const REF_COUNT_MASK: u16 = (((1u32 << REF_COUNT_BITS) - 1) & 0xffff) as u16;
 pub const MAX_REF_COUNT: u16 = REF_COUNT_MASK;
 
+
+pub const LOG_STRONG_REF_COUNT_BITS: usize = 3; 
+pub const STRONG_REF_COUNT_BITS: u8 = 1 << LOG_STRONG_REF_COUNT_BITS;
+pub const STRONG_REF_COUNT_MASK: u8 = (((1u16 << STRONG_REF_COUNT_BITS) - 1) & 0xff) as u8;
+pub const MAX_STRONG_REF_COUNT: u8 = STRONG_REF_COUNT_MASK;
 //original code:
 
 // pub const LOG_REF_COUNT_BITS: usize = {
@@ -121,6 +126,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     }
 
     //Eyal change: all u16 was originaly u8
+    //also added the panic
     pub fn inc(&self, o: ObjectReference) -> Result<u16, u16> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
@@ -269,6 +275,18 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         if size > Line::BYTES {
             self.mark_straddle_object_with_size(o, size);
         }
+    }
+
+    //Eyal added this func
+    pub fn strong_rc_inc(&self, o: ObjectReference) -> Result<u8, u8> {
+        let f = |x: u8| -> Option<u8> {
+            if x == MAX_STRONG_REF_COUNT {
+                None
+            } else {
+                Some(x + 1)
+            }
+        };
+        STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
     }
 }
 

@@ -300,11 +300,22 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     self.add_new_slot(slot);
                 } else {
                     if rc != crate::util::rc::MAX_REF_COUNT {
-                        let _ = self.rc.inc(target);
+                        //Eyal changed this
+                        //Originaly was : let _ = self.rc.inc(target);
+                        let result = self.rc.inc(target);
+                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
+                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as u16 <= self.rc.count(target));
                         #[cfg(feature = "measure_rc_rate")]
                         {
                             self.inc_objs += 1;
                         }
+                        //Eyal added this if
+                        if result == Ok(0){
+                            self.rc.strong_rc_inc(target);
+                        }
+                    }
+                    else{
+                        panic!("scan_nursery_object overflowed  inc");
                     }
                     self.record_mature_evac_remset2(obj_in_defrag, slot, target);
                 }
@@ -326,24 +337,16 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         self.new_incs_count = 0;
     }
 
+    //Eyal changed this function.
+    //originaly was a:
+    //self.rc.inc(o) == Ok(0)
     fn inc(&self, o: ObjectReference) -> bool {
-        //let old_val = self.rc.inc(o).unwrap();
-        let old_val = self.rc.inc(o);
-        // match old_val {
-        //     Ok(value) => {
-        //         if value > MAX_REF_COUNT/2{
-        //             println!("obj = {} and value = {}",o, value);
-        //         }
-                
-        //     }
-        //     Err(err) => {
-        //         eprintln!("obj = {} and err = {}", o, err);
-        //     }
-        // }
-        //assert!(old_val < MAX_REF_COUNT - 1);
+        if self.rc.inc(o) == Ok(0){
+            STRONG_RC_TABLE.fetch_add_atomic(o.to_raw_address(), 1 as u8, Ordering::SeqCst);
+            return true;
+        }
+        false
         //self.rc.inc(o) == Ok(0)
-        //old_val == 0
-        old_val == Ok(0)
     }
 
     fn dont_evacuate(&self, o: ObjectReference, los: bool) -> bool {
@@ -393,6 +396,12 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 o
             };
             let promoted = self.inc(new);
+
+            //Eyal added this if
+            if !promoted && KIND == EDGE_KIND_ROOT{
+                self.rc.strong_rc_inc(new);
+            }
+
             if promoted && new == o {
                 self.promote(o, false, los, depth);
             }
@@ -402,13 +411,19 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             if self.inc(o) {
                 self.promote(o, false, los, depth);
             }
+            //Eyal added this if
+            else if KIND == EDGE_KIND_ROOT{
+                self.rc.strong_rc_inc(o);
+            } 
             return o;
         }
         let forwarding_status = object_forwarding::attempt_to_forward::<VM>(o);
         if object_forwarding::state_is_forwarded_or_being_forwarded(forwarding_status) {
             // Object is moved to a new location.
             let new = object_forwarding::spin_and_get_forwarded_object::<VM>(o, forwarding_status);
-            self.inc(new);
+            if !self.inc(new) && KIND == EDGE_KIND_ROOT{
+                self.rc.strong_rc_inc(new);
+            }
             new
         } else {
             let is_nursery = self.rc.count(o) == 0;
@@ -425,13 +440,18 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     self.copy_objs += 1;
                 }
                 if let Some(new) = new {
-                    self.inc(new);
+                    if !self.inc(new) && KIND == EDGE_KIND_ROOT{
+                        self.rc.strong_rc_inc(new);
+                    }
                     self.promote(new, true, false, depth);
                     new
                 } else {
                     gc_log!([1] "to-space overflow");
                     // Object is not moved.
                     let promoted = self.inc(o);
+                    if !promoted && KIND == EDGE_KIND_ROOT{
+                        self.rc.strong_rc_inc(o);
+                    }
                     object_forwarding::clear_forwarding_bits::<VM>(o);
                     if promoted {
                         self.promote(o, false, los, depth);
@@ -443,6 +463,9 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             } else {
                 // Object is not moved.
                 let promoted = self.inc(o);
+                if !promoted && KIND == EDGE_KIND_ROOT{
+                    self.rc.strong_rc_inc(o);
+                }
                 object_forwarding::clear_forwarding_bits::<VM>(o);
                 if promoted {
                     self.promote(o, false, los, depth);
@@ -482,17 +505,11 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         // println!(" - inc {:?}: {:?} rc={}", s, o, self.rc.count(o));
         o.verify::<VM>();
         let new = self.process_inc_and_evacuate(o, depth);
+        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
+        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) as u16 <= self.rc.count(new));
         // Put this into remset if this is a mature slot, or a weak root
         if K != EDGE_KIND_ROOT || add_root_to_remset {
             self.record_mature_evac_remset(s, new);
-        }
-
-        //Eyal added that
-        if K == EDGE_KIND_ROOT ||  STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) == 0{
-            let old = STRONG_RC_TABLE.fetch_add_atomic::<u8>(new.to_raw_address(),1 as u8, Ordering::SeqCst);
-            if old == 255{
-                STRONG_RC_TABLE.store_atomic::<u8>(new.to_raw_address(),255 as u8, Ordering::SeqCst);
-            }
         }
         if new != o {
             // gc_log!(
@@ -503,6 +520,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             //     self.rc.count(new),
             //     K
             // );
+            panic!("object was copied");
             s.store(Some(new))
         } else {
             // gc_log!(
@@ -1049,6 +1067,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 }
                 debug_assert!(c <= MAX_REF_COUNT);
                 if c == 0 || c == MAX_REF_COUNT {
+                    //Eyal added this panic
                     panic!();
                     None /* sticky */
                 } else {
@@ -1063,10 +1082,16 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 //candidate
                 let mut candidates = lxr.cycle_candidates.lock().unwrap();
                 candidates.push(o);
-                if (STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::SeqCst) == 1){
-                    let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+                let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+                let s_rc_prev_val = STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::SeqCst);
+                if (s_rc_prev_val == 1){
                     s_candidates.push(o);
+                    debug_assert!(s_candidates.contains(&o));
+                    debug_assert!(STRONG_RC_TABLE.load_atomic(o.to_raw_address(), Ordering::SeqCst) == 0);
                 }
+                debug_assert!(s_rc_prev_val != 0 || s_candidates.contains(&o));
+                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) as u16 <= self.rc.count(o) 
+                            || s_candidates.contains(&o));
             }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {

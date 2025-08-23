@@ -522,6 +522,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     fn discover_reference(&self, reference: ObjectReference, referent: ObjectReference) {
         // Keep weak references and referents alive during SATB.
         // They can only be swept by mature sweeping.
+
         let _ = self.rc.inc(reference);
         let _ = self.rc.inc(referent);
     }
