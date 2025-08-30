@@ -19,7 +19,7 @@ pub const REF_COUNT_MASK: u16 = (((1u32 << REF_COUNT_BITS) - 1) & 0xffff) as u16
 pub const MAX_REF_COUNT: u16 = REF_COUNT_MASK;
 
 
-pub const LOG_STRONG_REF_COUNT_BITS: usize = 3; 
+pub const LOG_STRONG_REF_COUNT_BITS: usize = 1; 
 pub const STRONG_REF_COUNT_BITS: u8 = 1 << LOG_STRONG_REF_COUNT_BITS;
 pub const STRONG_REF_COUNT_MASK: u8 = (((1u16 << STRONG_REF_COUNT_BITS) - 1) & 0xff) as u8;
 pub const MAX_STRONG_REF_COUNT: u8 = STRONG_REF_COUNT_MASK;

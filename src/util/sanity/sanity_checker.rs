@@ -11,7 +11,10 @@ use crate::{scheduler::*, ObjectQueue};
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU8, Ordering};
-
+use crate::util::rc::{IN_STACK_TABLE, MAX_REF_COUNT, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, RC_TABLE, STRONG_RC_TABLE};
+use crate::util::heap::chunk_map::ChunkState;
+use crate::util::linear_scan::Region;
+use crate::util::rc;
 #[allow(dead_code)]
 pub struct SanityChecker<SL: Slot> {
     /// Visited objects
@@ -65,6 +68,7 @@ impl<P: Plan> ScheduleSanityGC<P> {
 
 impl<P: Plan> GCWork<P::VM> for ScheduleSanityGC<P> {
     fn do_work(&mut self, worker: &mut GCWorker<P::VM>, mmtk: &'static MMTK<P::VM>) {
+        println!("reached sanity");
         let scheduler = worker.scheduler();
         let plan = mmtk.get_plan();
 
@@ -99,18 +103,29 @@ impl<P: Plan> GCWork<P::VM> for ScheduleSanityGC<P> {
                 w.root_kind = Some(*kind);
                 scheduler.work_buckets[WorkBucketStage::Closure].add(w);
             }
+
+            //this was the original loop (note the parameters of new):
+            // for roots in &sanity_checker.root_nodes {
+            //     scheduler.work_buckets[WorkBucketStage::Closure].add(ProcessRootNode::<
+            //         P::VM,
+            //         SanityGCProcessEdges<P::VM>,
+            //         SanityGCProcessEdges<P::VM>,
+            //     >::new(
+            //         roots.clone(),
+            //         false,
+            //         false,
+            //         false,
+            //         WorkBucketStage::Closure,
+            //     ));
+            //}
+            //Eyal added this:
             for roots in &sanity_checker.root_nodes {
+                panic!("there is root_node");
                 scheduler.work_buckets[WorkBucketStage::Closure].add(ProcessRootNode::<
                     P::VM,
                     SanityGCProcessEdges<P::VM>,
                     SanityGCProcessEdges<P::VM>,
-                >::new(
-                    roots.clone(),
-                    false,
-                    false,
-                    false,
-                    WorkBucketStage::Closure,
-                ));
+                >::new(roots.clone(), WorkBucketStage::Closure));
             }
         }
         // Prepare global/collectors/mutators
@@ -173,6 +188,40 @@ impl<P: Plan> SanityRelease<P> {
 impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
     fn do_work(&mut self, _worker: &mut GCWorker<P::VM>, mmtk: &'static MMTK<P::VM>) {
         info!("Sanity GC release");
+        if let Some(lxr) = mmtk
+            .get_plan()
+            .downcast_ref::<crate::plan::lxr::LXR<P::VM>>()
+        {
+            let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
+            for (obj, rc) in rc_sanity_objects.iter() {
+                let real_rc = lxr.rc.count(*obj);
+                //println!("object: {} has real rc of: {}", obj.to_raw_address(), real_rc);
+                //println!("object: {} has acording to scan: {}", obj.to_raw_address(), *rc);
+                assert!(real_rc == *rc);
+            }
+            for chunk in lxr.immix_space.chunk_map.all_chunks()
+            .filter(|c| lxr.immix_space.chunk_map.get(*c) == ChunkState::Allocated){
+                for block in chunk.iter_region::<Block>().filter(|block| block.get_state() != BlockState::Unallocated) {
+                    let mut cursor = block.start();
+                    let limit = block.end();
+                    while cursor < limit {
+                        let o = unsafe { cursor.to_object_reference::<P::VM>() };
+                        let mark_state = MARK_STATE.load(Ordering::SeqCst);
+                        let old_value = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
+                        cursor = cursor + rc::MIN_OBJECT_SIZE;
+                        let c = lxr.rc.count(o);
+                        assert!(c <= 1 || old_value == mark_state)
+                        
+                    }
+                }
+            }
+
+
+            rc_sanity_objects.clear();
+        }
+        else{
+            panic!("no lxr");
+        }
         mmtk.sanity_checker.lock().unwrap().clear_roots_cache();
         mmtk.sanity_end();
     }
@@ -181,7 +230,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
 // #[derive(Default)]
 pub struct SanityGCProcessEdges<VM: VMBinding> {
     base: ProcessEdgesBase<VM>,
-    edge: Option<VM::VMEdge>,
+    edge: Option<VM::VMSlot>,
 }
 
 impl<VM: VMBinding> Deref for SanityGCProcessEdges<VM> {
@@ -239,12 +288,20 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
         }
     }
 
-    fn process_edge(&mut self, slot: EdgeOf<Self>) {
-        let object = slot.load();
+    //Eyal chanched this
+    //this func was process_edge
+    //The declartion was:
+    //fn process_edge(&mut self, slot: EdgeOf<Self>)
+    fn process_slot(&mut self, slot: SlotOf<Self>) {
         self.edge = Some(slot);
+
+        let Some(object) = slot.load() else {
+            // Skip slots that are not holding an object reference.
+            return;
+        };
         let new_object = self.trace_object(object);
-        if Self::OVERWRITE_REFERENCE {
-            slot.store(new_object);
+        if Self::OVERWRITE_REFERENCE && new_object != object {
+            slot.store(Some(new_object));
         }
     }
 
@@ -275,11 +332,17 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
         //     self.roots,
         //     self.root_kind
         // );
-        if let Some(_lxr) = self
+        if let Some(lxr) = self
             .mmtk()
             .get_plan()
             .downcast_ref::<crate::plan::lxr::LXR<VM>>()
         {
+            let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
+            for (obj, rc) in rc_sanity_objects.iter_mut() {
+                if (*obj == object){
+                    *rc += 1;
+                } 
+            }
             if self.edge.unwrap().to_address().is_mapped() {
                 assert!(
                     !self.edge.unwrap().to_address().is_field_logged::<VM>(),
@@ -289,10 +352,15 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                 );
             }
         }
-        if object.is_null() {
-            return object;
+        else{
+            panic!("no lxr");
         }
+        //Eyal commented this lines beacuse object should be null
+        // if object.is_null() {
+        //     return object;
+        // }
         if self.attempt_mark(object) {
+
             // FIXME steveb consider VM-specific integrity check on reference.
             assert!(object.is_sane(), "Invalid reference {:?}", object);
 
@@ -326,6 +394,7 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                     self.edge,
                     object
                 );
+
                 assert!(
                     !crate::util::object_forwarding::is_forwarded_or_being_forwarded::<VM>(object),
                     "{:?} -> {:?} is forwarded",
@@ -356,6 +425,8 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                         self.root_kind,
                     )
                 }
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0);
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as u16 <= lxr.rc.count(object));
             }
             self.nodes.enqueue(object);
         }

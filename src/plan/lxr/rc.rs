@@ -303,6 +303,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                         //Eyal changed this
                         //Originaly was : let _ = self.rc.inc(target);
                         let result = self.rc.inc(target);
+                        debug_assert!(self.rc.count(target) != crate::util::rc::MAX_REF_COUNT);
                         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
                         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as u16 <= self.rc.count(target));
                         #[cfg(feature = "measure_rc_rate")]
@@ -312,6 +313,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                         //Eyal added this if
                         if result == Ok(0){
                             self.rc.strong_rc_inc(target);
+                            panic!("sohuld never reach here");
                         }
                     }
                     else{
@@ -505,6 +507,15 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         // println!(" - inc {:?}: {:?} rc={}", s, o, self.rc.count(o));
         o.verify::<VM>();
         let new = self.process_inc_and_evacuate(o, depth);
+
+        #[cfg(feature = "sanity")]
+        if self.rc.count(new) > MAX_REF_COUNT/ 80{
+            let mut rc_sanity_objects = self.lxr.rc_sanity_objects.lock().unwrap();
+            if !rc_sanity_objects.contains(&(new, 0 as u16)){
+                rc_sanity_objects.push((new, 0 as u16));
+            }
+        }
+
         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) as u16 <= self.rc.count(new));
         // Put this into remset if this is a mature slot, or a weak root
@@ -1087,7 +1098,15 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 if (s_rc_prev_val == 1){
                     s_candidates.push(o);
                     debug_assert!(s_candidates.contains(&o));
-                    debug_assert!(STRONG_RC_TABLE.load_atomic(o.to_raw_address(), Ordering::SeqCst) == 0);
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
+                    #[cfg(feature = "sanity")]
+                    {
+                        let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
+                        if !rc_sanity_objects.contains(&(o, 0 as u16)){
+                            rc_sanity_objects.push((o, 0 as u16));
+                        }
+                        
+                    }
                 }
                 debug_assert!(s_rc_prev_val != 0 || s_candidates.contains(&o));
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) as u16 <= self.rc.count(o) 
@@ -1180,7 +1199,7 @@ impl<VM: VMBinding> ProcessEdgesWork for RCImmixCollectRootEdges<VM> {
         if !self.slots.is_empty() {
             #[cfg(feature = "sanity")]
             if self.roots
-                && !self.mmtk().get_plan().is_in_sanity()
+                && !self.mmtk().is_in_sanity()
                 && (cfg!(feature = "fragmentation_analysis") || crate::frag_exp_enabled())
                 && self.root_kind != Some(RootKind::Weak)
             {

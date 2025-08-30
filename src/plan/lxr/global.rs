@@ -100,6 +100,8 @@ pub struct LXR<VM: VMBinding> {
     gc_cause: Atomic<GCCause>,
     pub cycle_candidates: Mutex<Vec<ObjectReference>>,
     pub s_cycle_candidates: Mutex<Vec<ObjectReference>>,
+    #[cfg(feature = "sanity")]
+    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u16)>>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
@@ -275,10 +277,16 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             scheduler.work_buckets[WorkBucketStage::Final].add(ScheduleSanityGC::<Self>::new(self));
         }
 
+        //was:
+        // if cfg!(feature = "fragmentation_analysis")
+        //     && pause == Pause::RefCount
+        //     && crate::frag_exp_enabled()
+        // {
+        //     scheduler.work_buckets[WorkBucketStage::Final].add(ScheduleSanityGC::<Self>::new(self));
+        // }
+        //Eyal added this
         #[cfg(feature = "sanity")]
-        if cfg!(feature = "fragmentation_analysis")
-            && pause == Pause::RefCount
-            && crate::frag_exp_enabled()
+        if pause == Pause::RefCount
         {
             scheduler.work_buckets[WorkBucketStage::Final].add(ScheduleSanityGC::<Self>::new(self));
         }
@@ -522,7 +530,8 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     fn discover_reference(&self, reference: ObjectReference, referent: ObjectReference) {
         // Keep weak references and referents alive during SATB.
         // They can only be swept by mature sweeping.
-
+        //Eyal added the next line
+        panic!("reached discover_reference");
         let _ = self.rc.inc(reference);
         let _ = self.rc.inc(referent);
     }
@@ -596,6 +605,8 @@ impl<VM: VMBinding> LXR<VM> {
             barrier_decs: AtomicUsize::default(),
             cycle_candidates: Mutex::new(Vec::new()),
             s_cycle_candidates: Mutex::new(Vec::new()),
+            #[cfg(feature = "sanity")]
+            rc_sanity_objects: Mutex::new(Vec::new()),
         });
 
         lxr.update_fixed_alloc_trigger();

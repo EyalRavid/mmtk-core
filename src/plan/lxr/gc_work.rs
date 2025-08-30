@@ -98,9 +98,13 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 
         for obj in s_candidates.iter(){
             if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
-                real_s_candidate.push(*obj);
+                if !real_s_candidate.contains(obj){
+                    real_s_candidate.push(*obj);
+                }
+                
             }
         }
+        
         println!("num of s_rc candidates before dead object removal = {}", s_candidates.len());
 
 
@@ -301,4 +305,5 @@ impl<VM: VMBinding> CycleCollector<VM>{
             true
         }
     }
+
 }
