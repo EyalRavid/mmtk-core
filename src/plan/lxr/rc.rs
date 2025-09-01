@@ -310,11 +310,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                         {
                             self.inc_objs += 1;
                         }
-                        //Eyal added this if
-                        if result == Ok(0){
-                            self.rc.strong_rc_inc(target);
-                            panic!("sohuld never reach here");
-                        }
+                        //Eyal added this debug_assert
+                        debug_assert!(result != Ok(0));
                     }
                     else{
                         panic!("scan_nursery_object overflowed  inc");

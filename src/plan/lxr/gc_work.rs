@@ -193,13 +193,13 @@ impl<VM: VMBinding> CycleCollector<VM>{
     fn scan_black(&self, o: ObjectReference){
         let mut dfs_stack = Vec::<ObjectReference>::new();
         dfs_stack.push(o);
-        while let Some(curr) = dfs_stack.pop(){
-            debug_assert!(self.rc.count(curr) > 0);
+        while let Some(curr) = dfs_stack.last(){
+            debug_assert!(self.rc.count(*curr) > 0);
             if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != BLACK{
-                dfs_stack.push(curr);
+                debug_assert!(IN_STACK_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                 OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK, Ordering::SeqCst);
                 IN_STACK_TABLE.store_atomic::<u8>(curr.to_raw_address(), 1 as u8, Ordering::SeqCst);
-                let s_rc = self.rc.count(curr);
+                let s_rc = self.rc.count(*curr);
                 if s_rc > MAX_STRONG_REF_COUNT as u16{
                     STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::SeqCst);
                 }
@@ -221,6 +221,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             else{
                 IN_STACK_TABLE.store_atomic::<u8>(curr.to_raw_address(), 0 as u8, Ordering::SeqCst);
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != 0);
+                dfs_stack.pop();
             }
         }
   

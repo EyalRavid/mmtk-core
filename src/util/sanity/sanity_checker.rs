@@ -15,6 +15,7 @@ use crate::util::rc::{IN_STACK_TABLE, MAX_REF_COUNT, MAX_STRONG_REF_COUNT, OBJ_C
 use crate::util::heap::chunk_map::ChunkState;
 use crate::util::linear_scan::Region;
 use crate::util::rc;
+use crate::policy::immix::line::Line;
 #[allow(dead_code)]
 pub struct SanityChecker<SL: Slot> {
     /// Visited objects
@@ -207,17 +208,39 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                     while cursor < limit {
                         let o = unsafe { cursor.to_object_reference::<P::VM>() };
                         let mark_state = MARK_STATE.load(Ordering::SeqCst);
-                        let old_value = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-                        cursor = cursor + rc::MIN_OBJECT_SIZE;
-                        let c = lxr.rc.count(o);
-                        assert!(c <= 1 || old_value == mark_state)
+                        let mark_val = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
+                        // if lxr.rc.count(o) > 1 || STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 {
+                        if lxr.rc.count(o) > 0 &&
+                            (!Line::is_aligned(o.to_raw_address()) || !lxr.rc.is_straddle_line(Line::from(o.to_raw_address()))) {
+                
+                            let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);
+                            cursor = cursor + size;
+                            assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0);
+                            assert!(cursor <= limit);
+                            assert!(mark_val == mark_state, "size is, {}", size);
+                        }
+                        else{
+                            cursor = cursor + rc::MIN_OBJECT_SIZE;
+                        }
                         
+                        //let c = lxr.rc.count(o);
+                        //assert!(c <= 1 || old_value == mark_state);
+                        //assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0 || mark_val == mark_state);
                     }
                 }
             }
-
-
             rc_sanity_objects.clear();
+
+            let is_live = |o: ObjectReference| -> bool {
+                assert!(lxr.rc.count(o) > 0);
+                let mark_state = MARK_STATE.load(Ordering::SeqCst);
+                let mark_val = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
+                assert!(mark_val == mark_state);
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0);
+                true
+            };
+
+            lxr.common.los.sweep_rc_mature_objects_after_satb(&is_live); 
         }
         else{
             panic!("no lxr");
@@ -382,6 +405,8 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                 .get_plan()
                 .downcast_ref::<crate::plan::lxr::LXR<VM>>()
             {
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0);
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as u16 <= lxr.rc.count(object));
                 assert!(
                     unsafe { object.to_raw_address().load::<usize>() } != 0xdead,
                     "{:?} -> {:?} is killed by decs",
@@ -425,8 +450,7 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                         self.root_kind,
                     )
                 }
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0);
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as u16 <= lxr.rc.count(object));
+
             }
             self.nodes.enqueue(object);
         }
