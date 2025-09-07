@@ -299,11 +299,11 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
                     self.add_new_slot(slot);
                 } else {
+                    debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
                     if rc != crate::util::rc::MAX_REF_COUNT {
                         //Eyal changed this
                         //Originaly was : let _ = self.rc.inc(target);
                         let result = self.rc.inc(target);
-                        debug_assert!(self.rc.count(target) != crate::util::rc::MAX_REF_COUNT);
                         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
                         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as u16 <= self.rc.count(target));
                         #[cfg(feature = "measure_rc_rate")]
@@ -312,9 +312,6 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                         }
                         //Eyal added this debug_assert
                         debug_assert!(result != Ok(0));
-                    }
-                    else{
-                        panic!("scan_nursery_object overflowed  inc");
                     }
                     self.record_mature_evac_remset2(obj_in_defrag, slot, target);
                 }
@@ -1050,13 +1047,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             if self.rc.is_dead_or_stuck(*o)
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
-                if self.rc.count(*o) == 0{
-                    panic!("obj is dead in process_decs");
-                }
-                else{
-                    panic!("obj is stuck in process_decs");
-                }
-                
+                debug_assert!(self.rc.count(*o) != 0);
+                debug_assert!(self.rc.count(*o) != MAX_REF_COUNT);
                 continue;
             }
             let o =
@@ -1087,9 +1079,14 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 lxr.los().rc_free(o);
             }
             else if result != Ok(1){
-                //candidate
-                let mut candidates = lxr.cycle_candidates.lock().unwrap();
-                candidates.push(o);
+
+                //regular candidate
+                #[cfg(feature = "sanity")]
+                {
+                    let mut candidates = lxr.cycle_candidates.lock().unwrap();
+                    candidates.push(o);
+                }
+
                 let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
                 let s_rc_prev_val = STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::SeqCst);
                 if (s_rc_prev_val == 1){

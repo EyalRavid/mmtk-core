@@ -98,8 +98,9 @@ pub struct LXR<VM: VMBinding> {
     pub(super) barrier_decs: AtomicUsize,
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
-    pub cycle_candidates: Mutex<Vec<ObjectReference>>,
     pub s_cycle_candidates: Mutex<Vec<ObjectReference>>,
+    #[cfg(feature = "sanity")]
+    pub cycle_candidates: Mutex<Vec<ObjectReference>>,
     #[cfg(feature = "sanity")]
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u16)>>,
 }
@@ -603,8 +604,9 @@ impl<VM: VMBinding> LXR<VM> {
             rc: RefCountHelper::NEW,
             gc_cause: Atomic::new(GCCause::Unknown),
             barrier_decs: AtomicUsize::default(),
-            cycle_candidates: Mutex::new(Vec::new()),
             s_cycle_candidates: Mutex::new(Vec::new()),
+            #[cfg(feature = "sanity")]
+            cycle_candidates: Mutex::new(Vec::new()),
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),
         });

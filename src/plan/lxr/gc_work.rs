@@ -69,33 +69,10 @@ pub struct CycleCollector<VM: VMBinding>{
 
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        println!("GOT TO CYCLE COLLECTION PHAZE");
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
-        let mut  candidates = lxr.cycle_candidates.lock().unwrap();
-        let mut real_candidate = Vec::<ObjectReference>::new();
-       
-        println!("##################################");
-
-        println!("num of regular candidates before dead object removal = {}", candidates.len()); 
-        let mut num_of_dupcs = 0;  
-        // removing from candidates objects with 0 rc (because this objects allready freed)
-        for obj in candidates.iter(){
-            if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
-                if !real_candidate.contains(obj){
-                    real_candidate.push(*obj);
-                }
-                else{
-                    num_of_dupcs +=1 ;
-                }
-                
-            }
-        }
-        println!("num_of_dupcs in regular candidates = {}", num_of_dupcs); 
-        
-        candidates.clear();
         let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
         let mut real_s_candidate = Vec::<ObjectReference>::new();
-
+        
         for obj in s_candidates.iter(){
             if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
                 if !real_s_candidate.contains(obj){
@@ -104,19 +81,36 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 
             }
         }
-        
-        println!("num of s_rc candidates before dead object removal = {}", s_candidates.len());
-
 
         s_candidates.clear();
 
-
-
-
-        println!("num of regular candidates = {}", real_candidate.len());
-        println!("num of s_rc candidates = {}", real_s_candidate.len());
-
-        println!("##################################");
+        #[cfg(feature = "sanity")]
+        {
+            println!("GOT TO CYCLE COLLECTION PHAZE");
+            let mut  candidates = lxr.cycle_candidates.lock().unwrap();
+            let mut real_candidate = Vec::<ObjectReference>::new();
+            println!("##################################");
+            println!("num of regular candidates before dead object removal = {}", candidates.len()); 
+            let mut num_of_dupcs = 0;  
+            // removing from candidates objects with 0 rc (because this objects allready freed)
+            for obj in candidates.iter(){
+                if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
+                    if !real_candidate.contains(obj){
+                        real_candidate.push(*obj);
+                    }
+                    else{
+                        num_of_dupcs +=1 ;
+                    }
+                    
+                }
+            }
+            println!("num_of_dupcs in regular candidates = {}", num_of_dupcs); 
+            println!("num of s_rc candidates before dead object removal = {}", s_candidates.len());
+            println!("num of regular candidates = {}", real_candidate.len());
+            println!("num of s_rc candidates = {}", real_s_candidate.len());
+            println!("##################################");
+            
+        }
 
         for obj in real_s_candidate.iter(){
             assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
@@ -209,7 +203,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = slot.load() {
                         debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
-                        let prev = self.rc.inc(x);
+                        let _prev = self.rc.inc(x);
                         if IN_STACK_TABLE.load_atomic::<u8>(x.to_raw_address(), Ordering::SeqCst) == 0{
                             self.rc.strong_rc_inc(x);
                             dfs_stack.push(x);
