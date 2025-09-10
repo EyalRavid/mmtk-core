@@ -231,7 +231,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        //comented this line and added the two after
+        //comented this line and added the two lines after
         // let pause = self.select_collection_kind();
         self.wait_for_decide_cycle_collection();
         let pause = Pause::RefCount;
@@ -712,6 +712,7 @@ impl<VM: VMBinding> LXR<VM> {
         let hint_emergency_gc =
             self.next_gc_is_emergency_gc(total_pages, mature_space_pages, emergency_threshold);
         // Update states
+        //change this bool to false
         self.hint_cycle_gc.store(hint_cycle_gc, Ordering::SeqCst);
         self.hint_emergency_gc
             .store(hint_emergency_gc, Ordering::SeqCst);

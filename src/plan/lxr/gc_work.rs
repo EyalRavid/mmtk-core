@@ -74,7 +74,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         let mut real_s_candidate = Vec::<ObjectReference>::new();
         
         for obj in s_candidates.iter(){
-            if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
+            if lxr.rc.count(*obj) > 0{
                 if !real_s_candidate.contains(obj){
                     real_s_candidate.push(*obj);
                 }
@@ -94,7 +94,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             let mut num_of_dupcs = 0;  
             // removing from candidates objects with 0 rc (because this objects allready freed)
             for obj in candidates.iter(){
-                if RC_TABLE.load_atomic::<u16>(obj.to_raw_address(), Ordering::SeqCst) > 0{
+                if lxr.rc.count(*obj) > 0{
                     if !real_candidate.contains(obj){
                         real_candidate.push(*obj);
                     }
@@ -137,7 +137,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
 
     fn mark(&self, o: ObjectReference){
-        debug_assert!(RC_TABLE.load_atomic::<u16>(o.to_raw_address(), Ordering::SeqCst) > 0 
+        debug_assert!(RefCountHelper::<VM>::NEW.count(o) > 0 
         || OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == GREY);
         let mut dfs_stack = Vec::<ObjectReference>::new();
         dfs_stack.push(o);
@@ -172,7 +172,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             };
             if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == GREY{
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                if RC_TABLE.load_atomic::<u16>(curr.to_raw_address(), Ordering::SeqCst) > 0{
+                if RefCountHelper::<VM>::NEW.count(curr) > 0{
                     self.scan_black(curr);
                 }
                 else{
@@ -235,7 +235,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == WHITE{
                 OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK, Ordering::SeqCst);
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                debug_assert!(RC_TABLE.load_atomic::<u16>(curr.to_raw_address(), Ordering::SeqCst) == 0);
+                debug_assert!(lxr.rc.count(curr) == 0);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 self.process_dead_object(o, lxr);
             }
