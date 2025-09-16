@@ -237,7 +237,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                 debug_assert!(lxr.rc.count(curr) == 0);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
-                self.process_dead_object(o, lxr);
+                self.process_dead_object(curr, lxr);
             }
         }
     }

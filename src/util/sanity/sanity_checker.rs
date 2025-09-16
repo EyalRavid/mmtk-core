@@ -198,7 +198,14 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                 let real_rc = lxr.rc.count(*obj);
                 //println!("object: {} has real rc of: {}", obj.to_raw_address(), real_rc);
                 //println!("object: {} has acording to scan: {}", obj.to_raw_address(), *rc);
-                assert!(real_rc == *rc);
+                if lxr.rc.is_stuck(*obj){
+                    println!("stuck object in sanity!!!!!!!!!!!");
+                    assert!(*rc > 0);
+                }
+                else{
+                    assert!(real_rc == *rc);
+                }
+                
             }
             for chunk in lxr.immix_space.chunk_map.all_chunks()
             .filter(|c| lxr.immix_space.chunk_map.get(*c) == ChunkState::Allocated){
