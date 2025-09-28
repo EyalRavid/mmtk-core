@@ -297,6 +297,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     .rc_killed_bytes
                     .fetch_add(o.get_size::<VM>(), Ordering::Relaxed);
             }
+            lxr.los().rc_free(o);
             true
         }
     }

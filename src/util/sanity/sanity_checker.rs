@@ -138,7 +138,7 @@ impl<P: Plan> GCWork<P::VM> for ScheduleSanityGC<P> {
     }
 }
 
-static MARK_STATE: AtomicU8 = AtomicU8::new(0);
+pub static MARK_STATE: AtomicU8 = AtomicU8::new(0);
 const MARK_BITS: SideMetadataSpec =
     crate::util::metadata::side_metadata::spec_defs::SANITY_MARK_BITS;
 
@@ -193,6 +193,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
             .get_plan()
             .downcast_ref::<crate::plan::lxr::LXR<P::VM>>()
         {
+            lxr.los().sanity_sweep_largeObjectst();
             let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
             for (obj, rc) in rc_sanity_objects.iter() {
                 let real_rc = lxr.rc.count(*obj);
