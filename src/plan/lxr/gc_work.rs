@@ -82,7 +82,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             }
         }
 
-        s_candidates.clear();
+       
 
         #[cfg(feature = "sanity")]
         {
@@ -111,7 +111,8 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             println!("##################################");
             
         }
-
+        s_candidates.clear();
+        
         for obj in real_s_candidate.iter(){
             assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
             self.mark(*obj);

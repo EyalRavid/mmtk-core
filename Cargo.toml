@@ -90,7 +90,7 @@ harness = false
 [features]
 # default = ["sanity"]
 default = [
-    "sanity",
+    # "sanity",
     "lxr_no_evac",
     "lxr_stw",
     "lxr_rc_bits_8",
@@ -99,7 +99,7 @@ default = [
     "dep:regex",
     "dep:env_logger",
     "ix_always_defrag",
-    # "no_meta_counting",
+    "no_meta_counting",
 ]
 
 # Built-in env_logger.  This feature is enabled by default.

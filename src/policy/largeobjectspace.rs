@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use crate::util::rc::STRONG_RC_TABLE;
+#[cfg(feature = "sanity")]
 use crate::util::sanity::sanity_checker::MARK_STATE;
 use crate::util::metadata::side_metadata::spec_defs::SANITY_MARK_BITS;
 #[allow(unused)]
@@ -601,7 +602,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
 
     //Eyal added this function to use in sanity gc
     #[cfg(feature = "sanity")]
-    pub fn sanity_sweep_largeObjectst(&self) {
+    pub fn sanity_sweep_large_objects(&self) {
         let mut mature_objects = self.rc_mature_objects.lock().unwrap();
         for (o, _size) in mature_objects.iter() {
             println!("this is a large object");

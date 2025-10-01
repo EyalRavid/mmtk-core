@@ -193,7 +193,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
             .get_plan()
             .downcast_ref::<crate::plan::lxr::LXR<P::VM>>()
         {
-            lxr.los().sanity_sweep_largeObjectst();
+            lxr.los().sanity_sweep_large_objects();
             let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
             for (obj, rc) in rc_sanity_objects.iter() {
                 let real_rc = lxr.rc.count(*obj);
