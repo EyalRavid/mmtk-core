@@ -172,9 +172,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             // println!("promote los {:?} {}", o, self.immix().is_marked(o));
         }
         // Don't mark copied objects in initial mark pause. The concurrent marker will do it (and can also resursively mark the old objects).
-        if self.in_cm || self.pause == Pause::FinalMark {
-            debug_assert!(self.lxr.is_marked(o), "{:?} is not marked", o);
-        }
+        //Eyal commented this out
+        // if self.in_cm || self.pause == Pause::FinalMark {
+        //     debug_assert!(self.lxr.is_marked(o), "{:?} is not marked", o);
+        // }
         self.scan_nursery_object(o, los, !copied, depth, size);
     }
 
@@ -651,7 +652,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> GCWork<VM> for ProcessIncs<VM, KIND> {
         debug_assert!(!crate::plan::barriers::BARRIER_MEASUREMENT);
         self.lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         self.pause = self.lxr.current_pause().unwrap();
-        self.in_cm = self.lxr.cm_in_progress();
+        //Eyal commented this out
+        //self.in_cm = self.lxr.cm_in_progress();
         self.copy_context = self.worker().get_copy_context_mut() as *mut GCWorkerCopyContext<VM>;
         let count = if cfg!(feature = "rust_mem_counter") {
             self.incs.len()
@@ -954,12 +956,13 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 s.dead_mature_rc_los_volume += o.get_size::<VM>();
             }
         });
-        if self.cm_in_progress {
-            let marked = lxr.mark(o);
-            if cfg!(feature = "lxr_satb_live_bytes_counter") && marked {
-                crate::record_live_bytes(o.get_size::<VM>());
-            }
-        }
+        //Eyal commented this out
+        // if self.cm_in_progress {
+        //     let marked = lxr.mark(o);
+        //     if cfg!(feature = "lxr_satb_live_bytes_counter") && marked {
+        //         crate::record_live_bytes(o.get_size::<VM>());
+        //     }
+        // }
         // println!(" - dead {:?}", o);
         // debug_assert_eq!(self::count(o), 0);
         // Recursively decrease field ref counts
@@ -984,21 +987,22 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         } else {
                             self.record_mature_evac_remset(lxr, slot, x);
                         }
-                        if self.cm_in_progress && !lxr.is_marked(x) {
-                            if cfg!(any(feature = "sanity", debug_assertions)) {
-                                assert!(
-                                    x.to_raw_address().is_mapped(),
-                                    "Invalid object {:?}.{:?} -> {:?}: address is not mapped",
-                                    o,
-                                    slot,
-                                    x
-                                );
-                            }
-                            self.mark_objects.push(x);
-                            if self.mark_objects.is_full() {
-                                self.flush();
-                            }
-                        }
+                        //Eyal commented this out
+                        // if self.cm_in_progress && !lxr.is_marked(x) {
+                        //     if cfg!(any(feature = "sanity", debug_assertions)) {
+                        //         assert!(
+                        //             x.to_raw_address().is_mapped(),
+                        //             "Invalid object {:?}.{:?} -> {:?}: address is not mapped",
+                        //             o,
+                        //             slot,
+                        //             x
+                        //         );
+                        //     }
+                        //     self.mark_objects.push(x);
+                        //     if self.mark_objects.is_full() {
+                        //         self.flush();
+                        //     }
+                        // }
                     }
                 },
             );

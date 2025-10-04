@@ -128,10 +128,11 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             return true;
         }
         // SATB is finished
-        if self.cm_in_progress() && crate::concurrent_marking_packets_drained() {
-            self.gc_cause.store(GCCause::FinalMark, Ordering::Relaxed);
-            return true;
-        }
+        //Eyal commeted this out
+        // if self.cm_in_progress() && crate::concurrent_marking_packets_drained() {
+        //     self.gc_cause.store(GCCause::FinalMark, Ordering::Relaxed);
+        //     return true;
+        // }
         // Survival limits
         let total_young_alloc_pages = self
             .immix_space
@@ -240,11 +241,12 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
         self.update_stats_after_gc_decided(pause);
         // Wait for concurrent packets
-        if self.cm_in_progress() && pause == Pause::RefCount {
-            crate::counters()
-                .rc_during_satb
-                .fetch_add(1, Ordering::SeqCst);
-        }
+        //Eyal commeted this out
+        // if self.cm_in_progress() && pause == Pause::RefCount {
+        //     crate::counters()
+        //         .rc_during_satb
+        //         .fetch_add(1, Ordering::SeqCst);
+        // }
         // Mark table zeroing
         if pause == Pause::InitialMark || pause == Pause::Full {
             self.schedule_mark_table_zeroing_tasks(Some(pause))
@@ -439,11 +441,13 @@ impl<VM: VMBinding> Plan for LXR<VM> {
                 let t = crate::SATB_START.elapsed().as_nanos();
                 crate::counters().satb_nanos.fetch_add(t, Ordering::SeqCst);
             }
-        } else if cfg!(feature = "satb_timer") && pause == Pause::RefCount && self.cm_in_progress()
-        {
-            let t = crate::SATB_START.elapsed().as_nanos();
-            crate::counters().satb_nanos.fetch_add(t, Ordering::SeqCst);
         }
+        //Eyal commented this out
+        // else if cfg!(feature = "satb_timer") && pause == Pause::RefCount && self.cm_in_progress()
+        // {
+        //     let t = crate::SATB_START.elapsed().as_nanos();
+        //     crate::counters().satb_nanos.fetch_add(t, Ordering::SeqCst);
+        // }
 
         if cfg!(feature = "decs_counter") {
             gc_log!([3] "POSTPONED {} DELETED OBJS FOR DECREMENT", self.barrier_decs.load(Ordering::SeqCst));
@@ -461,10 +465,12 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             if cfg!(feature = "satb_timer") {
                 crate::SATB_START.start();
             }
-        } else if cfg!(feature = "satb_timer") && pause == Pause::RefCount && self.cm_in_progress()
-        {
-            crate::SATB_START.start();
         }
+        //Eyal commented this out
+        // else if cfg!(feature = "satb_timer") && pause == Pause::RefCount && self.cm_in_progress()
+        // {
+        //     crate::SATB_START.start();
+        // }
         // if pause == Pause::RefCount || pause == Pause::InitialMark {
         //     self.resize_nursery();
         // }
@@ -624,8 +630,9 @@ impl<VM: VMBinding> LXR<VM> {
         self.immix_space.cm_enabled
     }
 
-    pub fn cm_in_progress(&self) -> bool {
-        self.in_concurrent_marking.load(Ordering::Relaxed)
+
+   pub fn cm_in_progress(&self) -> bool {
+     self.in_concurrent_marking.load(Ordering::Relaxed)
     }
 
     fn next_gc_is_emergency_gc(
@@ -931,9 +938,10 @@ impl<VM: VMBinding> LXR<VM> {
             RC_PAUSES_BEFORE_SATB.fetch_add(1, Ordering::Relaxed);
         }
         self.disable_unnecessary_buckets(scheduler, Pause::RefCount);
-        if self.cm_in_progress() {
-            scheduler.pause_concurrent_marking_work_packets_during_gc();
-        }
+        //Eyal commented this out
+        // if self.cm_in_progress() {
+        //     scheduler.pause_concurrent_marking_work_packets_during_gc();
+        // }
         type E<VM> = RCImmixCollectRootEdges<VM>;
         // Before start yielding, wrap all the roots from the previous GC with work-packets.
         self.process_prev_roots(scheduler);
@@ -986,9 +994,10 @@ impl<VM: VMBinding> LXR<VM> {
             RC_PAUSES_BEFORE_SATB.store(0, Ordering::Relaxed);
         }
         self.disable_unnecessary_buckets(scheduler, Pause::FinalMark);
-        if self.cm_in_progress() {
-            crate::MOVE_CONCURRENT_MARKING_TO_STW.store(true, Ordering::SeqCst);
-        }
+        //Eyal commented this out
+        // if self.cm_in_progress() {
+        //     crate::MOVE_CONCURRENT_MARKING_TO_STW.store(true, Ordering::SeqCst);
+        // }
         self.process_prev_roots(scheduler);
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add_prioritized(Box::new(
             StopMutators::<LXRGCWorkContext<RCImmixCollectRootEdges<VM>>>::new(),
