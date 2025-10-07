@@ -59,10 +59,19 @@ impl<VM: VMBinding> GCWork<VM> for ReleaseLOSNursery {
 
 
 
+pub const BLACK_OUT_OF_STACK: u8 = 0;
+pub const BLACK_IN_STACK: u8 = 1;
+pub const GREY: u8 = 2;
+pub const WHITE: u8 = 3;
 
-pub const BLACK: u8 = 0;
-pub const GREY: u8 = 1;
-pub const WHITE: u8 = 2;
+unsafe fn in_stack(o: ObjectReference) -> bool{
+    OBJ_COLOR_TABLE.load::<u8>(o.to_raw_address()) == BLACK_IN_STACK  
+}
+
+unsafe fn is_black(o: ObjectReference) -> bool{
+    OBJ_COLOR_TABLE.load::<u8>(o.to_raw_address()) <= BLACK_IN_STACK  
+}
+
 pub struct CycleCollector<VM: VMBinding>{
     rc : RefCountHelper<VM>,
 }
@@ -137,6 +146,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
         }
     }
 
+
+
     fn mark(&self, o: ObjectReference){
         debug_assert!(RefCountHelper::<VM>::NEW.count(o) > 0 
         || OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == GREY);
@@ -152,12 +163,13 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     dfs_stack.push(x);
                 }
             };
-            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == BLACK{
-                STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),0, Ordering::SeqCst);
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),GREY, Ordering::SeqCst);
-                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
-            }
-            
+            unsafe{
+                if OBJ_COLOR_TABLE.load::<u8>(curr.to_raw_address()) == BLACK_OUT_OF_STACK{
+                    //STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),0, Ordering::Relaxed);
+                    OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),GREY);
+                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                }
+            }  
         }
     }
 
@@ -171,16 +183,19 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     dfs_stack.push(x);
                 }
             };
-            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == GREY{
-                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                if RefCountHelper::<VM>::NEW.count(curr) > 0{
-                    self.scan_black(curr);
-                }
-                else{
-                    OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),WHITE, Ordering::SeqCst);
-                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
-                }
-           }
+            unsafe {
+                if OBJ_COLOR_TABLE.load::<u8>(curr.to_raw_address()) == GREY{
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
+                    if RefCountHelper::<VM>::NEW.count(curr) > 0{
+                        self.scan_black(curr);
+                    }
+                    else{
+                        OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),WHITE);
+                        curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                    }
+               }    
+            }
+
         }
     }
 
@@ -190,34 +205,37 @@ impl<VM: VMBinding> CycleCollector<VM>{
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.last(){
             debug_assert!(self.rc.count(*curr) > 0);
-            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != BLACK{
-                debug_assert!(IN_STACK_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK, Ordering::SeqCst);
-                IN_STACK_TABLE.store_atomic::<u8>(curr.to_raw_address(), 1 as u8, Ordering::SeqCst);
-                let s_rc = self.rc.count(*curr);
-                if s_rc > MAX_STRONG_REF_COUNT as u16{
-                    STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::SeqCst);
+            unsafe {
+                if !is_black(*curr){
+                    debug_assert!(IN_STACK_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
+                    OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_IN_STACK);
+                    //IN_STACK_TABLE.store::<u8>(curr.to_raw_address(), 1 as u8);
+                    let s_rc = self.rc.count(*curr);
+                    if s_rc > MAX_STRONG_REF_COUNT as u16{
+                        STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT);
+                    }
+                    else{
+                        STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),s_rc as u8);
+                    }
+                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
+                        if let Some(x) = slot.load() {
+                            debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
+                            let _prev = self.rc.inc(x);
+                            if !in_stack(x){
+                                self.rc.strong_rc_inc(x);
+                                dfs_stack.push(x);
+                            }
+                        }
+                    });
+                    
                 }
                 else{
-                    STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),s_rc as u8, Ordering::SeqCst);
+                    OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_OUT_OF_STACK);
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != 0);
+                    dfs_stack.pop();
                 }
-                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
-                    if let Some(x) = slot.load() {
-                        debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
-                        let _prev = self.rc.inc(x);
-                        if IN_STACK_TABLE.load_atomic::<u8>(x.to_raw_address(), Ordering::SeqCst) == 0{
-                            self.rc.strong_rc_inc(x);
-                            dfs_stack.push(x);
-                        }
-                    }
-                });
-                
             }
-            else{
-                IN_STACK_TABLE.store_atomic::<u8>(curr.to_raw_address(), 0 as u8, Ordering::SeqCst);
-                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != 0);
-                dfs_stack.pop();
-            }
+
         }
   
     }
@@ -233,13 +251,17 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     dfs_stack.push(x);
                 }
             };
-            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == WHITE{
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK, Ordering::SeqCst);
-                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                debug_assert!(lxr.rc.count(curr) == 0);
-                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
-                self.process_dead_object(curr, lxr);
+            unsafe {
+                if OBJ_COLOR_TABLE.load::<u8>(curr.to_raw_address()) == WHITE{
+                    STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),0);
+                    OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_OUT_OF_STACK);
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
+                    debug_assert!(lxr.rc.count(curr) == 0);
+                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                    self.process_dead_object(curr, lxr);
+                }
             }
+
         }
     }
 
