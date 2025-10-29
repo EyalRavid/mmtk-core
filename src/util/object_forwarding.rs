@@ -80,6 +80,8 @@ pub fn try_forward_object<VM: VMBinding>(
     semantics: CopySemantics,
     copy_context: &mut GCWorkerCopyContext<VM>,
 ) -> Option<ObjectReference> {
+    //Eyal added this panic to make sure there is no copying
+    panic!();
     let new_object = VM::VMObjectModel::try_copy(object, semantics, copy_context)?;
     if let Some(shift) = forwarding_bits_offset_in_forwarding_pointer::<VM>() {
         VM::VMObjectModel::LOCAL_FORWARDING_POINTER_SPEC.store_atomic::<VM, usize>(
@@ -122,6 +124,8 @@ pub fn forward_object<VM: VMBinding>(
     copy_context: &mut GCWorkerCopyContext<VM>,
     on_after_forwarding: impl FnOnce(ObjectReference),
 ) -> ObjectReference {
+    //Eyal added this panic to make sure there is no copying
+    panic!();
     let new_object = VM::VMObjectModel::copy(object, semantics, copy_context);
     on_after_forwarding(new_object);
     if let Some(shift) = forwarding_bits_offset_in_forwarding_pointer::<VM>() {

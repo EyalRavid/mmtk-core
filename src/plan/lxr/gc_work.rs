@@ -18,6 +18,8 @@ use crate::policy::space::Space;
 use crate::policy::immix::block::Block;
 use crate::util::rc::RefCountHelper;
 use crate::vm::slot::MemorySlice;
+//Eyal added this:
+use crate::plan::lxr::stack::ChunkedStack;
 pub(super) struct LXRGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
 impl<E: ProcessEdgesWork> crate::scheduler::GCWorkContext for LXRGCWorkContext<E> {
@@ -80,16 +82,16 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
-        let mut real_s_candidate = Vec::<ObjectReference>::new();
+        //let mut real_s_candidate = Vec::<ObjectReference>::new();
         
-        for obj in s_candidates.iter(){
-            if lxr.rc.count(*obj) > 0{
-                if !real_s_candidate.contains(obj){
-                    real_s_candidate.push(*obj);
-                }
+        // for obj in s_candidates.iter(){
+        //     if lxr.rc.count(*obj) > 0{
+        //         if !real_s_candidate.contains(obj){
+        //             real_s_candidate.push(*obj);
+        //         }
                 
-            }
-        }
+        //     }
+        // }
 
        
 
@@ -120,21 +122,27 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             println!("##################################");
             
         }
-        s_candidates.clear();
         
-        for obj in real_s_candidate.iter(){
-            assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
-            self.mark(*obj);
+        for obj in s_candidates.iter(){
+            debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
+            if lxr.rc.count(*obj) > 0{
+                self.mark(*obj);
+            }    
         }
 
-        for obj in real_s_candidate.iter(){
-            self.scan(*obj);
+        for obj in s_candidates.iter(){
+            if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == GREY{
+                self.scan(*obj);
+            }
         }
 
-         for obj in real_s_candidate.iter(){
-            assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
-            self.collect_whites(*obj, lxr);
+         for obj in s_candidates.iter(){
+            debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
+            if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE{
+                self.collect_whites(*obj, lxr);
+            }
         }
+        s_candidates.clear();
     }
 }
 
@@ -151,7 +159,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     fn mark(&self, o: ObjectReference){
         debug_assert!(RefCountHelper::<VM>::NEW.count(o) > 0 
         || OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == GREY);
-        let mut dfs_stack = Vec::<ObjectReference>::new();
+        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
 
         while let Some(curr) = dfs_stack.pop() {
@@ -174,7 +182,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
 
     fn scan(&self, o: ObjectReference){
-        let mut dfs_stack = Vec::<ObjectReference>::new();
+        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
 
         while let Some(curr) = dfs_stack.pop(){
@@ -201,7 +209,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
 
     fn scan_black(&self, o: ObjectReference){
-        let mut dfs_stack = Vec::<ObjectReference>::new();
+        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.last(){
             debug_assert!(self.rc.count(*curr) > 0);
@@ -243,7 +251,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
     fn collect_whites(&self, o: ObjectReference, lxr: &LXR<VM>){
 
-        let mut dfs_stack = Vec::<ObjectReference>::new();
+        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop(){
             let mut visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
