@@ -129,7 +129,6 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             println!("num of duplicates candidates in s_rc scan not including dead duplicates = {}", num_of_dupcs);
             println!("num of dead candidates in s_rc scan = {}", num_of_dead_candidates);
             println!("num of s_rc candidates = {}", real_strong_candidates.len());
-            println!("##################################");
             
         }
         
@@ -145,13 +144,31 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 self.scan(*obj);
             }
         }
+        #[cfg(feature = "lxr_stats")]
+        {
+            let mut num_of_garbage_candidates = 0;
+            for obj in s_candidates.iter(){
+                debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
+                if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE{
+                    self.collect_whites(*obj, lxr);
+                    num_of_garbage_candidates+=1;     
+                }
+            }
+            
+            println!("num of s_rc dead scanned candidates = {}", num_of_garbage_candidates);
+        }
 
-         for obj in s_candidates.iter(){
-            debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
-            if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE{
-                self.collect_whites(*obj, lxr);
+        #[cfg(not(feature = "lxr_stats"))]
+        {
+            for obj in s_candidates.iter(){
+                debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
+                if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE{
+                    self.collect_whites(*obj, lxr);    
+                }
             }
         }
+        println!("\n\n");
+        
         s_candidates.clear();
     }
 }
