@@ -82,43 +82,53 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
-        //let mut real_s_candidate = Vec::<ObjectReference>::new();
-        
-        // for obj in s_candidates.iter(){
-        //     if lxr.rc.count(*obj) > 0{
-        //         if !real_s_candidate.contains(obj){
-        //             real_s_candidate.push(*obj);
-        //         }
-                
-        //     }
-        // }
-
-       
-
-        #[cfg(feature = "sanity")]
+        #[cfg(feature = "lxr_stats")]
         {
             println!("GOT TO CYCLE COLLECTION PHAZE");
             let mut  candidates = lxr.cycle_candidates.lock().unwrap();
-            let mut real_candidate = Vec::<ObjectReference>::new();
+            let mut real_candidates = Vec::<ObjectReference>::new();
             println!("##################################");
-            println!("num of regular candidates before dead object removal = {}", candidates.len()); 
-            let mut num_of_dupcs = 0;  
+            println!("num of trial deletion candidates with dead objects and duplicates = {}", candidates.len()); 
+            let mut num_of_dupcs = 0;
+            let mut num_of_dead_candidates = 0;
             // removing from candidates objects with 0 rc (because this objects allready freed)
             for obj in candidates.iter(){
                 if lxr.rc.count(*obj) > 0{
-                    if !real_candidate.contains(obj){
-                        real_candidate.push(*obj);
+                    if !real_candidates.contains(obj){
+                        real_candidates.push(*obj);
                     }
                     else{
                         num_of_dupcs +=1 ;
                     }
-                    
+                }
+                else{
+                    num_of_dead_candidates += 1;
                 }
             }
-            println!("num_of_dupcs in regular candidates = {}", num_of_dupcs); 
-            println!("num of s_rc candidates before dead object removal = {}", s_candidates.len());
-            println!("num of regular candidates = {}", real_candidate.len());
-            println!("num of s_rc candidates = {}", real_s_candidate.len());
+            println!("num of duplicates candidates in trial deletion not including dead duplicates = {}", num_of_dupcs);
+            println!("num of dead candidates in trial deletion = {}", num_of_dead_candidates);
+            println!("num of trial deletion candidates after duplicates and dead objects removal = {}", real_candidates.len());
+            candidates.clear();
+            let mut real_strong_candidates = Vec::<ObjectReference>::new();
+            num_of_dupcs = 0;
+            num_of_dead_candidates = 0;
+            for obj in s_candidates.iter(){
+                if lxr.rc.count(*obj) > 0{
+                    if !real_strong_candidates.contains(obj){
+                        real_strong_candidates.push(*obj);
+                    }
+                    else{
+                        num_of_dupcs +=1 ;
+                    }
+                }
+                else{
+                    num_of_dead_candidates += 1;
+                }
+            }  
+            println!("num of strong candidates before dead object removal = {}", s_candidates.len());
+            println!("num of duplicates candidates in s_rc scan not including dead duplicates = {}", num_of_dupcs);
+            println!("num of dead candidates in s_rc scan = {}", num_of_dead_candidates);
+            println!("num of s_rc candidates = {}", real_strong_candidates.len());
             println!("##################################");
             
         }
