@@ -84,10 +84,9 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
         #[cfg(feature = "lxr_stats")]
         {
-            println!("GOT TO CYCLE COLLECTION PHAZE");
+            println!("===GOT TO CYCLE COLLECTION PHAZE===");
             let mut  candidates = lxr.cycle_candidates.lock().unwrap();
             let mut real_candidates = Vec::<ObjectReference>::new();
-            println!("##################################");
             println!("num of trial deletion candidates with dead objects and duplicates = {}", candidates.len()); 
             let mut num_of_dupcs = 0;
             let mut num_of_dead_candidates = 0;
@@ -148,17 +147,17 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         {
             let mut num_of_garbage_candidates = 0;
             for obj in s_candidates.iter(){
-                debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
                 if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE{
-                    self.collect_whites(*obj, lxr);
                     num_of_garbage_candidates+=1;     
                 }
             }
             
             println!("num of s_rc dead scanned candidates = {}", num_of_garbage_candidates);
+            println!("===ENDED CYCLE COLLECTION PHAZE===");
+            println!("\n\n");
+
         }
 
-        #[cfg(not(feature = "lxr_stats"))]
         {
             for obj in s_candidates.iter(){
                 debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != GREY);
@@ -167,7 +166,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 }
             }
         }
-        println!("\n\n");
+        
         
         s_candidates.clear();
     }
