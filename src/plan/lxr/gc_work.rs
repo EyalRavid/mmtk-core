@@ -82,7 +82,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
-        #[cfg(feature = "lxr_stats")]
+        #[cfg(feature = "s_rc_stats")]
         {
             println!("===GOT TO CYCLE COLLECTION PHAZE===");
             let mut  candidates = lxr.cycle_candidates.lock().unwrap();
@@ -143,7 +143,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 self.scan(*obj);
             }
         }
-        #[cfg(feature = "lxr_stats")]
+        #[cfg(feature = "s_rc_stats")]
         {
             let mut num_of_garbage_candidates = 0;
             for obj in s_candidates.iter(){

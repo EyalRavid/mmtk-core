@@ -99,7 +99,7 @@ pub struct LXR<VM: VMBinding> {
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
     pub s_cycle_candidates: Mutex<Vec<ObjectReference>>,
-    #[cfg(feature = "lxr_stats")]
+    #[cfg(feature = "s_rc_stats")]
     pub cycle_candidates: Mutex<Vec<ObjectReference>>,
     #[cfg(feature = "sanity")]
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u16)>>,
@@ -574,7 +574,7 @@ impl<VM: VMBinding> LXR<VM> {
             ),
             MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
             MetadataSpec::OnSide(OBJ_COLOR_TABLE),
-            #[cfg(feature = "lxr_stats")]
+            #[cfg(feature = "s_rc_stats")]
             MetadataSpec::OnSide(IN_STACK_TABLE),
             MetadataSpec::OnSide(STRONG_RC_TABLE),
         ]);
@@ -615,7 +615,7 @@ impl<VM: VMBinding> LXR<VM> {
             gc_cause: Atomic::new(GCCause::Unknown),
             barrier_decs: AtomicUsize::default(),
             s_cycle_candidates: Mutex::new(Vec::new()),
-            #[cfg(feature = "lxr_stats")]
+            #[cfg(feature = "s_rc_stats")]
             cycle_candidates: Mutex::new(Vec::new()),
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),

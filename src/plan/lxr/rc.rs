@@ -1085,7 +1085,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             else if result != Ok(1){
 
                 //regular candidate
-                #[cfg(feature = "lxr_stats")]
+                #[cfg(feature = "s_rc_stats")]
                 {
                     let mut candidates = lxr.cycle_candidates.lock().unwrap();
                     candidates.push(o);

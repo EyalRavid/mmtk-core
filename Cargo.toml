@@ -100,7 +100,7 @@ default = [
     "dep:env_logger",
     "ix_always_defrag",
     "no_meta_counting",
-    "lxr_stats",
+    "s_rc_stats",
 ]
 
 # Built-in env_logger.  This feature is enabled by default.
@@ -239,7 +239,7 @@ bpr_unprioritized = []
 bpr_freelist = []
 freelist_best_fit_alloc = []
 bpr_spin_lock = []
-lxr_stats = []
+s_rc_stats = []
 # This feature is only supported on x86-64 for now
 # It's manually added to CI scripts
 perf_counter = ["pfm"]
