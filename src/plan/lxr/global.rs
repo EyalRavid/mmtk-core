@@ -101,6 +101,8 @@ pub struct LXR<VM: VMBinding> {
     pub s_cycle_candidates: Mutex<Vec<ObjectReference>>,
     #[cfg(feature = "s_rc_stats")]
     pub cycle_candidates: Mutex<Vec<ObjectReference>>,
+    #[cfg(feature = "s_rc_stats")]
+    pub num_of_scanned_s_rc_candidates: Mutex<u64>,
     #[cfg(feature = "sanity")]
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u16)>>,
 }
@@ -617,6 +619,8 @@ impl<VM: VMBinding> LXR<VM> {
             s_cycle_candidates: Mutex::new(Vec::new()),
             #[cfg(feature = "s_rc_stats")]
             cycle_candidates: Mutex::new(Vec::new()),
+            #[cfg(feature = "s_rc_stats")]
+            num_of_scanned_s_rc_candidates: Mutex::new(0),
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),
         });

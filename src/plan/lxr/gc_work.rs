@@ -134,7 +134,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         for obj in s_candidates.iter(){
             debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
             if lxr.rc.count(*obj) > 0{
-                self.mark(*obj);
+                self.mark(*obj, #[cfg(feature = "s_rc_stats")] lxr);
             }    
         }
 
@@ -153,6 +153,14 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             }
             
             println!("num of s_rc dead scanned candidates = {}", num_of_garbage_candidates);
+
+            let mut  num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
+            println!("num of scanned objects in s_rc scan = {}", num_of_scanned);
+            *num_of_scanned = 0;
+
+            let num_of_root_candidates: u64 = 0;
+
+            
             println!("===ENDED CYCLE COLLECTION PHAZE===");
             println!("\n\n");
 
@@ -166,8 +174,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 }
             }
         }
-        
-        
+
         s_candidates.clear();
     }
 }
@@ -182,7 +189,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
 
 
-    fn mark(&self, o: ObjectReference){
+    fn mark(&self, o: ObjectReference, #[cfg(feature = "s_rc_stats")] lxr: &LXR<VM>){
         debug_assert!(RefCountHelper::<VM>::NEW.count(o) > 0 
         || OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == GREY);
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
@@ -202,6 +209,13 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     //STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),0, Ordering::Relaxed);
                     OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),GREY);
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+
+                    #[cfg(feature = "s_rc_stats")]
+                    {
+                        let mut  num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
+                        *num_of_scanned+=1
+                    }
+;
                 }
             }  
         }
