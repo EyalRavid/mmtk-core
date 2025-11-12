@@ -235,12 +235,14 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         }
 
         //comented this line and added the two lines after
-        // let pause = self.select_collection_kind();
-
+        let mut pause = self.select_collection_kind();
+        if pause == Pause::InitialMark || pause == Pause::Full{
+            scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
+        } 
         //Eyal commented this line
         //It must be commeted with the call on line 1187
         //self.wait_for_decide_cycle_collection();
-        let pause = Pause::RefCount;
+        pause = Pause::RefCount;
         //########################################3
 
 
@@ -576,7 +578,6 @@ impl<VM: VMBinding> LXR<VM> {
             ),
             MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
             MetadataSpec::OnSide(OBJ_COLOR_TABLE),
-            #[cfg(feature = "s_rc_stats")]
             MetadataSpec::OnSide(IN_STACK_TABLE),
             MetadataSpec::OnSide(STRONG_RC_TABLE),
         ]);
@@ -962,8 +963,6 @@ impl<VM: VMBinding> LXR<VM> {
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<LXRGCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
 
-        // New cycleCollection Phaze. corrently only prints "GOT TO CYCLE COLLECTION PHAZE"
-        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
     }
 
     fn dump_memory(&self, pause: Pause) {
@@ -1188,7 +1187,7 @@ impl<VM: VMBinding> LXR<VM> {
         };
         //Eyal commented this line
         //It must be commeted with the call on line 240
-        //self.decide_next_gc_may_perform_cycle_collection(pause);
+        self.decide_next_gc_may_perform_cycle_collection(pause);
     }
 
     fn gc_init(&mut self, options: &Options) {

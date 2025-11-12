@@ -1066,6 +1066,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             let result = self.rc.clone().fetch_update(o, |c| {
                 if c == 1 && !dead {
                     STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(),0 as u8, Ordering::Relaxed);
+                    IN_STACK_TABLE.store_atomic::<u8>(o.to_raw_address(),0 , Ordering::Relaxed);
                     dead = true;
                     is_los = self.process_dead_object(o, lxr);
                 }
@@ -1095,6 +1096,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 let s_rc_prev_val = STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::Relaxed);
                 if (s_rc_prev_val == 1){
                     s_candidates.push(o);
+                    IN_STACK_TABLE.store_atomic::<u8>(o.to_raw_address(),1, Ordering::Relaxed);
                     debug_assert!(s_candidates.contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
                     #[cfg(feature = "sanity")]

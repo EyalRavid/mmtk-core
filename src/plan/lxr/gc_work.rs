@@ -95,6 +95,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         while i < s_candidates.len() {
             if self.should_mark(s_candidates[i]) {
                 self.mark(s_candidates[i], #[cfg(feature = "s_rc_stats")] lxr);
+                IN_STACK_TABLE.store_atomic::<u8>(s_candidates[i].to_raw_address(),0 , Ordering::Relaxed);
                 i+=1;
             }
             else {
@@ -333,7 +334,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
 
     fn should_mark(&self, o: ObjectReference) -> bool{
-        return self.rc.count(o) > 0 && unsafe {
+        IN_STACK_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 1 as u8 && unsafe {
             OBJ_COLOR_TABLE.load::<u8>(o.to_raw_address()) != GREY
         } 
     }
