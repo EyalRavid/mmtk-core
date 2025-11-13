@@ -235,14 +235,12 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         }
 
         //comented this line and added the two lines after
-        let mut pause = self.select_collection_kind();
-        if pause == Pause::InitialMark || pause == Pause::Full{
-            scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
-        } 
+        let mut orig_pause = self.select_collection_kind();
+
         //Eyal commented this line
         //It must be commeted with the call on line 1187
         //self.wait_for_decide_cycle_collection();
-        pause = Pause::RefCount;
+        let pause = Pause::RefCount;
         //########################################3
 
 
@@ -275,6 +273,9 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
         }
+
+        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
+        
         // Analysis routine that is ran. It is generally recommended to take advantage
         // of the scheduling system we have in place for more performance
         #[cfg(feature = "analysis")]
