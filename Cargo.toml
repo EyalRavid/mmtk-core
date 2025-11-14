@@ -58,6 +58,8 @@ spin = { version = "0.9.5", features = ["std"] }
 strum = "0.27.1"
 strum_macros = "0.27.1"
 sysinfo = { version = "0.33.1", optional = true }
+chunked_vec = "0.3.4"
+
 
 [dev-dependencies]
 paste = "1.0.8"
@@ -91,7 +93,7 @@ harness = false
 # default = ["sanity"]
 default = [
     #"sanity",
-    "lxr_rc_bits_8",
+    "lxr_rc_bits_4",
     "lxr_no_evac",
     "lxr_stw",
     "lxr_rc_bits_8",

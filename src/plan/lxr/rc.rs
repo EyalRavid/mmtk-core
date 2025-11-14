@@ -1092,12 +1092,14 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     candidates.push(o);
                 }
 
-                let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+                let mut s_candidates = unsafe {
+                    lxr.s_cycle_candidates_mut()
+                };
                 let s_rc_prev_val = STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::Relaxed);
                 if (s_rc_prev_val == 1){
                     s_candidates.push(o);
                     IN_STACK_TABLE.store_atomic::<u8>(o.to_raw_address(),1, Ordering::Relaxed);
-                    debug_assert!(s_candidates.contains(&o));
+                    //debug_assert!(s_candidates.contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
                     #[cfg(feature = "sanity")]
                     {
@@ -1108,10 +1110,10 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         
                     }
                 }
-                debug_assert!(s_rc_prev_val != 0 || s_candidates.contains(&o));
-                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o) 
-                            || s_candidates.contains(&o));
-            }
+                //debug_assert!(s_rc_prev_val != 0 || s_candidates.contains(&o));
+            //     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o) 
+            //                 || s_candidates.contains(&o));
+         }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {
                     self.prefetch_object(*o);

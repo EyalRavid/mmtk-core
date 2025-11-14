@@ -5,6 +5,7 @@ use crate::util::ObjectReference;
 use crate::{vm::*, Plan, MMTK};
 use crate::util::rc::{IN_STACK_TABLE, MAX_REF_COUNT, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, RC_TABLE, STRONG_RC_TABLE};
 use atomic::Ordering;
+use chunked_vec::ChunkedVec;
 use crate::util::address::CLDScanPolicy;
 use crate::util::address::RefScanPolicy;
 use std::marker::PhantomData;
@@ -84,7 +85,10 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         
         #[cfg(feature = "s_rc_stats")]
         self.print_stats(lxr);
-        let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+        
+        let mut s_candidates = unsafe {
+            lxr.s_cycle_candidates_mut()
+        };
         // for obj in s_candidates.iter(){
         //     debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
         //     if lxr.rc.count(*obj) > 0{
@@ -135,7 +139,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         }
         
 
-        s_candidates.clear();
+        *s_candidates = ChunkedVec::with_capacity(1024);
     }
 }
 
