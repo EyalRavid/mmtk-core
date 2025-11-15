@@ -139,7 +139,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         }
         
 
-        *s_candidates = ChunkedVec::with_capacity(1024);
+        s_candidates.clear()
     }
 }
 

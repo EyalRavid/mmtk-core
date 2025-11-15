@@ -93,7 +93,7 @@ harness = false
 # default = ["sanity"]
 default = [
     #"sanity",
-    "lxr_rc_bits_4",
+    "lxr_rc_bits_8",
     "lxr_no_evac",
     "lxr_stw",
     "lxr_rc_bits_8",
