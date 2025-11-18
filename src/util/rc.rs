@@ -290,6 +290,20 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         // STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
         STRONG_RC_TABLE.fetch_add_atomic::<u8>(o.to_raw_address(), 1, Ordering::Relaxed)
     }
+
+    //Eyal added this func
+    #[inline]
+    pub fn strong_rc_dec(&self, o: ObjectReference) -> u8 {
+        // let f = |x: u8| -> Option<u8> {
+        //     if x == 0 {
+        //         None
+        //     } else {
+        //         Some(x - 1)
+        //     }
+        // };
+        // STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
+        STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(), 1, Ordering::Relaxed)
+    }
 }
 
 impl<VM: VMBinding> Clone for RefCountHelper<VM> {
