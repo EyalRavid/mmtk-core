@@ -218,7 +218,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_IN_STACK);
                     //IN_STACK_TABLE.store::<u8>(curr.to_raw_address(), 1 as u8);
                     let s_rc = self.rc.count(*curr);
-                    if s_rc > MAX_STRONG_REF_COUNT as u16{
+                    if s_rc > MAX_STRONG_REF_COUNT{
                         STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT);
                     }
                     else{

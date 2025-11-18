@@ -12,11 +12,11 @@ use crate::{
 use atomic::Ordering;
 
 //Eyal's code
-pub const LOG_REF_COUNT_BITS: usize = 4; 
+// pub const LOG_REF_COUNT_BITS: usize = 4; 
 
-pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
-pub const REF_COUNT_MASK: u16 = (((1u32 << REF_COUNT_BITS) - 1) & 0xffff) as u16;
-pub const MAX_REF_COUNT: u16 = REF_COUNT_MASK;
+// pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
+// pub const REF_COUNT_MASK: u16 = (((1u32 << REF_COUNT_BITS) - 1) & 0xffff) as u16;
+// pub const MAX_REF_COUNT: u16 = REF_COUNT_MASK;
 
 
 pub const LOG_STRONG_REF_COUNT_BITS: usize = 2; 
@@ -25,20 +25,20 @@ pub const STRONG_REF_COUNT_MASK: u8 = (((1u16 << STRONG_REF_COUNT_BITS) - 1) & 0
 pub const MAX_STRONG_REF_COUNT: u8 = STRONG_REF_COUNT_MASK;
 //original code:
 
-// pub const LOG_REF_COUNT_BITS: usize = {
-//     if cfg!(feature = "lxr_rc_bits_2") {
-//         1
-//     } else if cfg!(feature = "lxr_rc_bits_4") {
-//         2
-//     } else if cfg!(feature = "lxr_rc_bits_8") {
-//         3
-//     } else {
-//         1
-//     }
-// };
-// pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
-// pub const REF_COUNT_MASK: u8 = (((1u16 << REF_COUNT_BITS) - 1) & 0xff) as u8;
-// pub const MAX_REF_COUNT: u8 = REF_COUNT_MASK;
+pub const LOG_REF_COUNT_BITS: usize = {
+    if cfg!(feature = "lxr_rc_bits_2") {
+        1
+    } else if cfg!(feature = "lxr_rc_bits_4") {
+        2
+    } else if cfg!(feature = "lxr_rc_bits_8") {
+        3
+    } else {
+        1
+    }
+};
+pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
+pub const REF_COUNT_MASK: u8 = (((1u16 << REF_COUNT_BITS) - 1) & 0xff) as u8;
+pub const MAX_REF_COUNT: u8 = REF_COUNT_MASK;
 
 pub const LOG_MIN_OBJECT_SIZE: usize = crate::util::constants::LOG_MIN_OBJECT_SIZE as _;
 pub const MIN_OBJECT_SIZE: usize = 1 << LOG_MIN_OBJECT_SIZE;
@@ -104,8 +104,8 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     pub fn fetch_update(
         &self,
         o: ObjectReference,
-        f: impl FnMut(u16) -> Option<u16>,
-    ) -> Result<u16, u16> {
+        f: impl FnMut(u8) -> Option<u8>,
+    ) -> Result<u8, u8> {
         RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
     }
 
@@ -114,7 +114,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     }
 
     //Eyal change: all u16 was originaly u8
-    pub fn stick(&self, o: ObjectReference) -> Result<u16, u16> {
+    pub fn stick(&self, o: ObjectReference) -> Result<u8, u8> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             if x == MAX_REF_COUNT {
@@ -126,7 +126,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     }
 
     //Eyal change: all u16 was originaly u8
-    pub fn inc(&self, o: ObjectReference) -> Result<u16, u16> {
+    pub fn inc(&self, o: ObjectReference) -> Result<u8, u8> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             //Eyal added this assert to make sure an object doesn't get stuck in debug mode
@@ -139,7 +139,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         })
     }
     //Eyal change: all u16 was originaly u8
-    pub fn dec(&self, o: ObjectReference) -> Result<u16, u16> {
+    pub fn dec(&self, o: ObjectReference) -> Result<u8, u8> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             if x == 0 || x == MAX_REF_COUNT
@@ -152,16 +152,16 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         })
     }
     //Eyal change: all u16 was originaly u8
-    pub fn set(&self, o: ObjectReference, count: u16) {
+    pub fn set(&self, o: ObjectReference, count: u8) {
         RC_TABLE.store_atomic(o.to_raw_address(), count, Ordering::Relaxed)
     }
     //Eyal change: all u16 was originaly u8
-    pub fn set_relaxed(&self, o: ObjectReference, count: u16) {
+    pub fn set_relaxed(&self, o: ObjectReference, count: u8) {
         unsafe { RC_TABLE.store(o.to_raw_address(), count) }
     }
 
     //Eyal change: all u16 was originaly u8
-    pub fn count(&self, o: ObjectReference) -> u16 {
+    pub fn count(&self, o: ObjectReference) -> u8 {
         RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed)
     }
 
@@ -180,7 +180,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     // }
     pub fn object_or_line_is_dead(&self, o: ObjectReference) -> bool {
         //RC_TABLE.load_byte(o.to_raw_address()) == 0
-        RC_TABLE.load_atomic::<u16>(o.to_raw_address(), Ordering::Relaxed) == 0
+        RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0
     }
 
     pub fn rc_table_range<UInt: Sized>(&self, b: Block) -> &'static [UInt] {
@@ -199,12 +199,12 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     #[allow(unused)]
     //Eyal change: all u16 was originaly u8
     pub fn is_dead(&self, o: ObjectReference) -> bool {
-        let v: u16 = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
+        let v: u8 = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
         v == 0
     }
 //Eyal change: all u16 was originaly u8
     pub fn is_dead_or_stuck(&self, o: ObjectReference) -> bool {
-        let v: u16 = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
+        let v: u8 = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
         v == 0 || v == MAX_REF_COUNT
     }
 
