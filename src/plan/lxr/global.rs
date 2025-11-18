@@ -276,9 +276,9 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
         }
-        if orig_pause != Pause::RefCount {
+        //if orig_pause != Pause::RefCount {
             scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
-        }
+        //}
         
         
         // Analysis routine that is ran. It is generally recommended to take advantage
