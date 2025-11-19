@@ -222,7 +222,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT);
                     }
                     else{
-                        STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),s_rc as u8);
+                        STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),s_rc);
                     }
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                         if let Some(x) = slot.load() {

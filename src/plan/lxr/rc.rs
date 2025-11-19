@@ -339,7 +339,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     //self.rc.inc(o) == Ok(0)
     fn inc(&self, o: ObjectReference) -> bool {
         if self.rc.inc(o) == Ok(0){
-            STRONG_RC_TABLE.fetch_add_atomic(o.to_raw_address(), 1 as u8, Ordering::SeqCst);
+            self.rc.clone().strong_rc_inc(o);
+            //STRONG_RC_TABLE.fetch_add_atomic(o.to_raw_address(), 1 as u8, Ordering::SeqCst);
             return true;
         }
         false
@@ -1070,6 +1071,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     is_los = self.process_dead_object(o, lxr);
                 }
                 debug_assert!(c <= MAX_REF_COUNT);
+                //This if should never happen because of the dead check at the start of the func
                 if c == 0 || c == MAX_REF_COUNT {
                     //Eyal added this panic
                     panic!();
@@ -1091,9 +1093,9 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     candidates.push(o);
                 }
 
-                let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
-                let s_rc_prev_val = STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(),1 as u8, Ordering::Relaxed);
-                if (s_rc_prev_val == 1){
+                let s_rc_prev_val = self.rc.clone().strong_rc_dec(o);
+                if (s_rc_prev_val == Ok(1)){
+                    let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
                     s_candidates.push(o);
                     debug_assert!(s_candidates.contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
@@ -1106,9 +1108,9 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         
                     }
                 }
-                debug_assert!(s_rc_prev_val != 0 || s_candidates.contains(&o));
+                debug_assert!(s_rc_prev_val != Ok(0) || lxr.s_cycle_candidates.lock().unwrap().contains(&o));
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o) 
-                            || s_candidates.contains(&o));
+                            || lxr.s_cycle_candidates.lock().unwrap().contains(&o));
             }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {

@@ -292,7 +292,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
 
     pub fn strong_rc_dec(&self, o: ObjectReference) -> Result<u8, u8> {
         let f = |x: u8| -> Option<u8> {
-            if x == MAX_STRONG_REF_COUNT || x == 0 {
+            if x == 0 {
                 None
             } else {
                 Some(x - 1)
