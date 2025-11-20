@@ -1011,7 +1011,9 @@ pub trait ScanObjectsWork<VM: VMBinding>: GCWork<VM> + Sized {
         }
 
         #[cfg(feature = "tracing")]
-        probe!(mmtk, scan_objects, total_objects, scan_and_trace);
+        //was probe!(mmtk, scan_objects, total_objects, scan_and_trace); (Eyal changed this because
+        //total_objects ans scan_and_trace where not defined)
+        probe!(mmtk, scan_objects, 0, 0);
 
         // If any object does not support slot-enqueuing, we process them now.
         if !scan_later.is_empty() {
