@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::time::SystemTime;
 use std::marker::PhantomData;
+use std::cell::UnsafeCell;
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -98,7 +99,7 @@ pub struct LXR<VM: VMBinding> {
     pub(super) barrier_decs: AtomicUsize,
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
-    pub s_cycle_candidates: Mutex<Vec<ObjectReference>>,
+    pub s_cycle_candidates: UnsafeCell<Vec<ObjectReference>>,
     #[cfg(feature = "s_rc_stats")]
     pub cycle_candidates: Mutex<Vec<ObjectReference>>,
     #[cfg(feature = "s_rc_stats")]
@@ -616,7 +617,7 @@ impl<VM: VMBinding> LXR<VM> {
             rc: RefCountHelper::NEW,
             gc_cause: Atomic::new(GCCause::Unknown),
             barrier_decs: AtomicUsize::default(),
-            s_cycle_candidates: Mutex::new(Vec::new()),
+            s_cycle_candidates: UnsafeCell::new(Vec::with_capacity(2048)),
             #[cfg(feature = "s_rc_stats")]
             cycle_candidates: Mutex::new(Vec::new()),
             #[cfg(feature = "s_rc_stats")]
@@ -1315,5 +1316,28 @@ impl<VM: VMBinding> LXR<VM> {
                 self.young_alloc_trigger = new_value;
             }
         }
+    }
+}
+
+
+unsafe impl<VM: VMBinding> Sync for LXR<VM> {}
+
+impl<VM: VMBinding> LXR<VM> {
+    /// Get a mutable reference to `s_cycle_candidates`.
+    ///
+    /// # Safety
+    /// Caller must guarantee exclusive access to `s_cycle_candidates`:
+    /// - No other thread may read or write it at the same time.
+    /// - No other code may be using another mutable reference to it.
+    /// Typically this should only be called in a stop-the-world / single-thread phase.
+    #[inline]
+    pub unsafe fn s_cycle_candidates_mut(&self) -> &mut Vec<ObjectReference> {
+        &mut *self.s_cycle_candidates.get()
+    }
+
+    /// Optional: read-only view (not strictly necessary)
+    #[inline]
+    pub unsafe fn s_cycle_candidates(&self) -> &Vec<ObjectReference> {
+        &*self.s_cycle_candidates.get()
     }
 }

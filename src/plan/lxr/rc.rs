@@ -1095,7 +1095,9 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
                 let s_rc_prev_val = self.rc.clone().strong_rc_dec(o);
                 if (s_rc_prev_val == Ok(1)){
-                    let mut s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+                    let s_candidates = unsafe {
+                        lxr.s_cycle_candidates_mut()
+                    };
                     s_candidates.push(o);
                     debug_assert!(s_candidates.contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
@@ -1108,9 +1110,11 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         
                     }
                 }
-                debug_assert!(s_rc_prev_val != Ok(0) || lxr.s_cycle_candidates.lock().unwrap().contains(&o));
-                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o) 
-                            || lxr.s_cycle_candidates.lock().unwrap().contains(&o));
+                unsafe {
+                    debug_assert!(s_rc_prev_val != Ok(0) || lxr.s_cycle_candidates().contains(&o));
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o) 
+                                || lxr.s_cycle_candidates().contains(&o));
+                }
             }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {

@@ -84,13 +84,10 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         
         #[cfg(feature = "s_rc_stats")]
         self.print_stats(lxr);
-        let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
-        // for obj in s_candidates.iter(){
-        //     debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) != WHITE);
-        //     if lxr.rc.count(*obj) > 0{
-        //         self.mark(*obj, #[cfg(feature = "s_rc_stats")] lxr);
-        //     }    
-        // }
+        let mut s_candidates = unsafe {
+            lxr.s_cycle_candidates_mut()
+        };
+
         let mut i = 0;
         while i < s_candidates.len() {
             if self.should_mark(s_candidates[i]) {
@@ -132,7 +129,6 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             self.collect_whites(*obj, lxr);    
 
         }
-        
 
         s_candidates.clear();
     }
@@ -172,9 +168,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     #[cfg(feature = "s_rc_stats")]
                     {
                         let mut  num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
-                        *num_of_scanned+=1
+                        *num_of_scanned+=1;
                     }
-;
                 }
             }  
         }
@@ -214,9 +209,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(self.rc.count(*curr) > 0);
             unsafe {
                 if !is_black(*curr){
-                    debug_assert!(IN_STACK_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                     OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_IN_STACK);
-                    //IN_STACK_TABLE.store::<u8>(curr.to_raw_address(), 1 as u8);
                     let s_rc = self.rc.count(*curr);
                     if s_rc > MAX_STRONG_REF_COUNT{
                         STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT);
@@ -340,7 +333,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
     #[cfg(feature = "s_rc_stats")]
     fn print_stats(&self, lxr: &LXR<VM>) {
         println!("===GOT TO CYCLE COLLECTION PHAZE===");
-        let mut  s_candidates = lxr.s_cycle_candidates.lock().unwrap();
+        let mut s_candidates = unsafe {
+            lxr.s_cycle_candidates_mut()
+        };
         let mut  candidates = lxr.cycle_candidates.lock().unwrap();
         let mut real_candidates = Vec::<ObjectReference>::new();
         println!("num of trial deletion candidates with dead objects and duplicates = {}", candidates.len()); 
