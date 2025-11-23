@@ -3,7 +3,7 @@ use super::{barrier, LXR};
 use crate::scheduler::{gc_work::*, GCWork, GCWorker};
 use crate::util::ObjectReference;
 use crate::{vm::*, Plan, MMTK};
-use crate::util::rc::{IN_STACK_TABLE, MAX_REF_COUNT, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, RC_TABLE, STRONG_RC_TABLE};
+use crate::util::rc::{CANDIDATES_STATUS, MAX_REF_COUNT, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, RC_TABLE, STRONG_RC_TABLE};
 use atomic::Ordering;
 use crate::util::address::CLDScanPolicy;
 use crate::util::address::RefScanPolicy;
@@ -19,6 +19,7 @@ use crate::policy::immix::block::Block;
 use crate::util::rc::RefCountHelper;
 use crate::vm::slot::MemorySlice;
 //Eyal added this:
+use crate::plan::lxr::global::NUM_OF_CANDIDATES_VECTORS;
 use crate::plan::lxr::stack::ChunkedStack;
 pub(super) struct LXRGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
@@ -83,15 +84,18 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         
         #[cfg(feature = "s_rc_stats")]
-        self.print_stats(lxr);
+        self.print_stats(lxr, (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1);
         let mut s_candidates = unsafe {
             lxr.s_cycle_candidates_mut()
         };
 
         let mut i = 0;
         while i < s_candidates.len() {
-            if self.should_mark(s_candidates[i]) {
+            if self.should_mark(s_candidates[i], (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) {
                 self.mark(s_candidates[i], #[cfg(feature = "s_rc_stats")] lxr);
+                unsafe {
+                    CANDIDATES_STATUS.store::<u8>(s_candidates[i].to_raw_address(),0 as u8);
+                }
                 i+=1;
             }
             else {
@@ -254,6 +258,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             unsafe {
                 if OBJ_COLOR_TABLE.load::<u8>(curr.to_raw_address()) == WHITE{
                     STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),0);
+                    CANDIDATES_STATUS.store::<u8>(curr.to_raw_address(),0 as u8);
                     OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_OUT_OF_STACK);
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                     debug_assert!(lxr.rc.count(curr) == 0);
@@ -325,13 +330,15 @@ impl<VM: VMBinding> CycleCollector<VM>{
         }
     }
 
-    fn should_mark(&self, o: ObjectReference) -> bool{
+    fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
         return self.rc.count(o) > 0 && unsafe {
-            OBJ_COLOR_TABLE.load::<u8>(o.to_raw_address()) != GREY
-        } 
+            OBJ_COLOR_TABLE.load::<u8>(o.to_raw_address()) != GREY &&
+            CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx} 
     }
+
+
     #[cfg(feature = "s_rc_stats")]
-    fn print_stats(&self, lxr: &LXR<VM>) {
+    fn print_stats(&self, lxr: &LXR<VM>, vec_indx: u8) {
         println!("===GOT TO CYCLE COLLECTION PHAZE===");
         let mut s_candidates = unsafe {
             lxr.s_cycle_candidates_mut()
@@ -363,7 +370,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
         num_of_dupcs = 0;
         num_of_dead_candidates = 0;
         for obj in s_candidates.iter(){
-            if lxr.rc.count(*obj) > 0{
+            if self.should_mark(*obj, vec_indx){
                 if !real_strong_candidates.contains(obj){
                     real_strong_candidates.push(*obj);
                 }

@@ -1067,6 +1067,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             let result = self.rc.clone().fetch_update(o, |c| {
                 if c == 1 && !dead {
                     STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(),0 as u8, Ordering::Relaxed);
+                    CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),0 as u8, Ordering::Relaxed);
                     dead = true;
                     is_los = self.process_dead_object(o, lxr);
                 }
@@ -1096,9 +1097,12 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 let s_rc_prev_val = self.rc.clone().strong_rc_dec(o);
                 if (s_rc_prev_val == Ok(1)){
                     let s_candidates = unsafe {
-                        lxr.s_cycle_candidates_mut()
+                        lxr.curr_s_cycle_candidates_mut()
                     };
-                    s_candidates.push(o);
+                    if CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0{
+                        CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                        s_candidates.push(o);
+                    }
                     debug_assert!(s_candidates.contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
                     #[cfg(feature = "sanity")]
@@ -1111,9 +1115,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     }
                 }
                 unsafe {
-                    debug_assert!(s_rc_prev_val != Ok(0) || lxr.s_cycle_candidates().contains(&o));
-                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o) 
-                                || lxr.s_cycle_candidates().contains(&o));
+                    debug_assert!(s_rc_prev_val != Ok(0) || lxr.curr_s_cycle_candidates_mut().contains(&o));
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o));
                 }
             }
             if crate::args::PREFETCH {

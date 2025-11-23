@@ -28,7 +28,7 @@ use crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::metadata::MetadataSpec;
 use crate::util::options::{GCTriggerSelector, Options};
-use crate::util::rc::{RefCountHelper, RC_LOCK_BIT_SPEC, RC_TABLE, STRONG_RC_TABLE, IN_STACK_TABLE};
+use crate::util::rc::{RefCountHelper, RC_LOCK_BIT_SPEC, RC_TABLE, STRONG_RC_TABLE, CANDIDATES_STATUS};
 #[cfg(feature = "sanity")]
 use crate::util::sanity::sanity_checker::*;
 use crate::util::{metadata, Address, ObjectReference};
@@ -45,6 +45,7 @@ use std::sync::{Condvar, Mutex, RwLock};
 use std::time::SystemTime;
 use std::marker::PhantomData;
 use std::cell::UnsafeCell;
+use std::cell::Cell;
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -72,6 +73,7 @@ enum GCCause {
     FinalMark,
 }
 
+pub const NUM_OF_CANDIDATES_VECTORS: u8 = 3;
 #[derive(HasSpaces, PlanTraceObject)]
 pub struct LXR<VM: VMBinding> {
     #[post_scan]
@@ -99,7 +101,8 @@ pub struct LXR<VM: VMBinding> {
     pub(super) barrier_decs: AtomicUsize,
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
-    pub s_cycle_candidates: UnsafeCell<Vec<ObjectReference>>,
+    pub s_cycle_candidates: UnsafeCell<Vec<Vec<ObjectReference>>>,
+    pub curr_vec: Cell<u8>,
     #[cfg(feature = "s_rc_stats")]
     pub cycle_candidates: Mutex<Vec<ObjectReference>>,
     #[cfg(feature = "s_rc_stats")]
@@ -223,6 +226,8 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     }
 
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        let new_idx = (self.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS;
+        self.curr_vec.set(new_idx);
         #[cfg(feature = "nogc_no_zeroing")]
         if true {
             unreachable!();
@@ -577,8 +582,7 @@ impl<VM: VMBinding> LXR<VM> {
             ),
             MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
             MetadataSpec::OnSide(OBJ_COLOR_TABLE),
-            #[cfg(feature = "s_rc_stats")]
-            MetadataSpec::OnSide(IN_STACK_TABLE),
+            MetadataSpec::OnSide(CANDIDATES_STATUS),
             MetadataSpec::OnSide(STRONG_RC_TABLE),
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
@@ -617,7 +621,8 @@ impl<VM: VMBinding> LXR<VM> {
             rc: RefCountHelper::NEW,
             gc_cause: Atomic::new(GCCause::Unknown),
             barrier_decs: AtomicUsize::default(),
-            s_cycle_candidates: UnsafeCell::new(Vec::with_capacity(2048)),
+            s_cycle_candidates: UnsafeCell::new((0..NUM_OF_CANDIDATES_VECTORS).map(|_| Vec::with_capacity(2048)).collect()),
+            curr_vec: Cell::new(NUM_OF_CANDIDATES_VECTORS - 1),
             #[cfg(feature = "s_rc_stats")]
             cycle_candidates: Mutex::new(Vec::new()),
             #[cfg(feature = "s_rc_stats")]
@@ -1332,12 +1337,24 @@ impl<VM: VMBinding> LXR<VM> {
     /// Typically this should only be called in a stop-the-world / single-thread phase.
     #[inline]
     pub unsafe fn s_cycle_candidates_mut(&self) -> &mut Vec<ObjectReference> {
-        &mut *self.s_cycle_candidates.get()
+        let next_index: usize = ((self.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS) as usize;
+        &mut (&mut *self.s_cycle_candidates.get())[next_index]
     }
 
     /// Optional: read-only view (not strictly necessary)
     #[inline]
     pub unsafe fn s_cycle_candidates(&self) -> &Vec<ObjectReference> {
-        &*self.s_cycle_candidates.get()
+        let next_index: usize = ((self.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS) as usize;
+        & (&*self.s_cycle_candidates.get())[next_index]
+    }
+
+    pub unsafe fn curr_s_cycle_candidates_mut(&self) -> &mut Vec<ObjectReference> {
+        &mut (&mut *self.s_cycle_candidates.get())[self.curr_vec.get() as usize]
+    }
+
+    /// Optional: read-only view (not strictly necessary)
+    #[inline]
+    pub unsafe fn curr_s_cycle_candidates(&self) -> &Vec<ObjectReference> {
+        & (&*self.s_cycle_candidates.get())[self.curr_vec.get() as usize]
     }
 }
