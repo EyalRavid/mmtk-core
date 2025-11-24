@@ -1099,10 +1099,9 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     let s_candidates = unsafe {
                         lxr.curr_s_cycle_candidates_mut()
                     };
-                    if CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0{
-                        CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
-                        s_candidates.push(o);
-                    }
+                    CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                    s_candidates.push(o);
+
                     debug_assert!(s_candidates.contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
                     #[cfg(feature = "sanity")]
@@ -1114,6 +1113,16 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         
                     }
                 }
+                else if (s_rc_prev_val == Err(0)){
+                    let s_candidates = unsafe {
+                        lxr.curr_s_cycle_candidates_mut()
+                    };
+                    if CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) != lxr.curr_vec.get() + 1{
+                        CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                        s_candidates.push(o);
+                    }
+                }
+
                 unsafe {
                     debug_assert!(s_rc_prev_val != Ok(0) || lxr.curr_s_cycle_candidates_mut().contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o));
