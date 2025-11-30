@@ -93,16 +93,24 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         //let mut prev_num_of_scanned = 0;
         while i < s_candidates.len() {
             if self.should_mark(s_candidates[i], (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) {
-                
+                //println!("Reached marking candidate {}", i);
+                CANDIDATES_STATUS.store_atomic::<u8>(s_candidates[i].to_raw_address(), 0 as u8, Ordering::Relaxed);
                 self.mark(s_candidates[i], #[cfg(feature = "s_rc_stats")] lxr);
                 // #[cfg(feature = "s_rc_stats")]{
                 //     let mut num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
                 //     println!("candidate {} subgraph size = {}",i, *num_of_scanned - prev_num_of_scanned);
                 //     prev_num_of_scanned = *num_of_scanned;
                 // }
+                
                 i+=1;
             }
             else {
+                // println!("s_rc > 0 ? {}",  STRONG_RC_TABLE.load_atomic::<u8>(s_candidates[i].to_raw_address(), Ordering::Relaxed) > 0);
+                // println!("in other vec ? {}", 
+                // CANDIDATES_STATUS.load_atomic::<u8>(s_candidates[i].to_raw_address(), Ordering::Relaxed) != (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1);
+                if CANDIDATES_STATUS.load_atomic::<u8>(s_candidates[i].to_raw_address(), Ordering::Relaxed) == (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1 {
+                    CANDIDATES_STATUS.store_atomic::<u8>(s_candidates[i].to_raw_address(), 0 as u8, Ordering::Relaxed);
+                }
                 s_candidates.swap_remove(i);
             }
         }
@@ -164,23 +172,25 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     let prev = self.rc.dec(x);
                     debug_assert!(prev != Err(0));
                     debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
+                    self.rc.strong_rc_dec(x);
                     dfs_stack.push(x);
                 }
             };
             unsafe{
-                if OBJ_COLOR_TABLE.load::<u8>(curr.to_raw_address()) == BLACK_OUT_OF_STACK{
-                    unsafe {
-                        CANDIDATES_STATUS.store::<u8>(curr.to_raw_address(),0 as u8);
-                    }
-                    //STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),0, Ordering::Relaxed);
+                if is_black(curr) && STRONG_RC_TABLE.load::<u8>(curr.to_raw_address()) == 0 &&
+                CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(),Ordering::Relaxed) == 0 as u8 
+                {
                     OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),GREY);
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
-
                     #[cfg(feature = "s_rc_stats")]
-                    {
-                        let mut  num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
-                        *num_of_scanned+=1;
-                    }
+                        {
+                            let mut  num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
+                            *num_of_scanned+=1;
+                        }
+                      //STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),0, Ordering::Relaxed);
+                }
+                else if is_black(curr){
+                    OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_IN_STACK);
                 }
             }  
         }
@@ -340,7 +350,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
     fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
         return self.rc.count(o) > 0 && unsafe {
             OBJ_COLOR_TABLE.load::<u8>(o.to_raw_address()) != GREY &&
-            CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx} 
+            CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx &&
+            STRONG_RC_TABLE.load::<u8>(o.to_raw_address()) == 0}; 
     }
 
 

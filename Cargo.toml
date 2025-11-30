@@ -100,8 +100,9 @@ default = [
     "dep:env_logger",
     "ix_always_defrag",
     "no_meta_counting",
-    "s_rc_stats",
-    "tracing",
+    #"s_rc_stats",
+    #"tracing",
+    "immix_non_moving",
 ]
 
 # Built-in env_logger.  This feature is enabled by default.
