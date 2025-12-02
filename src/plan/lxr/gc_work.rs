@@ -177,8 +177,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
             };
             unsafe{
-                if is_black(curr) && STRONG_RC_TABLE.load::<u8>(curr.to_raw_address()) == 0 &&
-                CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(),Ordering::Relaxed) == 0 as u8 
+                if is_black(curr)  
                 {
                     OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),GREY);
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
@@ -350,8 +349,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
         return self.rc.count(o) > 0 && unsafe {
             OBJ_COLOR_TABLE.load::<u8>(o.to_raw_address()) != GREY &&
-            CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx &&
-            STRONG_RC_TABLE.load::<u8>(o.to_raw_address()) == 0}; 
+            CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx}; 
     }
 
 

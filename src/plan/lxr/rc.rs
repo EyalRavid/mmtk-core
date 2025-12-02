@@ -1086,43 +1086,22 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 lxr.los().rc_free(o);
             }
             else if result != Ok(1){
-
-                //regular candidate
-                #[cfg(feature = "s_rc_stats")]
-                {
-                    let mut candidates = lxr.cycle_candidates.lock().unwrap();
-                    candidates.push(o);
-                }
-
                 let s_rc_prev_val = self.rc.clone().strong_rc_dec(o);
-                if (s_rc_prev_val == Ok(1)){
-                    let s_candidates = unsafe {
-                        lxr.curr_s_cycle_candidates_mut()
-                    };
-                    CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
-                    s_candidates.push(o);
+                let s_candidates = unsafe {
+                    lxr.curr_s_cycle_candidates_mut()
+                };
+                CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                s_candidates.push(o);
 
-                    debug_assert!(s_candidates.contains(&o));
-                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0);
-                    #[cfg(feature = "sanity")]
-                    {
-                        let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
-                        if !rc_sanity_objects.contains(&(o, 0 as u16)){
-                            rc_sanity_objects.push((o, 0 as u16));
-                        }
+                debug_assert!(s_candidates.contains(&o));
+                #[cfg(feature = "sanity")]
+                {
+                    let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
+                    if !rc_sanity_objects.contains(&(o, 0 as u16)){
+                        rc_sanity_objects.push((o, 0 as u16));
+                    }
                         
-                    }
                 }
-                else if (s_rc_prev_val == Err(0)){
-                    let s_candidates = unsafe {
-                        lxr.curr_s_cycle_candidates_mut()
-                    };
-                    if CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) != lxr.curr_vec.get() + 1{
-                        CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
-                        s_candidates.push(o);
-                    }
-                }
-
                 unsafe {
                     debug_assert!(s_rc_prev_val != Ok(0) || lxr.curr_s_cycle_candidates_mut().contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o));
