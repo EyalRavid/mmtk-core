@@ -73,7 +73,7 @@ enum GCCause {
     FinalMark,
 }
 
-pub const NUM_OF_CANDIDATES_VECTORS: u8 = 1;
+pub const NUM_OF_CANDIDATES_VECTORS: u8 = 3;
 #[derive(HasSpaces, PlanTraceObject)]
 pub struct LXR<VM: VMBinding> {
     #[post_scan]
