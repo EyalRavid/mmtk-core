@@ -177,7 +177,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
             };
             unsafe{
-                if is_black(curr)  
+                if is_black(curr) && CANDIDATES_STATUS.load::<u8>(curr.to_raw_address()) == 0
                 {
                     OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),GREY);
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
