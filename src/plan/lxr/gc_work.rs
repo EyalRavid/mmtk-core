@@ -114,6 +114,10 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 s_candidates.swap_remove(i);
             }
         }
+
+        #[cfg(feature = "s_rc_stats")]
+        println!("num of real candidates = {}", s_candidates.len());
+        
         for obj in s_candidates.iter(){
             self.scan(*obj);
         }
