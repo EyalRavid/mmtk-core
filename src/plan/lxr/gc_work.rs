@@ -114,6 +114,10 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 s_candidates.swap_remove(i);
             }
         }
+
+        #[cfg(feature = "s_rc_stats")]
+        println!("num of real candidates = {}", s_candidates.len());
+        
         for obj in s_candidates.iter(){
             self.scan(*obj);
         }
@@ -349,8 +353,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
     fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
         return self.rc.count(o) > 0 && unsafe {
-            CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx &&
-            STRONG_RC_TABLE.load::<u8>(o.to_raw_address()) == 0}; 
+            CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx}; 
     }
 
 
