@@ -103,6 +103,9 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 i+=1;
             }
             else {
+                if STRONG_RC_TABLE.load_atomic::<u8>(s_candidates[i].to_raw_address(), Ordering::Relaxed) > 0{
+                    CANDIDATES_STATUS.store_atomic::<u8>(s_candidates[i].to_raw_address(), 0, Ordering::Relaxed);
+                }
                 s_candidates.swap_remove(i);
             }
         }
