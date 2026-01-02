@@ -93,7 +93,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         //let mut prev_num_of_scanned = 0;
         while i < s_candidates.len() {
             if self.should_mark(s_candidates[i], (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) {
-                
+                CANDIDATES_STATUS.store_atomic::<u8>(s_candidates[i].to_raw_address(), 0, Ordering::Relaxed);
                 self.mark(s_candidates[i], #[cfg(feature = "s_rc_stats")] lxr);
                 // #[cfg(feature = "s_rc_stats")]{
                 //     let mut num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
