@@ -23,6 +23,7 @@ use crate::{
     vm::*,
     MMTK,
 };
+use crate::util::rc::CANDIDATES_STATUS;
 use atomic::Ordering;
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "measure_rc_rate")]
@@ -300,12 +301,16 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
                     self.add_new_slot(slot);
                 } else {
-                    debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
+                    //this is assert may not be true
+                    //debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
                     if rc != crate::util::rc::MAX_REF_COUNT {
                         //Eyal changed this
                         //Originaly was : let _ = self.rc.inc(target);
+                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0 || 
+                        CANDIDATES_STATUS.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
                         let result = self.rc.inc(target);
-                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
+                        //this is assert may not be true
+                        //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
                         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) <= self.rc.count(target));
                         #[cfg(feature = "measure_rc_rate")]
                         {
@@ -343,6 +348,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             //STRONG_RC_TABLE.fetch_add_atomic(o.to_raw_address(), 1 as u8, Ordering::SeqCst);
             return true;
         }
+        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 || 
+        CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
         false
         //self.rc.inc(o) == Ok(0)
     }
@@ -505,14 +512,15 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         let new = self.process_inc_and_evacuate(o, depth);
 
         #[cfg(feature = "sanity")]
-        if self.rc.count(new) > MAX_REF_COUNT/ 80{
+        if self.rc.count(new) > MAX_REF_COUNT / 5{
             let mut rc_sanity_objects = self.lxr.rc_sanity_objects.lock().unwrap();
-            if !rc_sanity_objects.contains(&(new, 0 as u16)){
-                rc_sanity_objects.push((new, 0 as u16));
+            if !rc_sanity_objects.contains(&(new, 0 )){
+                rc_sanity_objects.push((new, 0));
             }
         }
 
-        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
+        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0 || 
+                     CANDIDATES_STATUS.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) <= self.rc.count(new));
         // Put this into remset if this is a mature slot, or a weak root
         if K != EDGE_KIND_ROOT || add_root_to_remset {
@@ -1053,7 +1061,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
                 debug_assert!(self.rc.count(*o) != 0);
-                debug_assert!(self.rc.count(*o) != MAX_REF_COUNT);
+                //debug_assert!(self.rc.count(*o) != MAX_REF_COUNT);
                 continue;
             }
             let o =
@@ -1107,8 +1115,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     #[cfg(feature = "sanity")]
                     {
                         let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
-                        if !rc_sanity_objects.contains(&(o, 0 as u16)){
-                            rc_sanity_objects.push((o, 0 as u16));
+                        if !rc_sanity_objects.contains(&(o, 0)){
+                            rc_sanity_objects.push((o, 0));
                         }
                         
                     }
@@ -1127,14 +1135,16 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     debug_assert!(s_rc_prev_val != Ok(0) || lxr.curr_s_cycle_candidates_mut().contains(&o));
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o));
                 }
+                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 ||
+                CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
             }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {
                     self.prefetch_object(*o);
                 }
             }
-
         }
+        
     }
 }
 

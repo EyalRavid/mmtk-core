@@ -108,7 +108,7 @@ pub struct LXR<VM: VMBinding> {
     #[cfg(feature = "s_rc_stats")]
     pub num_of_scanned_s_rc_candidates: Mutex<u64>,
     #[cfg(feature = "sanity")]
-    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u16)>>,
+    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u8)>>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
