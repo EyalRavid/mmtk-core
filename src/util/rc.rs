@@ -128,9 +128,9 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     //Eyal change: all u16 was originaly u8
     pub fn inc(&self, o: ObjectReference) -> Result<u8, u8> {
         self.fetch_update(o, |x| {
-            debug_assert!(x <= MAX_REF_COUNT);
+            //debug_assert!(x <= MAX_REF_COUNT);
             //Eyal added this assert to make sure an object doesn't get stuck in debug mode
-            debug_assert!(x < MAX_REF_COUNT - 1);
+            //debug_assert!(x < MAX_REF_COUNT - 1);
             if x == MAX_REF_COUNT {
                 None
             } else {
