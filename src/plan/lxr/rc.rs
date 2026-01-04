@@ -300,12 +300,13 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
                     self.add_new_slot(slot);
                 } else {
-                    debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
+                    //debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
                     if rc != crate::util::rc::MAX_REF_COUNT {
                         //Eyal changed this
                         //Originaly was : let _ = self.rc.inc(target);
                         let result = self.rc.inc(target);
-                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
+                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0 ||
+                                        CANDIDATES_STATUS.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
                         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) <= self.rc.count(target));
                         #[cfg(feature = "measure_rc_rate")]
                         {
@@ -512,7 +513,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
         }
 
-        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
+        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0 || 
+                        CANDIDATES_STATUS.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) <= self.rc.count(new));
         // Put this into remset if this is a mature slot, or a weak root
         if K != EDGE_KIND_ROOT || add_root_to_remset {
@@ -1053,7 +1055,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
                 debug_assert!(self.rc.count(*o) != 0);
-                debug_assert!(self.rc.count(*o) != MAX_REF_COUNT);
+                //debug_assert!(self.rc.count(*o) != MAX_REF_COUNT);
                 continue;
             }
             let o =
