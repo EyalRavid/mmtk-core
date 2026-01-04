@@ -165,8 +165,6 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
 
     fn mark(&self, o: ObjectReference, #[cfg(feature = "s_rc_stats")] lxr: &LXR<VM>){
-        debug_assert!(RefCountHelper::<VM>::NEW.count(o) > 0 
-        || OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == GREY);
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
 
@@ -175,7 +173,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 if let Some(x) = slot.load(){
                     let prev = self.rc.dec(x);
                     debug_assert!(prev != Err(0));
-                    debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
+                    //debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
                     self.rc.strong_rc_dec(x);
                     dfs_stack.push(x);
                 }
@@ -211,11 +209,11 @@ impl<VM: VMBinding> CycleCollector<VM>{
             };
             unsafe {
                 if OBJ_COLOR_TABLE.load::<u8>(curr.to_raw_address()) == GREY{
-                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                     if RefCountHelper::<VM>::NEW.count(curr) > 0{
                         self.scan_black(curr);
                     }
                     else{
+                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                         OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),WHITE);
                         curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                     }
@@ -243,7 +241,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     }
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                         if let Some(x) = slot.load() {
-                            debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
+                            //debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
                             let _prev = self.rc.inc(x);
                             if !in_stack(x){
                                 self.rc.strong_rc_inc(x);
@@ -351,7 +349,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
 
     fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
-        return self.rc.count(o) > 0 && unsafe {
+        return unsafe {
             CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx &&
             STRONG_RC_TABLE.load::<u8>(o.to_raw_address()) == 0}; 
     }

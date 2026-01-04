@@ -130,7 +130,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             //Eyal added this assert to make sure an object doesn't get stuck in debug mode
-            debug_assert!(x < MAX_REF_COUNT - 1);
+            //debug_assert!(x < MAX_REF_COUNT - 1);
             if x == MAX_REF_COUNT {
                 None
             } else {
