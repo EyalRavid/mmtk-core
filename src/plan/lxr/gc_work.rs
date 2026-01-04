@@ -352,7 +352,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
 
     fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
-        return self.rc.count(o) > 0 && unsafe {
+        return unsafe {
             CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx &&
             STRONG_RC_TABLE.load::<u8>(o.to_raw_address()) == 0}; 
     }
