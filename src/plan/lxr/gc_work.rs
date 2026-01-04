@@ -108,9 +108,6 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                 // println!("s_rc > 0 ? {}",  STRONG_RC_TABLE.load_atomic::<u8>(s_candidates[i].to_raw_address(), Ordering::Relaxed) > 0);
                 // println!("in other vec ? {}", 
                 // CANDIDATES_STATUS.load_atomic::<u8>(s_candidates[i].to_raw_address(), Ordering::Relaxed) != (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1);
-                if CANDIDATES_STATUS.load_atomic::<u8>(s_candidates[i].to_raw_address(), Ordering::Relaxed) == (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1 {
-                    CANDIDATES_STATUS.store_atomic::<u8>(s_candidates[i].to_raw_address(), 0 as u8, Ordering::Relaxed);
-                }
                 s_candidates.swap_remove(i);
             }
         }
@@ -351,7 +348,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
 
     fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
-        return self.rc.count(o) > 0 && unsafe {
+        return unsafe {
             CANDIDATES_STATUS.load::<u8>(o.to_raw_address()) == vec_indx}; 
     }
 
