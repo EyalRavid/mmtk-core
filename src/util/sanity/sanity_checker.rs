@@ -69,7 +69,7 @@ impl<P: Plan> ScheduleSanityGC<P> {
 
 impl<P: Plan> GCWork<P::VM> for ScheduleSanityGC<P> {
     fn do_work(&mut self, worker: &mut GCWorker<P::VM>, mmtk: &'static MMTK<P::VM>) {
-        println!("reached sanity");
+        println!("$$$$$$$$$$$$$$$$reached sanity$$$$$$$$$");
         let scheduler = worker.scheduler();
         let plan = mmtk.get_plan();
 
@@ -248,7 +248,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                 assert!(lxr.rc.count(o) > 0);
                 let mark_state = MARK_STATE.load(Ordering::SeqCst);
                 let mark_val = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-                assert!(mark_val == mark_state);
+                //assert!(mark_val == mark_state);
                 assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
                         CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
                 true

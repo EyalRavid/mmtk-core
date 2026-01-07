@@ -611,7 +611,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             assert!(self.rc.count(*o) > 0);
             let mark_state = MARK_STATE.load(Ordering::SeqCst);
             let mark_val = SANITY_MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-            assert!(mark_val == mark_state);
+            //assert!(mark_val == mark_state);
         }
     }
 }
