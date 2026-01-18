@@ -11,34 +11,72 @@ use crate::{
 };
 use atomic::Ordering;
 
-//Eyal's code
-// pub const LOG_REF_COUNT_BITS: usize = 4; 
-
-// pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
-// pub const REF_COUNT_MASK: u16 = (((1u32 << REF_COUNT_BITS) - 1) & 0xffff) as u16;
-// pub const MAX_REF_COUNT: u16 = REF_COUNT_MASK;
-
-
+//Strong reference count constants
 pub const LOG_STRONG_REF_COUNT_BITS: usize = 2; 
 pub const STRONG_REF_COUNT_BITS: u8 = 1 << LOG_STRONG_REF_COUNT_BITS;
 pub const STRONG_REF_COUNT_MASK: u8 = (((1u16 << STRONG_REF_COUNT_BITS) - 1) & 0xff) as u8;
 pub const MAX_STRONG_REF_COUNT: u8 = STRONG_REF_COUNT_MASK;
+
+
+//size of rc field defintion
+#[cfg(feature = "lxr_rc_bits_2")]
+pub type RcBits = u8;
+#[cfg(feature = "lxr_rc_bits_4")]
+pub type RcBits = u8;
+#[cfg(feature = "lxr_rc_bits_8")]
+pub type RcBits = u8;
+#[cfg(feature = "lxr_rc_bits_16")]
+pub type RcBits = u16;
+#[cfg(feature = "lxr_rc_bits_32")]
+pub type RcBits = u32;
+#[cfg(feature = "lxr_rc_bits_64")]
+pub type RcBits = u64;
+
+#[cfg(not(any(
+    feature="lxr_rc_bits_2",
+    feature="lxr_rc_bits_4",
+    feature="lxr_rc_bits_8",
+    feature="lxr_rc_bits_16",
+    feature="lxr_rc_bits_32",
+    feature="lxr_rc_bits_64",
+)))]
+pub type RcBits = u8;
+
 //original code:
 
-pub const LOG_REF_COUNT_BITS: usize = {
-    if cfg!(feature = "lxr_rc_bits_2") {
-        1
-    } else if cfg!(feature = "lxr_rc_bits_4") {
-        2
-    } else if cfg!(feature = "lxr_rc_bits_8") {
-        3
-    } else {
-        1
-    }
-};
-pub const REF_COUNT_BITS: u8 = 1 << LOG_REF_COUNT_BITS;
-pub const REF_COUNT_MASK: u8 = (((1u16 << REF_COUNT_BITS) - 1) & 0xff) as u8;
-pub const MAX_REF_COUNT: u8 = REF_COUNT_MASK;
+#[cfg(feature="lxr_rc_bits_2")]
+pub const LOG_REF_COUNT_BITS: usize = 1;
+#[cfg(feature="lxr_rc_bits_4")]
+pub const LOG_REF_COUNT_BITS: usize = 2;
+#[cfg(feature="lxr_rc_bits_8")]
+pub const LOG_REF_COUNT_BITS: usize = 3;
+#[cfg(feature="lxr_rc_bits_16")]
+pub const LOG_REF_COUNT_BITS: usize = 4;
+#[cfg(feature="lxr_rc_bits_32")]
+pub const LOG_REF_COUNT_BITS: usize = 5;
+#[cfg(feature="lxr_rc_bits_64")]
+pub const LOG_REF_COUNT_BITS: usize = 6;
+
+// default
+#[cfg(not(any(
+    feature="lxr_rc_bits_2",
+    feature="lxr_rc_bits_4",
+    feature="lxr_rc_bits_8",
+    feature="lxr_rc_bits_16",
+    feature="lxr_rc_bits_32",
+    feature="lxr_rc_bits_64",
+)))]
+pub const LOG_REF_COUNT_BITS: usize = 3; // default to 8 bits
+
+
+
+pub const REF_COUNT_BITS: usize = 1 << LOG_REF_COUNT_BITS;
+
+pub const REF_COUNT_MASK: RcBits =
+    ((1u128 << REF_COUNT_BITS) - 1) as RcBits;
+
+pub const MAX_REF_COUNT: RcBits = REF_COUNT_MASK;
+
 
 pub const LOG_MIN_OBJECT_SIZE: usize = crate::util::constants::LOG_MIN_OBJECT_SIZE as _;
 pub const MIN_OBJECT_SIZE: usize = 1 << LOG_MIN_OBJECT_SIZE;
@@ -104,8 +142,8 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     pub fn fetch_update(
         &self,
         o: ObjectReference,
-        f: impl FnMut(u8) -> Option<u8>,
-    ) -> Result<u8, u8> {
+        f: impl FnMut(RcBits) -> Option<RcBits>,
+    ) -> Result<RcBits, RcBits> {
         RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
     }
 
@@ -114,7 +152,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     }
 
     //Eyal change: all u16 was originaly u8
-    pub fn stick(&self, o: ObjectReference) -> Result<u8, u8> {
+    pub fn stick(&self, o: ObjectReference) -> Result<RcBits, RcBits> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             if x == MAX_REF_COUNT {
@@ -126,7 +164,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     }
 
     //Eyal change: all u16 was originaly u8
-    pub fn inc(&self, o: ObjectReference) -> Result<u8, u8> {
+    pub fn inc(&self, o: ObjectReference) -> Result<RcBits, RcBits> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             //Eyal added this assert to make sure an object doesn't get stuck in debug mode
@@ -139,7 +177,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         })
     }
     //Eyal change: all u16 was originaly u8
-    pub fn dec(&self, o: ObjectReference) -> Result<u8, u8> {
+    pub fn dec(&self, o: ObjectReference) -> Result<RcBits, RcBits> {
         self.fetch_update(o, |x| {
             debug_assert!(x <= MAX_REF_COUNT);
             if x == 0 || x == MAX_REF_COUNT
@@ -152,16 +190,16 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         })
     }
     //Eyal change: all u16 was originaly u8
-    pub fn set(&self, o: ObjectReference, count: u8) {
+    pub fn set(&self, o: ObjectReference, count: RcBits) {
         RC_TABLE.store_atomic(o.to_raw_address(), count, Ordering::Relaxed)
     }
     //Eyal change: all u16 was originaly u8
-    pub fn set_relaxed(&self, o: ObjectReference, count: u8) {
+    pub fn set_relaxed(&self, o: ObjectReference, count: RcBits) {
         unsafe { RC_TABLE.store(o.to_raw_address(), count) }
     }
 
     //Eyal change: all u16 was originaly u8
-    pub fn count(&self, o: ObjectReference) -> u8 {
+    pub fn count(&self, o: ObjectReference) -> RcBits {
         RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed)
     }
 
@@ -180,7 +218,7 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     // }
     pub fn object_or_line_is_dead(&self, o: ObjectReference) -> bool {
         //RC_TABLE.load_byte(o.to_raw_address()) == 0
-        RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0
+        RC_TABLE.load_atomic::<RcBits>(o.to_raw_address(), Ordering::Relaxed) == 0
     }
 
     pub fn rc_table_range<UInt: Sized>(&self, b: Block) -> &'static [UInt] {
@@ -199,12 +237,12 @@ impl<VM: VMBinding> RefCountHelper<VM> {
     #[allow(unused)]
     //Eyal change: all u16 was originaly u8
     pub fn is_dead(&self, o: ObjectReference) -> bool {
-        let v: u8 = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
+        let v: RcBits = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
         v == 0
     }
 //Eyal change: all u16 was originaly u8
     pub fn is_dead_or_stuck(&self, o: ObjectReference) -> bool {
-        let v: u8 = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
+        let v: RcBits = RC_TABLE.load_atomic(o.to_raw_address(), Ordering::Relaxed);
         v == 0 || v == MAX_REF_COUNT
     }
 

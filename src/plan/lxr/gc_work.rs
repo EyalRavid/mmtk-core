@@ -21,6 +21,7 @@ use crate::vm::slot::MemorySlice;
 //Eyal added this:
 use crate::plan::lxr::global::NUM_OF_CANDIDATES_VECTORS;
 use crate::plan::lxr::stack::ChunkedStack;
+use crate::util::rc::RcBits;
 pub(super) struct LXRGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
 impl<E: ProcessEdgesWork> crate::scheduler::GCWorkContext for LXRGCWorkContext<E> {
@@ -235,13 +236,13 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(self.rc.count(*curr) > 0);
             unsafe {
                 if !is_black(*curr){
-                    OBJ_COLOR_TABLE.store::<u8>(curr.to_raw_address(),BLACK_IN_STACK);
+                    OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed);
                     let s_rc = self.rc.count(*curr);
-                    if s_rc > MAX_STRONG_REF_COUNT{
-                        STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT);
+                    if s_rc > MAX_STRONG_REF_COUNT as RcBits{
+                        STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::Relaxed);
                     }
                     else{
-                        STRONG_RC_TABLE.store::<u8>(curr.to_raw_address(),s_rc);
+                        STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),s_rc as u8, Ordering::Relaxed);
                     }
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                         if let Some(x) = slot.load() {
@@ -278,7 +279,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
             };
             
-            debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) <= lxr.rc.count(curr));
+            debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
             unsafe {
                 if OBJ_COLOR_TABLE.load::<u8>(curr.to_raw_address()) == WHITE{
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
@@ -321,7 +322,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
             };
             curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
-            debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) <= lxr.rc.count(curr));
+            debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
             debug_assert!(is_black(curr) && self.rc.clone().count(curr) == 0);
             CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(),0 as u8, Ordering::Relaxed);
             OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_OUT_OF_STACK, Ordering::Relaxed);

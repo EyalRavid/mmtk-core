@@ -311,7 +311,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                         let result = self.rc.inc(target);
                         //this is assert may not be true
                         //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
-                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) <= self.rc.count(target));
+                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(target));
                         #[cfg(feature = "measure_rc_rate")]
                         {
                             self.inc_objs += 1;
@@ -521,7 +521,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
         debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0 || 
                      CANDIDATES_STATUS.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
-        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) <= self.rc.count(new));
+        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(new));
         // Put this into remset if this is a mature slot, or a weak root
         if K != EDGE_KIND_ROOT || add_root_to_remset {
             self.record_mature_evac_remset(s, new);
@@ -1133,7 +1133,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
                 unsafe {
                     debug_assert!(s_rc_prev_val != Ok(0) || lxr.curr_s_cycle_candidates_mut().contains(&o));
-                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) <= self.rc.count(o));
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(o));
                 }
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 ||
                 CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);

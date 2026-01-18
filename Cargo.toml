@@ -183,6 +183,9 @@ lxr_buf_2048 = []
 lxr_rc_bits_2 = []
 lxr_rc_bits_4 = []
 lxr_rc_bits_8 = []
+lxr_rc_bits_16 = []
+lxr_rc_bits_32 = []
+lxr_rc_bits_64 = []
 
 # LXR Features
 lxr_hole_counting = []
