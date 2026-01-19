@@ -535,7 +535,6 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             //     self.rc.count(new),
             //     K
             // );
-            panic!("object was copied");
             s.store(Some(new))
         } else {
             // gc_log!(
