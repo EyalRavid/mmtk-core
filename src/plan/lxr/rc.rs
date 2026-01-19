@@ -10,6 +10,7 @@ use crate::util::address::CLDScanPolicy;
 use crate::util::address::RefScanPolicy;
 use crate::util::copy::CopySemantics;
 use crate::util::copy::GCWorkerCopyContext;
+use crate::util::epilogue::debug_assert_counter_zero;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::rc::*;
 use crate::vm::slot::MemorySlice;
@@ -398,16 +399,21 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             let new = if object_forwarding::is_forwarded::<VM>(o) {
                 object_forwarding::read_forwarding_pointer::<VM>(o)
             } else {
+                panic!("object must be copied");
                 o
             };
             let promoted = self.inc(new);
-
+            debug_assert!(promoted == false);
             //Eyal added this if
             if !promoted && KIND == EDGE_KIND_ROOT{
-                self.rc.strong_rc_inc(new);
+                self.rc.clone().strong_rc_inc(new);
+            }
+            else if KIND == EDGE_KIND_MATURE && o != new && !promoted{
+                self.rc.clone().strong_rc_inc(new);
             }
 
             if promoted && new == o {
+                panic!("object must be copied");
                 self.promote(o, false, los, depth);
             }
             return new;
@@ -426,7 +432,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         if object_forwarding::state_is_forwarded_or_being_forwarded(forwarding_status) {
             // Object is moved to a new location.
             let new = object_forwarding::spin_and_get_forwarded_object::<VM>(o, forwarding_status);
-            if !self.inc(new) && KIND == EDGE_KIND_ROOT{
+            debug_assert!(self.rc.clone().count(o) != 0);
+            if !self.inc(new) && (KIND == EDGE_KIND_ROOT || KIND == EDGE_KIND_MATURE){
                 self.rc.strong_rc_inc(new);
             }
             new
@@ -535,7 +542,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             //     self.rc.count(new),
             //     K
             // );
-            panic!("object was copied");
+            //panic!("object was copied");
             s.store(Some(new))
         } else {
             // gc_log!(
