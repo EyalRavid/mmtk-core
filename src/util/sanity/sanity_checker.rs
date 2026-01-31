@@ -16,6 +16,7 @@ use crate::util::heap::chunk_map::ChunkState;
 use crate::util::linear_scan::Region;
 use crate::util::rc;
 use crate::policy::immix::line::Line;
+use crate::util::rc::RcBits;
 #[allow(dead_code)]
 pub struct SanityChecker<SL: Slot> {
     /// Visited objects
@@ -207,6 +208,13 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                     //this assertion was may be wrong beacuse of stuck objects
                     //assert!(real_rc == *rc, "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
                     assert!(real_rc >= *rc, "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
+                }
+
+                if cfg!(feature = "lxr_rc_bits_32") || cfg!(feature = "lxr_rc_bits_64"){
+                    assert!(real_rc == *rc || 
+                        CANDIDATES_STATUS.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
+                        STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0,
+                     "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
                 }
                 
             }
@@ -425,7 +433,7 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                 assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0 || 
                         CANDIDATES_STATUS.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0,
                          "{:?} has zero strong rc count and {} rc", object, lxr.rc.count(object));
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) <= lxr.rc.count(object));
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(object));
                 assert!(
                     unsafe { object.to_raw_address().load::<usize>() } != 0xdead,
                     "{:?} -> {:?} is killed by decs",

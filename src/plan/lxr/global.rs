@@ -46,6 +46,7 @@ use std::time::SystemTime;
 use std::marker::PhantomData;
 use std::cell::UnsafeCell;
 use std::cell::Cell;
+use crate::util::rc::RcBits;
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -108,7 +109,7 @@ pub struct LXR<VM: VMBinding> {
     #[cfg(feature = "s_rc_stats")]
     pub num_of_scanned_s_rc_candidates: Mutex<u64>,
     #[cfg(feature = "sanity")]
-    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u8)>>,
+    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, RcBits)>>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
