@@ -2,7 +2,6 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 
 use crate::util::linear_scan::Region;
-use crate::util::metadata::MetadataSpec;
 use crate::util::{metadata::side_metadata::address_to_meta_address, Address};
 use crate::{
     policy::immix::{block::Block, line::Line},
@@ -85,12 +84,10 @@ pub const RC_STRADDLE_LINES: SideMetadataSpec =
     crate::util::metadata::side_metadata::spec_defs::RC_STRADDLE_LINES;
 
 pub const RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::RC_TABLE;
+
 pub const STRONG_RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::STRONG_RC_TABLE;
 pub const OBJ_COLOR_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
 pub const CANDIDATES_STATUS: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::CANDIDATES_STATUS;
-pub const RC_LOCK_BITS: SideMetadataSpec =
-    crate::util::metadata::side_metadata::spec_defs::RC_LOCK_BITS;
-pub const RC_LOCK_BIT_SPEC: MetadataSpec = MetadataSpec::OnSide(RC_LOCK_BITS);
 
 static INC_BUFFER_SIZE: AtomicUsize = AtomicUsize::new(0);
 
