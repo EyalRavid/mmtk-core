@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use atomic::Ordering;
+use atomic_traits::fetch::Or;
 
 use super::LXR;
 use crate::plan::barriers::BarrierSemantics;
@@ -21,6 +22,7 @@ use crate::scheduler::WorkBucketStage;
 use crate::util::address::CLDScanPolicy;
 use crate::util::address::RefScanPolicy;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
+use crate::util::rc::{OBJ_COLOR_TABLE, BLACK_IN_STACK};
 use crate::util::*;
 use crate::vm::slot::MemorySlice;
 use crate::vm::slot::Slot;
@@ -91,6 +93,10 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
     }
 
     fn log_slot_and_get_old_target(&self, slot: VM::VMSlot) -> Result<Option<ObjectReference>, ()> {
+
+        if self.get_slot_logging_state(slot) == LOGGED_VALUE {
+            return Err(());
+        }
         let old = slot.load();
         if self.attempt_to_log_field(slot) {
             Ok(old)
@@ -171,9 +177,18 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
                 self.stat.los_incs += 1;
             }
         }
-        if self.incs.is_full() {
-            self.flush_incs();
-        }
+        // if self.incs.is_full() {
+        //     self.flush_incs();
+        // }
+        // if let Some(obj) = _src {
+        //      if OBJ_COLOR_TABLE.load_atomic::<u8>(obj.to_raw_address(),Ordering::SeqCst) > BLACK_IN_STACK {
+        //         self.lxr.satb_map.insert(slot, old);
+        //      }
+        //  }
+        //  else{
+        //     self.lxr.satb_map.insert(slot, old);
+        //     panic!("Null source for SATB logging: slot={:?}, old={:?}", slot, old);
+        //  }
     }
 
     fn enqueue_node(
