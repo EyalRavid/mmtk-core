@@ -47,6 +47,8 @@ use std::marker::PhantomData;
 use std::cell::UnsafeCell;
 use std::cell::Cell;
 use crate::util::rc::RcBits;
+use dashmap::DashMap;
+
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -110,6 +112,7 @@ pub struct LXR<VM: VMBinding> {
     pub num_of_scanned_s_rc_candidates: Mutex<u64>,
     #[cfg(feature = "sanity")]
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, RcBits)>>,
+    pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
@@ -227,6 +230,9 @@ impl<VM: VMBinding> Plan for LXR<VM> {
     }
 
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
+
+        self.satb_map.clear();
+
         let new_idx = (self.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS;
         self.curr_vec.set(new_idx);
         #[cfg(feature = "nogc_no_zeroing")]
@@ -629,6 +635,7 @@ impl<VM: VMBinding> LXR<VM> {
             num_of_scanned_s_rc_candidates: Mutex::new(0),
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),
+            satb_map: DashMap::with_capacity(2048),
         });
 
         lxr.update_fixed_alloc_trigger();
@@ -969,7 +976,7 @@ impl<VM: VMBinding> LXR<VM> {
             .add(Release::<LXRGCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
 
         // New cycleCollection Phaze. corrently only prints "GOT TO CYCLE COLLECTION PHAZE"
-        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
+        //scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
     }
 
     fn dump_memory(&self, pause: Pause) {
@@ -1131,6 +1138,10 @@ impl<VM: VMBinding> LXR<VM> {
             " - lazy decs finished since-gc-start={:.3}ms",
             crate::gc_start_time_ms(),
         );
+        self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained].add(CycleCollector::<VM>::new(c));
+    }
+
+    fn on_lazy_cc_finished(&self, c: LazySweepingJobsCounter) {
         self.immix_space.schedule_rc_block_sweeping_tasks(c);
     }
 
@@ -1213,6 +1224,12 @@ impl<VM: VMBinding> LXR<VM> {
             let lxr = unsafe { &*(lxr_ptr as *const Self) };
             lxr.on_lazy_decs_finished(c);
         }));
+
+        lazy_sweeping_jobs.end_of_cc = Some(Box::new(move |c| {
+            let lxr = unsafe { &*(lxr_ptr as *const Self) };
+            lxr.on_lazy_cc_finished(c);
+        }));
+
         lazy_sweeping_jobs.end_of_lazy = Some(Box::new(move || {
             let lxr = unsafe { &*(lxr_ptr as *const Self) };
             lxr.on_lazy_sweeping_finished();

@@ -298,6 +298,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 //     target
                 // );
                 let rc = self.rc.count(target);
+                assert!(rc != 1);
                 if rc == 0 {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
                     self.add_new_slot(slot);
@@ -344,8 +345,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     //originaly was a:
     //self.rc.inc(o) == Ok(0)
     fn inc(&self, o: ObjectReference) -> bool {
+        assert!(self.rc.count(o) != 1);
         if self.rc.inc(o) == Ok(0){
             self.rc.clone().strong_rc_inc(o);
+            self.rc.clone().inc(o);
             //STRONG_RC_TABLE.fetch_add_atomic(o.to_raw_address(), 1 as u8, Ordering::SeqCst);
             return true;
         }
@@ -997,6 +1000,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         // println!(" -- rec dec {:?}.{:?} -> {:?}", o, slot, x);
                         if !out_of_heap {
                             let rc = self.rc.count(x);
+                            assert!(rc > 1);
                             if rc != MAX_REF_COUNT && rc != 0 {
                                 self.recursive_dec(x);
                             }
@@ -1079,8 +1083,10 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 };
             let mut dead = false;
             let mut is_los = false;
+            assert!(self.rc.count(o) > 1);
             let result = self.rc.clone().fetch_update(o, |c| {
-                if c == 1 && !dead {
+                assert!(c != 1);
+                if c == 2 && !dead {
                     STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(),0 as u8, Ordering::Relaxed);
                     CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(),0 as u8, Ordering::Relaxed);
                     dead = true;
@@ -1096,11 +1102,15 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     Some(c - 1)
                 }
             });
-
-            if result == Ok(1) && is_los {
-                lxr.los().rc_free(o);
+            assert!(result != Err(0));
+            assert!(result != Ok(1));
+            if result == Ok(2) {
+                self.rc.clone().dec(o);
+                if is_los {
+                    lxr.los().rc_free(o);
+                }
             }
-            else if result != Ok(1){
+            else if result != Ok(2){
 
                 //regular candidate
                 #[cfg(feature = "s_rc_stats")]

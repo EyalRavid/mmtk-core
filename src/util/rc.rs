@@ -89,6 +89,12 @@ pub const STRONG_RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metada
 pub const OBJ_COLOR_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
 pub const CANDIDATES_STATUS: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::CANDIDATES_STATUS;
 
+pub const BLACK_OUT_OF_STACK: u8 = 0;
+pub const BLACK_IN_STACK: u8 = 1;
+pub const GREY: u8 = 2;
+pub const WHITE: u8 = 3;
+
+
 static INC_BUFFER_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 static TOTAL_INCS_PACKETS: AtomicU32 = AtomicU32::new(0);

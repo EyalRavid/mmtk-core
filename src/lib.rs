@@ -91,6 +91,7 @@ static NUM_CONCURRENT_TRACING_PACKETS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct LazySweepingJobsCounter {
     decs_counter: Option<Arc<AtomicUsize>>,
+    cc_counter: Option<Arc<AtomicUsize>>,   // Eyal added this for cycle collection phase
     counter: Arc<AtomicUsize>,
 }
 impl LazySweepingJobsCounter {
@@ -100,6 +101,7 @@ impl LazySweepingJobsCounter {
         counter.fetch_add(1, Ordering::SeqCst);
         Self {
             decs_counter: None,
+            cc_counter: None,
             counter: counter.clone(),
         }
     }
@@ -112,6 +114,23 @@ impl LazySweepingJobsCounter {
         counter.fetch_add(1, Ordering::SeqCst);
         Self {
             decs_counter: Some(decs_counter.clone()),
+            cc_counter: None,
+            counter: counter.clone(),
+        }
+    }
+
+    pub fn new_cc() -> Self {
+        let lazy = LAZY_SWEEPING_JOBS.read();
+    
+        let cc = lazy.curr_cc_counter.as_ref().unwrap();
+        cc.fetch_add(1, Ordering::SeqCst);
+    
+        let counter = lazy.curr_counter.as_ref().unwrap();
+        counter.fetch_add(1, Ordering::SeqCst);
+    
+        Self {
+            decs_counter: None,
+            cc_counter: Some(cc.clone()),
             counter: counter.clone(),
         }
     }
@@ -121,6 +140,7 @@ impl LazySweepingJobsCounter {
         self.counter.fetch_add(1, Ordering::SeqCst);
         Self {
             decs_counter: None,
+            cc_counter: None,
             counter: self.counter.clone(),
         }
     }
@@ -133,6 +153,17 @@ impl LazySweepingJobsCounter {
         self.counter.fetch_add(1, Ordering::SeqCst);
         Self {
             decs_counter: self.decs_counter.clone(),
+            cc_counter: None,
+            counter: self.counter.clone(),
+        }
+    }
+
+    pub fn clone_with_cc(&self) -> Self {
+        self.cc_counter.as_ref().unwrap().fetch_add(1, Ordering::SeqCst);
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        Self {
+            decs_counter: None,
+            cc_counter: self.cc_counter.clone(),
             counter: self.counter.clone(),
         }
     }
@@ -140,15 +171,27 @@ impl LazySweepingJobsCounter {
 
 impl Drop for LazySweepingJobsCounter {
     fn drop(&mut self) {
-        let lazy_sweeping_jobs = LAZY_SWEEPING_JOBS.read();
+        let lazy = LAZY_SWEEPING_JOBS.read();
+
+        // 1) decs finished? -> trigger end_of_decs(token_for_overall)
         if let Some(decs) = self.decs_counter.as_ref() {
             if decs.fetch_sub(1, Ordering::SeqCst) == 1 {
-                let f = lazy_sweeping_jobs.end_of_decs.as_ref().unwrap();
-                f(self.clone())
+                let f = lazy.end_of_decs.as_ref().unwrap();
+                f(LazySweepingJobsCounter::new_cc()); // keeps overall alive, NOT decs
             }
         }
+
+        // 2) cc finished? -> trigger end_of_cc(token_for_overall)
+        if let Some(cc) = self.cc_counter.as_ref() {
+            if cc.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let f = lazy.end_of_cc.as_ref().unwrap();
+                f(self.clone()); // keeps overall alive, NOT cc
+            }
+        }
+
+        // 3) overall finished? -> trigger end_of_lazy()
         if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
-            if let Some(f) = lazy_sweeping_jobs.end_of_lazy.as_ref() {
+            if let Some(f) = lazy.end_of_lazy.as_ref() {
                 f()
             }
         }
@@ -158,9 +201,12 @@ impl Drop for LazySweepingJobsCounter {
 pub struct LazySweepingJobs {
     prev_decs_counter: Option<Arc<AtomicUsize>>,
     curr_decs_counter: Option<Arc<AtomicUsize>>,
+    prev_cc_counter: Option<Arc<AtomicUsize>>,      // Eyal added this for cycle collection phase
+    curr_cc_counter: Option<Arc<AtomicUsize>>,      // Eyal added this for cycle collection phase
     prev_counter: Option<Arc<AtomicUsize>>,
     curr_counter: Option<Arc<AtomicUsize>>,
     pub end_of_decs: Option<Box<dyn Send + Sync + Fn(LazySweepingJobsCounter)>>,
+    pub end_of_cc: Option<Box<dyn Send + Sync + Fn(LazySweepingJobsCounter)>>,     // Eyal added this for cycle collection phase
     pub end_of_lazy: Option<Box<dyn Send + Sync + Fn()>>,
 }
 
@@ -169,9 +215,12 @@ impl LazySweepingJobs {
         Self {
             prev_decs_counter: None,
             curr_decs_counter: None,
+            prev_cc_counter: None,
+            curr_cc_counter: None,
             prev_counter: None,
             curr_counter: None,
             end_of_decs: None,
+            end_of_cc: None,
             end_of_lazy: None,
         }
     }
@@ -189,6 +238,10 @@ impl LazySweepingJobs {
     pub fn swap(&mut self) {
         self.prev_decs_counter = self.curr_decs_counter.take();
         self.curr_decs_counter = Some(Arc::new(AtomicUsize::new(0)));
+    
+        self.prev_cc_counter = self.curr_cc_counter.take();
+        self.curr_cc_counter = Some(Arc::new(AtomicUsize::new(0)));
+    
         self.prev_counter = self.curr_counter.take();
         self.curr_counter = Some(Arc::new(AtomicUsize::new(0)));
     }

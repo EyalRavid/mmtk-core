@@ -177,9 +177,10 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
                 self.stat.los_incs += 1;
             }
         }
-        // if self.incs.is_full() {
-        //     self.flush_incs();
-        // }
+        if self.incs.is_full() {
+            self.flush_incs();
+        }
+        self.lxr.satb_map.insert(slot, old);
         // if let Some(obj) = _src {
         //      if OBJ_COLOR_TABLE.load_atomic::<u8>(obj.to_raw_address(),Ordering::SeqCst) > BLACK_IN_STACK {
         //         self.lxr.satb_map.insert(slot, old);
@@ -187,7 +188,7 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         //  }
         //  else{
         //     self.lxr.satb_map.insert(slot, old);
-        //     panic!("Null source for SATB logging: slot={:?}, old={:?}", slot, old);
+
         //  }
     }
 
