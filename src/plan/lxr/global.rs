@@ -50,7 +50,7 @@ use crate::util::rc::RcBits;
 use dashmap::DashMap;
 
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
-
+const SATB_DEFAULT_SIZE: usize = 2048;
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
 static ALLOC_TRIGGERED: AtomicBool = AtomicBool::new(false);
 static SURVIVAL_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -231,10 +231,10 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
 
-        self.satb_map.clear();
-
         let new_idx = (self.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS;
         self.curr_vec.set(new_idx);
+        //self.satb_map.clear();
+
         #[cfg(feature = "nogc_no_zeroing")]
         if true {
             unreachable!();
@@ -635,7 +635,7 @@ impl<VM: VMBinding> LXR<VM> {
             num_of_scanned_s_rc_candidates: Mutex::new(0),
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),
-            satb_map: DashMap::with_capacity(2048),
+            satb_map: DashMap::with_capacity(SATB_DEFAULT_SIZE),
         });
 
         lxr.update_fixed_alloc_trigger();

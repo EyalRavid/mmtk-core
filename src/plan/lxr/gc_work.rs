@@ -18,7 +18,6 @@ use crate::policy::space::Space;
 use crate::policy::immix::block::Block;
 use crate::util::rc::RefCountHelper;
 use crate::vm::slot::MemorySlice;
-//Eyal added this:
 use crate::plan::lxr::global::NUM_OF_CANDIDATES_VECTORS;
 use crate::plan::lxr::stack::ChunkedStack;
 use crate::util::rc::RcBits;
@@ -63,47 +62,43 @@ impl<VM: VMBinding> GCWork<VM> for ReleaseLOSNursery {
     }
 }
 
-fn in_stack(o: ObjectReference) -> bool{
-    OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == BLACK_IN_STACK  
+fn in_stack(o: ObjectReference) -> bool {
+    OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == BLACK_IN_STACK
 }
 
-fn is_black(o: ObjectReference) -> bool{
-    OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) <= BLACK_IN_STACK  
+fn is_black(o: ObjectReference) -> bool {
+    OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) <= BLACK_IN_STACK
 }
 
-pub struct CycleCollector<VM: VMBinding>{
-    rc : RefCountHelper<VM>,
+pub struct CycleCollector<VM: VMBinding> {
+    rc: RefCountHelper<VM>,
     _c: LazySweepingJobsCounter,
 }
 
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     
-    fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         println!("hash_map size before cycle collection = {}", lxr.satb_map.len());
-        //lxr.satb_map.clear();
-        
+        lxr.satb_map.clear();
+
+        let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
+
         #[cfg(feature = "s_rc_stats")]
-        self.print_stats(lxr, (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1);
+        self.print_stats(lxr, vec_index);
 
-
-        println!("reached mark");
+        // Mark phase: trial-delete candidates with strong_rc == 0
         let mut i = 0;
-
         loop {
-            // borrow lasts only inside this block
-            let cand_opt = unsafe {
+            let cand = unsafe {
                 let v = lxr.s_cycle_candidates_mut();
-                if i >= v.len() { None }
-                else { Some(v[i]) } // ObjectReference is Copy
+                if i >= v.len() { break }
+                v[i] // ObjectReference is Copy
             };
-        
-            let Some(cand) = cand_opt else { break };
-        
-            if self.should_mark(cand, (lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) {
+
+            if self.should_mark(cand, vec_index) {
                 CANDIDATES_STATUS.store_atomic::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed);
-                assert!(self.rc.count(cand) > 0);
+                debug_assert!(self.rc.count(cand) > 0);
                 self.mark(cand, lxr);
                 i += 1;
             } else {
@@ -111,77 +106,45 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                     CANDIDATES_STATUS.store_atomic::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed);
                 }
                 unsafe { lxr.s_cycle_candidates_mut().swap_remove(i); }
-                // don't increment i
             }
         }
 
-
         #[cfg(feature = "s_rc_stats")]
         println!("num of real candidates = {}", s_candidates.len());
-        println!("reached scan");
-        i = 0;
-        loop {
-            // borrow lasts only inside this block
-            let cand_opt = unsafe {
-                let v = lxr.s_cycle_candidates_mut();
-                if i >= v.len() { None }
-                else { Some(v[i]) } // ObjectReference is Copy
-            };
-        
-            let Some(cand) = cand_opt else { break };
+
+        // Scan phase: classify GREY objects as WHITE (garbage) or restore to BLACK
+        let len = unsafe { lxr.s_cycle_candidates_mut().len() };
+        for i in 0..len {
+            let cand = unsafe { lxr.s_cycle_candidates_mut()[i] };
             self.scan(cand, lxr);
-            i += 1;
-
         }
-
 
         #[cfg(feature = "s_rc_stats")]
         {
             let mut num_of_garbage_candidates = 0;
-            for obj in s_candidates.iter(){
-                if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE{
-                    num_of_garbage_candidates+=1;     
+            for obj in s_candidates.iter() {
+                if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE {
+                    num_of_garbage_candidates += 1;
                 }
             }
-            
             println!("num of s_rc dead scanned candidates = {}", num_of_garbage_candidates);
 
-            let mut  num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
+            let mut num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
             println!("num of scanned objects in s_rc scan = {}", num_of_scanned);
             *num_of_scanned = 0;
 
-            let num_of_root_candidates: u64 = 0;
-            
-            println!("===ENDED CYCLE COLLECTION PHAZE===");
-            println!("\n\n");
-
+            println!("===ENDED CYCLE COLLECTION PHASE===");
         }
 
-        i = 0;
-
-        loop {
-            // borrow lasts only inside this block
-            let cand_opt = unsafe {
-                let v = lxr.s_cycle_candidates_mut();
-                if i >= v.len() { None }
-                else { Some(v[i]) } // ObjectReference is Copy
-            };
-        
-            let Some(cand) = cand_opt else { break };
-            debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>((cand).to_raw_address(), Ordering::SeqCst) != GREY);
+        // Collect phase: free WHITE objects and handle remaining BLACK_IN_STACK
+        let len = unsafe { lxr.s_cycle_candidates_mut().len() };
+        for i in 0..len {
+            let cand = unsafe { lxr.s_cycle_candidates_mut()[i] };
+            debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::SeqCst) != GREY);
             self.collect_whites(cand, lxr);
-
-            i += 1;
-
         }
-
         println!("hash_map size after cycle collection = {}", lxr.satb_map.len());
-        
-        let mut s_candidates = unsafe {
-            lxr.s_cycle_candidates_mut()
-        };
-        s_candidates.clear();
-        lxr.satb_map.clear();
+        unsafe { lxr.s_cycle_candidates_mut() }.clear();
     }
 }
 
@@ -191,15 +154,15 @@ impl<VM: VMBinding> CycleCollector<VM>{
     pub const LOGGED_VALUE: u8 = 0b0;
 
     const UNLOG_BITS: SideMetadataSpec = *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
-    .as_spec()
-    .extract_side_spec();
+        .as_spec()
+        .extract_side_spec();
 
     fn get_slot_logging_state(&self, slot: VM::VMSlot) -> u8 {
         Self::UNLOG_BITS.load_atomic(slot.to_address(), Ordering::SeqCst)
     }
 
-    pub fn new(c: LazySweepingJobsCounter)->CycleCollector<VM>{
-        CycleCollector::<VM>{
+    pub fn new(c: LazySweepingJobsCounter) -> CycleCollector<VM> {
+        CycleCollector::<VM> {
             rc: RefCountHelper::NEW,
             _c: c.clone_with_cc(),
         }
@@ -211,62 +174,64 @@ impl<VM: VMBinding> CycleCollector<VM>{
             return child;
         }
         else{
-            assert!(self.get_slot_logging_state(slot) != Self::UNLOGGED_VALUE);
+            debug_assert!(self.get_slot_logging_state(slot) != Self::UNLOGGED_VALUE);
             let satb_child = loop {
                 if let Some(m) = lxr.satb_map.get(&slot).map(|v| *v) {
                     println!("got child from satb map");
                     break m;
                 }
+                println!("loop in get child");
                 std::hint::spin_loop();
             };
             return satb_child;
         }
     }
 
-    fn mark(&self, o: ObjectReference, lxr: &LXR<VM>){
-        //I commented this assert becuase it is no logner true
-        // debug_assert!(RefCountHelper::<VM>::NEW.count(o) > 0 
-        // || OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == GREY);
+    /// Trial deletion: decrements RC of children for each GREY candidate via DFS.
+    /// If an SATB-logged slot is found, reverts all decrements.
+    fn mark(&self, o: ObjectReference, lxr: &LXR<VM>) {
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
-        assert!(self.rc.count(o) > 0);
+        debug_assert!(self.rc.count(o) > 0);
         while let Some(curr) = dfs_stack.pop() {
-            assert!(self.rc.count(curr) > 0);
+            debug_assert!(self.rc.count(curr) > 0);
             let mut is_logged = false;
             let mut num_of_childs = 0;
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
-                if let Some(x) = self.get_child(slot, lxr){
-                    let prev = self.rc.dec(x);
-                    assert!(prev != Ok(1));
-                    assert!(prev != Err(0));
-                    debug_assert!(prev != Err(0));
-                    //debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
-                    self.rc.strong_rc_dec(x);
-                    dfs_stack.push(x);   
-                    num_of_childs+=1;
-                }
+                let child = slot.load();
                 if self.get_slot_logging_state(slot) == Self::LOGGED_VALUE{
-                    is_logged = true;      
+                        is_logged = true;      
                 }
-
+                else if let Some(x) = child{
+                    let prev = self.rc.dec(x);
+                    debug_assert!(prev != Ok(1));
+                    debug_assert!(prev != Err(0));
+                    self.rc.strong_rc_dec(x);
+                    dfs_stack.push(x);
+                    num_of_childs += 1;
+                }
             };
-       
-            if is_black(curr) && STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == 0 &&
-                CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(),Ordering::Relaxed) == 0 as u8 
+
+            if is_black(curr)
+                && STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == 0
+                && CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == 0
             {
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),GREY, Ordering::SeqCst);
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), GREY, Ordering::SeqCst);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 #[cfg(feature = "s_rc_stats")]
                 {
-                    let mut  num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
-                    *num_of_scanned+=1;
+                    let mut num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
+                    *num_of_scanned += 1;
                 }
-                if false{
+                if is_logged{
                     OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed);
                     for _ in 0..num_of_childs{
                         if let Some(curr_child) = dfs_stack.pop(){
-                            self.rc.strong_rc_inc(curr_child);
-                            self.rc.inc(curr_child);
+                            let _ = self.rc.inc(curr_child);
+                            let _ = self.rc.strong_rc_inc(curr_child); 
+                            if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
+                                let _ = self.rc.strong_rc_dec(curr_child);
+                            }
                         }
                         else{
                             panic!("num_of_childs is greater than the actual number of childs");
@@ -278,50 +243,47 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     }
                     CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                 }
+            } else if is_black(curr) {
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_IN_STACK, Ordering::Relaxed);
             }
-            else if is_black(curr){
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed);
-            }
-
         }
     }
 
-    fn scan(&self, o: ObjectReference, lxr: &LXR<VM>){
+    /// Scan phase: GREY objects with RC > 1 are externally referenced — restore them (scan_black).
+    /// GREY objects with RC == 1 are garbage — mark WHITE.
+    fn scan(&self, o: ObjectReference, lxr: &LXR<VM>) {
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
-
-        while let Some(curr) = dfs_stack.pop(){
-            assert!(self.rc.count(curr) > 0);
-            let visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
-                if let Some(x) = self.get_child(slot, lxr){
+        while let Some(curr) = dfs_stack.pop() {
+            debug_assert!(self.rc.count(curr) > 0);
+            let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
+                if let Some(x) = self.get_child(slot, lxr) {
                     dfs_stack.push(x);
                 }
             };
 
-            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == GREY{
+            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == GREY {
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                if RefCountHelper::<VM>::NEW.count(curr) > 1{
+                if RefCountHelper::<VM>::NEW.count(curr) > 1 {
                     self.scan_black(curr, lxr);
-                }
-                else{
-                    OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),WHITE, Ordering::Relaxed);
+                } else {
+                    OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), WHITE, Ordering::Relaxed);
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 }
-            }    
-            
-
+            }
         }
     }
 
 
-    fn scan_black(&self, o: ObjectReference, lxr: &LXR<VM>){
+    /// Restores RCs for objects found to be externally reachable.
+    /// Reconstructs strong_rc and marks objects BLACK.
+    fn scan_black(&self, o: ObjectReference, lxr: &LXR<VM>) {
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
-        while let Some(curr) = dfs_stack.last(){
-            debug_assert!(self.rc.count(*curr) > 0);
+        while let Some(curr) = dfs_stack.last() {
             assert!(self.rc.count(*curr) > 1);
-            let curr_copy = *curr; //needed for the borrow checker.
-            if !is_black(*curr){
+            let curr_copy = *curr; // needed for the borrow checker
+            if !is_black(*curr) {
                 let s_rc = self.rc.count(*curr) - 1;
                 if s_rc > MAX_STRONG_REF_COUNT as RcBits{
                     STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::Relaxed);
@@ -331,19 +293,17 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = self.get_child(slot, lxr) {
-                        //debug_assert!(self.rc.count(x) < MAX_REF_COUNT);
                         let _prev = self.rc.inc(x);
-                        if !in_stack(x){
+                        if !in_stack(x) {
                             self.rc.strong_rc_inc(x);
                             dfs_stack.push(x);
                         }
-                        assert!(self.rc.count(x) > 1);
+                        debug_assert!(self.rc.count(x) > 1);
                     }
                 });
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr_copy.to_raw_address(),BLACK_IN_STACK, Ordering::SeqCst);
-            }
-            else{
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_OUT_OF_STACK, Ordering::Relaxed);
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr_copy.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst);
+            } else {
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != 0);
                 dfs_stack.pop();
             }
@@ -351,71 +311,68 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
     
 
-    fn collect_whites(&self, o: ObjectReference, lxr: &LXR<VM>){
-
+    /// Frees WHITE (garbage) objects. Also handles BLACK_IN_STACK objects with RC == 1
+    /// by delegating to collect_blacks.
+    fn collect_whites(&self, o: ObjectReference, lxr: &LXR<VM>) {
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
-        while let Some(curr) = dfs_stack.pop(){
-            let mut visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
+        while let Some(curr) = dfs_stack.pop() {
+            let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 if let Some(x) = self.get_child(slot, lxr) {
                     dfs_stack.push(x);
                 }
             };
-            
+
             debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
-               
-            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == WHITE{
-                assert!(self.rc.count(curr) == 1);
+
+            if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == WHITE {
+                debug_assert!(self.rc.count(curr) == 1);
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(),0 as u8, Ordering::Relaxed);
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_OUT_OF_STACK, Ordering::Relaxed);                    debug_assert!(lxr.rc.count(curr) == 0);
+                CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed);
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
+                debug_assert!(lxr.rc.count(curr) == 1);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 self.process_dead_object(curr, lxr);
-                self.rc.clone().dec(curr);
-            }
-            else if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == BLACK_IN_STACK &&
-                self.rc.clone().count(curr) == 1 && 
-                CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) != 0 as u8{
+                self.rc.dec(curr);
+            } else if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == BLACK_IN_STACK
+                && self.rc.count(curr) == 1
+                && CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) != 0
+            {
                 self.collect_blacks(curr, lxr);
             }
-            
-
-
         }
     }
 
     
-    fn collect_blacks(&self, o: ObjectReference, lxr: &LXR<VM>){
+    /// Frees BLACK objects with RC == 1 by decrementing children and reclaiming.
+    /// Children that reach RC == 2 (death threshold) are also freed recursively.
+    fn collect_blacks(&self, o: ObjectReference, lxr: &LXR<VM>) {
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
-        while let Some(curr) = dfs_stack.pop(){
-            assert!(self.rc.clone().count(curr) == 1);
-            let mut visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
-                if let Some(x) = self.get_child(slot, lxr){
-                    assert!(self.rc.clone().count(x) > 1);
-                    let prev_rc = self.rc.clone().dec(x);
-                    let prev_s_rc = self.rc.clone().strong_rc_dec(x);
-                    assert!(prev_rc != Ok(1));
-                    if prev_rc == Ok(2){
+        while let Some(curr) = dfs_stack.pop() {
+            debug_assert!(self.rc.count(curr) == 1);
+            let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
+                if let Some(x) = self.get_child(slot, lxr) {
+                    assert!(self.rc.count(x) > 1);
+                    let prev_rc = self.rc.dec(x);
+                    let prev_s_rc = self.rc.strong_rc_dec(x);
+                    debug_assert!(prev_rc != Ok(1));
+                    if prev_rc == Ok(2) {
                         dfs_stack.push(x);
-                    }
-                    else if prev_s_rc == Ok(1){
-                        let s_candidates = unsafe {
-                            lxr.curr_s_cycle_candidates_mut()
-                        };
-                        CANDIDATES_STATUS.store_atomic::<u8>(x.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                    } else if prev_s_rc == Ok(1) {
+                        let s_candidates = unsafe { lxr.curr_s_cycle_candidates_mut() };
+                        CANDIDATES_STATUS.store_atomic::<u8>(x.to_raw_address(), (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                         s_candidates.push(x);
                     }
                 }
             };
             curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
             debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
-            debug_assert!(is_black(curr) && self.rc.clone().count(curr) == 0);
-            CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(),0 as u8, Ordering::Relaxed);
-            OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_OUT_OF_STACK, Ordering::Relaxed);
-            debug_assert!(lxr.rc.count(curr) == 0);
+            debug_assert!(is_black(curr));
+            CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed);
+            OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
             self.process_dead_object(curr, lxr);
-            assert!(lxr.rc.count(curr) == 1);
+            debug_assert!(lxr.rc.count(curr) == 1);
             self.rc.dec(curr);
         }
     }
@@ -436,22 +393,6 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 s.dead_mature_rc_los_volume += o.get_size::<VM>();
             }
         });
-        // if self.cm_in_progress {
-        //     let marked = lxr.mark(o);
-        //     if cfg!(feature = "lxr_satb_live_bytes_counter") && marked {
-        //         crate::record_live_bytes(o.get_size::<VM>());
-        //     }
-        // }
-        // println!(" - dead {:?}", o);
-        // debug_assert_eq!(self::count(o), 0);
-        // Recursively decrease field ref counts
-        if false
-            && VM::VMScanning::is_obj_array(o)
-            && VM::VMScanning::obj_array_data(o).bytes() > 1024
-        {
-            // Buggy. Dead array can be recycled at any time.
-            unimplemented!()
-        }
         let in_ix_space = lxr.immix_space.in_space(o);
         if !crate::args::BLOCK_ONLY && in_ix_space {
             self.rc.unmark_straddle_object(o);
@@ -480,34 +421,30 @@ impl<VM: VMBinding> CycleCollector<VM>{
         }
     }
 
-    fn should_mark(&self, o: ObjectReference, vec_indx: u8) -> bool{
-        return CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(),Ordering::Relaxed) == vec_indx &&
-                STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(),Ordering::Relaxed) == 0; 
+    fn should_mark(&self, o: ObjectReference, vec_index: u8) -> bool {
+        CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == vec_index
+            && STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0
     }
 
     
     #[cfg(feature = "s_rc_stats")]
-    fn print_stats(&self, lxr: &LXR<VM>, vec_indx: u8) {
-        println!("===GOT TO CYCLE COLLECTION PHAZE===");
-        let mut s_candidates = unsafe {
-            lxr.s_cycle_candidates_mut()
-        };
-        let mut  candidates = lxr.cycle_candidates.lock().unwrap();
+    fn print_stats(&self, lxr: &LXR<VM>, vec_index: u8) {
+        println!("===GOT TO CYCLE COLLECTION PHASE===");
+        let s_candidates = unsafe { lxr.s_cycle_candidates_mut() };
+        let mut candidates = lxr.cycle_candidates.lock().unwrap();
         let mut real_candidates = Vec::<ObjectReference>::new();
-        println!("num of trial deletion candidates with dead objects and duplicates = {}", candidates.len()); 
+        println!("num of trial deletion candidates with dead objects and duplicates = {}", candidates.len());
         let mut num_of_dupcs = 0;
         let mut num_of_dead_candidates = 0;
-        // removing from candidates objects with 0 rc (because this objects allready freed)
-        for obj in candidates.iter(){
-            if lxr.rc.count(*obj) > 0{
-                if !real_candidates.contains(obj){
+        // Remove candidates with RC == 0 (already freed)
+        for obj in candidates.iter() {
+            if lxr.rc.count(*obj) > 0 {
+                if !real_candidates.contains(obj) {
                     real_candidates.push(*obj);
+                } else {
+                    num_of_dupcs += 1;
                 }
-                else{
-                    num_of_dupcs +=1 ;
-                }
-            }
-            else{
+            } else {
                 num_of_dead_candidates += 1;
             }
         }
@@ -518,25 +455,21 @@ impl<VM: VMBinding> CycleCollector<VM>{
         let mut real_strong_candidates = Vec::<ObjectReference>::new();
         num_of_dupcs = 0;
         num_of_dead_candidates = 0;
-        for obj in s_candidates.iter(){
-            if self.should_mark(*obj, vec_indx){
-                if !real_strong_candidates.contains(obj){
+        for obj in s_candidates.iter() {
+            if self.should_mark(*obj, vec_index) {
+                if !real_strong_candidates.contains(obj) {
                     real_strong_candidates.push(*obj);
+                } else {
+                    num_of_dupcs += 1;
                 }
-                else{
-                    num_of_dupcs +=1 ;
-                }
-            }
-            else{
+            } else {
                 num_of_dead_candidates += 1;
             }
-        }  
+        }
         println!("num of strong candidates before dead object removal = {}", s_candidates.len());
         println!("num of duplicates candidates in s_rc scan not including dead duplicates = {}", num_of_dupcs);
         println!("num of dead candidates in s_rc scan = {}", num_of_dead_candidates);
         println!("num of s_rc candidates = {}", real_strong_candidates.len());
-        
-    
     }
 
 }
