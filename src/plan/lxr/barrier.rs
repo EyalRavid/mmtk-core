@@ -181,15 +181,17 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             self.flush_incs();
         }
         //self.lxr.satb_map.insert(slot, old);
-        if let Some(obj) = _src {
+        if (self.lxr.in_cycle_collection.load(Ordering::SeqCst) == true) {
+            if let Some(obj) = _src {
              if OBJ_COLOR_TABLE.load_atomic::<u8>(obj.to_raw_address(),Ordering::SeqCst) > BLACK_IN_STACK {
                 self.lxr.satb_map.insert(slot, old);
              }
          }
-         else{
-            self.lxr.satb_map.insert(slot, old);
+            else {
+                self.lxr.satb_map.insert(slot, old);
+            }
+        }
 
-         }
     }
 
     fn enqueue_node(

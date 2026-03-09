@@ -78,7 +78,9 @@ pub struct CycleCollector<VM: VMBinding> {
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        lxr.in_cycle_collection.store(true, Ordering::SeqCst);
         println!("hash_map size before cycle collection = {}", lxr.satb_map.len());
         lxr.satb_map.clear();
 
@@ -118,7 +120,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             let cand = unsafe { lxr.s_cycle_candidates_mut()[i] };
             self.scan(cand, lxr);
         }
-
+        lxr.in_cycle_collection.store(false, Ordering::Relaxed);
         #[cfg(feature = "s_rc_stats")]
         {
             let mut num_of_garbage_candidates = 0;
@@ -318,7 +320,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
-                if let Some(x) = self.get_child(slot, lxr) {
+                debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
+                if let Some(x) = slot.load() {
                     dfs_stack.push(x);
                 }
             };
@@ -352,7 +355,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
         while let Some(curr) = dfs_stack.pop() {
             debug_assert!(self.rc.count(curr) == 1);
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
-                if let Some(x) = self.get_child(slot, lxr) {
+                debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
+                if let Some(x) = slot.load() {
                     assert!(self.rc.count(x) > 1);
                     let prev_rc = self.rc.dec(x);
                     let prev_s_rc = self.rc.strong_rc_dec(x);

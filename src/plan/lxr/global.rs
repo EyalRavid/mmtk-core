@@ -113,6 +113,7 @@ pub struct LXR<VM: VMBinding> {
     #[cfg(feature = "sanity")]
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, RcBits)>>,
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
+    pub in_cycle_collection: AtomicBool,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
@@ -636,6 +637,7 @@ impl<VM: VMBinding> LXR<VM> {
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),
             satb_map: DashMap::with_capacity(SATB_DEFAULT_SIZE),
+            in_cycle_collection: AtomicBool::new(false),
         });
 
         lxr.update_fixed_alloc_trigger();
