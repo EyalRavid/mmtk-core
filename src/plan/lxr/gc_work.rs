@@ -72,6 +72,7 @@ fn is_black(o: ObjectReference) -> bool {
 
 pub struct CycleCollector<VM: VMBinding> {
     rc: RefCountHelper<VM>,
+    #[cfg(not(feature = "lxr_stw"))]
     _c: LazySweepingJobsCounter,
 }
 
@@ -163,9 +164,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
         Self::UNLOG_BITS.load_atomic(slot.to_address(), Ordering::SeqCst)
     }
 
-    pub fn new(c: LazySweepingJobsCounter) -> CycleCollector<VM> {
+    pub fn new(#[cfg(not(feature = "lxr_stw"))] c: LazySweepingJobsCounter) -> CycleCollector<VM> {
         CycleCollector::<VM> {
             rc: RefCountHelper::NEW,
+            #[cfg(not(feature = "lxr_stw"))]
             _c: c.clone_with_cc(),
         }
     }

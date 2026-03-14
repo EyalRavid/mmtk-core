@@ -978,7 +978,8 @@ impl<VM: VMBinding> LXR<VM> {
             .add(Release::<LXRGCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
 
         // New cycleCollection Phaze. corrently only prints "GOT TO CYCLE COLLECTION PHAZE"
-        //scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
+       #[cfg(feature = "lxr_stw")]
+        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
     }
 
     fn dump_memory(&self, pause: Pause) {
@@ -1140,6 +1141,10 @@ impl<VM: VMBinding> LXR<VM> {
             " - lazy decs finished since-gc-start={:.3}ms",
             crate::gc_start_time_ms(),
         );
+
+        // Schedule cycle collection. Added the cfg guard add support for cycle collection in stw settings.
+        //with stw feature, cycle collection is scheduled at the end of the ref count pause. on the cycleCollection phaze.
+        #[cfg(not(feature = "lxr_stw"))]
         self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained].add(CycleCollector::<VM>::new(c));
     }
 
