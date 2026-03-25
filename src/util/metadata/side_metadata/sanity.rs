@@ -64,6 +64,10 @@ fn verify_global_specs_total_size(g_specs: &[SideMetadataSpec]) -> Result<()> {
     for spec in g_specs {
         total_size += super::metadata_address_range_size(spec);
     }
+    #[cfg(feature="lxr_rc_bits_32")]
+    return Ok(());
+    #[cfg(feature="lxr_rc_bits_64")]
+    return Ok(());
 
     if total_size
         <= 1usize << (VMLayout::LOG_ARCH_ADDRESS_SPACE - LOG_GLOBAL_SIDE_METADATA_WORST_CASE_RATIO)

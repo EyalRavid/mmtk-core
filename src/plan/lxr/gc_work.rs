@@ -347,6 +347,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 s.dead_mature_rc_los_volume += o.get_size::<VM>();
             }
         });
+
+        #[cfg(feature = "sanity")]
+        crate::util::sanity::sanity_checker::SANITY_DEAD_CYCLE_COUNT
+            .store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
         // if self.cm_in_progress {
         //     let marked = lxr.mark(o);
         //     if cfg!(feature = "lxr_satb_live_bytes_counter") && marked {

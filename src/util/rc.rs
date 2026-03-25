@@ -91,7 +91,8 @@ pub const CANDIDATES_STATUS: SideMetadataSpec = crate::util::metadata::side_meta
 pub const RC_LOCK_BITS: SideMetadataSpec =
     crate::util::metadata::side_metadata::spec_defs::RC_LOCK_BITS;
 pub const RC_LOCK_BIT_SPEC: MetadataSpec = MetadataSpec::OnSide(RC_LOCK_BITS);
-
+#[cfg(feature = "sanity")]
+pub const SANITY_DEAD_CYCLE_COUNT: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::SANITY_DEAD_CYCLE_COUNT;
 static INC_BUFFER_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 static TOTAL_INCS_PACKETS: AtomicU32 = AtomicU32::new(0);

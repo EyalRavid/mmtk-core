@@ -964,6 +964,9 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 s.dead_mature_rc_los_volume += o.get_size::<VM>();
             }
         });
+        #[cfg(feature = "sanity")]
+        crate::util::sanity::sanity_checker::SANITY_DEAD_CYCLE_COUNT
+            .store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
         //Eyal commented this out
         // if self.cm_in_progress {
         //     let marked = lxr.mark(o);

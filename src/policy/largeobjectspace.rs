@@ -603,6 +603,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     //Eyal added this function to use in sanity gc
     #[cfg(feature = "sanity")]
     pub fn sanity_sweep_large_objects(&self) {
+        use crate::util::sanity::sanity_checker::SANITY_DEAD_CYCLE_COUNT;
         let mut mature_objects = self.rc_mature_objects.lock().unwrap();
         for (o, _size) in mature_objects.iter() {
             println!("this is a large object");
@@ -611,7 +612,13 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             assert!(self.rc.count(*o) > 0);
             let mark_state = MARK_STATE.load(Ordering::SeqCst);
             let mark_val = SANITY_MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-            //assert!(mark_val == mark_state);
+            if mark_val != mark_state {
+                let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
+                assert!(prev != 3, "Large object {:?} has been dead for 3 cycles without being collected", o);
+                SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), prev + 1, Ordering::SeqCst);
+            } else {
+                SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
+            }
         }
     }
 }

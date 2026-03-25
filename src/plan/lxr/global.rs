@@ -108,7 +108,7 @@ pub struct LXR<VM: VMBinding> {
     #[cfg(feature = "s_rc_stats")]
     pub num_of_scanned_s_rc_candidates: Mutex<u64>,
     #[cfg(feature = "sanity")]
-    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u8)>>,
+    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, u32)>>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
@@ -584,6 +584,8 @@ impl<VM: VMBinding> LXR<VM> {
             MetadataSpec::OnSide(OBJ_COLOR_TABLE),
             MetadataSpec::OnSide(CANDIDATES_STATUS),
             MetadataSpec::OnSide(STRONG_RC_TABLE),
+            #[cfg(feature = "sanity")]
+            MetadataSpec::OnSide(SANITY_DEAD_CYCLE_COUNT),
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
         let options = args.options.clone();

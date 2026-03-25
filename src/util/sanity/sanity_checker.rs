@@ -1,3 +1,5 @@
+#[cfg(not(any(feature = "lxr_rc_bits_32", feature = "lxr_rc_bits_64")))]
+compile_error!("Either `lxr_rc_bits_32` or `lxr_rc_bits_64` feature must be enabled");
 use crate::plan::Plan;
 use crate::policy::immix::block::{Block, BlockState};
 use crate::policy::space::Space;
@@ -16,6 +18,8 @@ use crate::util::heap::chunk_map::ChunkState;
 use crate::util::linear_scan::Region;
 use crate::util::rc;
 use crate::policy::immix::line::Line;
+pub const SANITY_DEAD_CYCLE_COUNT: SideMetadataSpec =
+    crate::util::metadata::side_metadata::spec_defs::SANITY_DEAD_CYCLE_COUNT;
 #[allow(dead_code)]
 pub struct SanityChecker<SL: Slot> {
     /// Visited objects
@@ -224,13 +228,21 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                             (!Line::is_aligned(o.to_raw_address()) || !lxr.rc.is_straddle_line(Line::from(o.to_raw_address()))) {
                 
                             let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);
-                            cursor = cursor + size;
+                            cursor = cursor + rc::MIN_OBJECT_SIZE;
                             assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
                                     CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
                             assert!(cursor <= limit);
 
-                            //this assertion was may be wrong beacuse of stuck objects
-                            //assert!(mark_val == mark_state, "size is, {}", size);
+                            // If the object is alive but not marked by sanity tracing, it is "dead" from sanity's perspective.
+                            // Track how many cycles it survives unmarked.
+                            if mark_val != mark_state {
+                                let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
+                                assert!(prev != 12 || lxr.rc.count(o) == 0, "Object {:?} has been dead for 12 cycles without being collected it has rc of: {}", o, lxr.rc.count(o));
+                                SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), prev + 1, Ordering::SeqCst);
+                            } else {
+                                // Object is live and marked — reset counter
+                                SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
+                            }
                         }
                         else{
                             cursor = cursor + rc::MIN_OBJECT_SIZE;
@@ -425,7 +437,7 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                 assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0 || 
                         CANDIDATES_STATUS.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0,
                          "{:?} has zero strong rc count and {} rc", object, lxr.rc.count(object));
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) <= lxr.rc.count(object));
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as u32 <= lxr.rc.count(object));
                 assert!(
                     unsafe { object.to_raw_address().load::<usize>() } != 0xdead,
                     "{:?} -> {:?} is killed by decs",
