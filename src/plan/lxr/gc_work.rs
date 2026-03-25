@@ -187,6 +187,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 println!("loop in get child");
                 std::hint::spin_loop();
             };
+            
             return satb_child;
         }
     }
@@ -232,7 +233,12 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     for _ in 0..num_of_childs{
                         if let Some(curr_child) = dfs_stack.pop(){
                             let _ = self.rc.inc(curr_child);
-                            let _ = self.rc.strong_rc_inc(curr_child); 
+                            //let _ = self.rc.strong_rc_inc(curr_child); 
+                           
+                        unsafe {
+                            lxr.curr_s_cycle_candidates_mut().push(curr_child);
+                        }
+                        CANDIDATES_STATUS.store_atomic::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                             if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
                                 let _ = self.rc.strong_rc_dec(curr_child);
                             }
@@ -262,6 +268,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(self.rc.count(curr) > 0);
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 if let Some(x) = self.get_child(slot, lxr) {
+                    debug_assert!(self.rc.count(x) > 0);
                     dfs_stack.push(x);
                 }
             };
@@ -341,8 +348,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 self.rc.dec(curr);
             } else if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == BLACK_IN_STACK
                 && self.rc.count(curr) == 1
-                && CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) != 0
             {
+                debug_assert!(CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) != 0);
                 self.collect_blacks(curr, lxr);
             }
         }
@@ -403,6 +410,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
         if !crate::args::BLOCK_ONLY && in_ix_space {
             self.rc.unmark_straddle_object(o);
         }
+        #[cfg(feature = "sanity")]
+        crate::util::sanity::sanity_checker::SANITY_DEAD_CYCLE_COUNT
+            .store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
         if cfg!(feature = "sanity") || ObjectReference::STRICT_VERIFICATION {
             unsafe { o.to_raw_address().store(0xdeadusize) };
         }
@@ -430,6 +440,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
     fn should_mark(&self, o: ObjectReference, vec_index: u8) -> bool {
         CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == vec_index
             && STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0
+        // STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0
+        //     && CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) != 0
     }
 
     

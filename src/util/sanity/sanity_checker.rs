@@ -1,9 +1,15 @@
+#[cfg(not(any(feature = "lxr_rc_bits_32", feature = "lxr_rc_bits_64")))]
+compile_error!("Either `lxr_rc_bits_32` or `lxr_rc_bits_64` feature must be enabled");
+
 use crate::plan::Plan;
 use crate::policy::immix::block::{Block, BlockState};
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::ObjectReference;
+
+pub const SANITY_DEAD_CYCLE_COUNT: SideMetadataSpec =
+    crate::util::metadata::side_metadata::spec_defs::SANITY_DEAD_CYCLE_COUNT;
 use crate::vm::slot::Slot;
 use crate::vm::*;
 use crate::MMTK;
@@ -190,23 +196,25 @@ impl<P: Plan> SanityRelease<P> {
 impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
     fn do_work(&mut self, _worker: &mut GCWorker<P::VM>, mmtk: &'static MMTK<P::VM>) {
         info!("Sanity GC release");
+        
         if let Some(lxr) = mmtk
             .get_plan()
             .downcast_ref::<crate::plan::lxr::LXR<P::VM>>()
         {
             lxr.los().sanity_sweep_large_objects();
             let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
+
             for (obj, rc) in rc_sanity_objects.iter() {
-                let real_rc = lxr.rc.count(*obj);
-                //println!("object: {} has real rc of: {}", obj.to_raw_address(), real_rc);
-                //println!("object: {} has acording to scan: {}", obj.to_raw_address(), *rc);
+                    let real_rc = lxr.rc.count(*obj);
+                    //println!("object: {} has real rc of: {}", obj.to_raw_address(), real_rc);
+                    //println!("object: {} has acording to scan: {}", obj.to_raw_address(), *rc);
                 if lxr.rc.is_stuck(*obj){
                     println!("stuck object in sanity!!!!!!!!!!!");
-                    //assert!(*rc > 0);
+                        //assert!(*rc > 0);
                 }
                 else{
-                    //this assertion was may be wrong beacuse of stuck objects
-                    //assert!(real_rc == *rc, "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
+                        //this assertion was may be wrong beacuse of stuck objects
+                        //assert!(real_rc == *rc, "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
                     assert!(real_rc >= *rc, "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
                 }
 
@@ -214,10 +222,10 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                     assert!(real_rc == *rc || 
                         CANDIDATES_STATUS.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
                         STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0,
-                     "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
+                        "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
                 }
-                
             }
+
             for chunk in lxr.immix_space.chunk_map.all_chunks()
             .filter(|c| lxr.immix_space.chunk_map.get(*c) == ChunkState::Allocated){
                 for block in chunk.iter_region::<Block>().filter(|block| block.get_state() != BlockState::Unallocated) {
@@ -232,15 +240,27 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                             (!Line::is_aligned(o.to_raw_address()) || !lxr.rc.is_straddle_line(Line::from(o.to_raw_address()))) {
                 
                             let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);
-                            cursor = cursor + size;
+                            cursor = cursor +  rc::MIN_OBJECT_SIZE;
                             assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
                                     CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
                             assert!(cursor <= limit);
+
+                            // If the object is alive but not marked by sanity tracing, it is "dead" from sanity's perspective.
+                            // Track how many cycles it survives unmarked.
+                            if mark_val != mark_state {
+                                let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
+                                assert!(prev != 12 || lxr.rc.count(o) == 0, "Object {:?} has been dead for 12 cycles without being collected it has rc of: {}", o, lxr.rc.count(o));
+                                SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), prev + 1, Ordering::SeqCst);
+                            } else {
+                                // Object is live and marked — reset counter
+                                SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
+                            }
 
                             //this assertion was may be wrong beacuse of stuck objects
                             //assert!(mark_val == mark_state, "size is, {}", size);
                         }
                         else{
+                            SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
                             cursor = cursor + rc::MIN_OBJECT_SIZE;
                         }
                         
@@ -433,7 +453,7 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                 assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0 || 
                         CANDIDATES_STATUS.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0,
                          "{:?} has zero strong rc count and {} rc", object, lxr.rc.count(object));
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(object));
+                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(object) - 1);
                 assert!(
                     unsafe { object.to_raw_address().load::<usize>() } != 0xdead,
                     "{:?} -> {:?} is killed by decs",
@@ -441,7 +461,7 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                     object
                 );
                 assert!(
-                    lxr.rc.count(object) > 0,
+                    lxr.rc.count(object) > 1,
                     "{:?} -> {:?} has zero rc count",
                     self.edge,
                     object

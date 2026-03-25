@@ -591,6 +591,8 @@ impl<VM: VMBinding> LXR<VM> {
             MetadataSpec::OnSide(OBJ_COLOR_TABLE),
             MetadataSpec::OnSide(CANDIDATES_STATUS),
             MetadataSpec::OnSide(STRONG_RC_TABLE),
+            #[cfg(feature = "sanity")]
+            MetadataSpec::OnSide(SANITY_DEAD_CYCLE_COUNT),
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
         let options = args.options.clone();

@@ -88,7 +88,8 @@ pub const RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spe
 pub const STRONG_RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::STRONG_RC_TABLE;
 pub const OBJ_COLOR_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
 pub const CANDIDATES_STATUS: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::CANDIDATES_STATUS;
-
+#[cfg(feature = "sanity")]
+pub const SANITY_DEAD_CYCLE_COUNT: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::SANITY_DEAD_CYCLE_COUNT;
 pub const BLACK_OUT_OF_STACK: u8 = 0;
 pub const BLACK_IN_STACK: u8 = 1;
 pub const GREY: u8 = 2;

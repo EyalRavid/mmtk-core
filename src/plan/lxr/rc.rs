@@ -1062,6 +1062,9 @@ impl<VM: VMBinding> ProcessDecs<VM> {
         if !crate::args::BLOCK_ONLY && in_ix_space {
             self.rc.unmark_straddle_object(o);
         }
+        #[cfg(feature = "sanity")]
+        crate::util::sanity::sanity_checker::SANITY_DEAD_CYCLE_COUNT
+            .store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
         if cfg!(feature = "sanity") || ObjectReference::STRICT_VERIFICATION {
             unsafe { o.to_raw_address().store(0xdeadusize) };
         }
