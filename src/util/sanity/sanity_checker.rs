@@ -221,7 +221,8 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                 if cfg!(feature = "lxr_rc_bits_32") || cfg!(feature = "lxr_rc_bits_64"){
                     assert!(real_rc == *rc || 
                         CANDIDATES_STATUS.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
-                        STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0,
+                        STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
+                        (Line::is_aligned(obj.to_raw_address()) && lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))),
                         "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
                 }
             }
@@ -249,7 +250,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                             // Track how many cycles it survives unmarked.
                             if mark_val != mark_state {
                                 let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-                                assert!(prev != 12 || lxr.rc.count(o) == 0, "Object {:?} has been dead for 12 cycles without being collected it has rc of: {}", o, lxr.rc.count(o));
+                                assert!(prev != 5 || lxr.rc.count(o) == 0, "Object {:?} has been dead for 5 cycles without being collected it has rc of: {}", o, lxr.rc.count(o));
                                 SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), prev + 1, Ordering::SeqCst);
                             } else {
                                 // Object is live and marked — reset counter

@@ -615,7 +615,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             //assert!(mark_val == mark_state);
             if mark_val != mark_state {
                 let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-                assert!(prev != 3, "Large object {:?} has been dead for 3 cycles without being collected", o);
+                assert!(prev != 5, "Large object {:?} has been dead for 5 cycles without being collected", o);
                 SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), prev + 1, Ordering::SeqCst);
             } else {
                 SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);

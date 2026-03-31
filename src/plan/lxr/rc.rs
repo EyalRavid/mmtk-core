@@ -412,7 +412,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         false
     }
 
-    fn process_inc_and_evacuate(&mut self, o: ObjectReference, depth: u32) -> ObjectReference {
+    fn process_inc_and_evacuate<const K: EdgeKind>(&mut self, o: ObjectReference, depth: u32) -> ObjectReference {
         o.verify::<VM>();
         crate::stat(|s| {
             s.inc_objects += 1;
@@ -439,10 +439,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             let promoted = self.inc(new);
             debug_assert!(promoted == false);
             //Eyal added this if
-            if !promoted && KIND == EDGE_KIND_ROOT{
+            if !promoted && K == EDGE_KIND_ROOT{
                 self.rc.clone().strong_rc_inc(new);
             }
-            else if KIND == EDGE_KIND_MATURE && o != new && !promoted{
+            else if K == EDGE_KIND_MATURE && o != new && !promoted{
                 self.rc.clone().strong_rc_inc(new);
             }
 
@@ -457,7 +457,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 self.promote(o, false, los, depth);
             }
             //Eyal added this if
-            else if KIND == EDGE_KIND_ROOT{
+            else if K == EDGE_KIND_ROOT{
                 self.rc.strong_rc_inc(o);
             } 
             return o;
@@ -467,7 +467,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             // Object is moved to a new location.
             let new = object_forwarding::spin_and_get_forwarded_object::<VM>(o, forwarding_status);
             debug_assert!(self.rc.clone().count(o) != 0);
-            if !self.inc(new) && (KIND == EDGE_KIND_ROOT || KIND == EDGE_KIND_MATURE){
+            if !self.inc(new) && (K == EDGE_KIND_ROOT || K == EDGE_KIND_MATURE){
                 self.rc.strong_rc_inc(new);
             }
             new
@@ -486,7 +486,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     self.copy_objs += 1;
                 }
                 if let Some(new) = new {
-                    if !self.inc(new) && KIND == EDGE_KIND_ROOT{
+                    if !self.inc(new) && K == EDGE_KIND_ROOT{
                         self.rc.strong_rc_inc(new);
                     }
                     self.promote(new, true, false, depth);
@@ -495,7 +495,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     gc_log!([1] "to-space overflow");
                     // Object is not moved.
                     let promoted = self.inc(o);
-                    if !promoted && KIND == EDGE_KIND_ROOT{
+                    if !promoted && K == EDGE_KIND_ROOT{
                         self.rc.strong_rc_inc(o);
                     }
                     object_forwarding::clear_forwarding_bits::<VM>(o);
@@ -509,7 +509,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             } else {
                 // Object is not moved.
                 let promoted = self.inc(o);
-                if !promoted && KIND == EDGE_KIND_ROOT{
+                if !promoted && K == EDGE_KIND_ROOT{
                     self.rc.strong_rc_inc(o);
                 }
                 object_forwarding::clear_forwarding_bits::<VM>(o);
@@ -550,7 +550,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         };
         // println!(" - inc {:?}: {:?} rc={}", s, o, self.rc.count(o));
         o.verify::<VM>();
-        let new = self.process_inc_and_evacuate(o, depth);
+        let new = self.process_inc_and_evacuate::<K>(o, depth);
 
         #[cfg(feature = "sanity")]
         if self.rc.count(new) > MAX_REF_COUNT / 5{
