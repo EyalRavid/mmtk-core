@@ -86,29 +86,24 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         lxr.satb_map.clear();
 
         let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
-
+        let mut candidates = unsafe {lxr.s_cycle_candidates_mut()}.into_final_buffers();
         #[cfg(feature = "s_rc_stats")]
         self.print_stats(lxr, vec_index);
 
         // Mark phase: trial-delete candidates with strong_rc == 0
-        let mut i = 0;
-        loop {
-            let cand = unsafe {
-                let v = lxr.s_cycle_candidates_mut();
-                if i >= v.len() { break }
-                v[i] // ObjectReference is Copy
-            };
-
-            if self.should_mark(cand, vec_index) {
-                CANDIDATES_STATUS.store_atomic::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed);
-                debug_assert!(self.rc.count(cand) > 0);
-                self.mark(cand, lxr);
-                i += 1;
-            } else {
-                if STRONG_RC_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::Relaxed) > 0 {
+        {
+            let mut it = candidates.iter_mut();
+            while let Some(cand) = it.next(){
+                if self.should_mark(*cand, vec_index) {
                     CANDIDATES_STATUS.store_atomic::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed);
+                    debug_assert!(self.rc.count(*cand) > 0);
+                    self.mark(*cand, lxr);
+                } else {
+                    if STRONG_RC_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::Relaxed) > 0 {
+                        CANDIDATES_STATUS.store_atomic::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed);
+                    }
+                    it.swap_remove_current();
                 }
-                unsafe { lxr.s_cycle_candidates_mut().swap_remove(i); }
             }
         }
 
@@ -116,11 +111,13 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         println!("num of real candidates = {}", s_candidates.len());
 
         // Scan phase: classify GREY objects as WHITE (garbage) or restore to BLACK
-        let len = unsafe { lxr.s_cycle_candidates_mut().len() };
-        for i in 0..len {
-            let cand = unsafe { lxr.s_cycle_candidates_mut()[i] };
-            self.scan(cand, lxr);
+        let mut it = candidates.iter_mut();
+        while let Some(cand) = it.next() {
+            self.scan(*cand, lxr);
         }
+
+
+
         lxr.in_cycle_collection.store(false, Ordering::Relaxed);
         #[cfg(feature = "s_rc_stats")]
         {
@@ -140,14 +137,12 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         }
 
         // Collect phase: free WHITE objects and handle remaining BLACK_IN_STACK
-        let len = unsafe { lxr.s_cycle_candidates_mut().len() };
-        for i in 0..len {
-            let cand = unsafe { lxr.s_cycle_candidates_mut()[i] };
+        let mut it = candidates.iter_mut();
+        while let Some(cand) = it.next() {
             debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::SeqCst) != GREY);
-            self.collect_whites(cand, lxr);
+            self.collect_whites(*cand, lxr);
         }
         println!("hash_map size after cycle collection = {}", lxr.satb_map.len());
-        unsafe { lxr.s_cycle_candidates_mut() }.clear();
     }
 }
 
@@ -195,6 +190,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
     /// Trial deletion: decrements RC of children for each GREY candidate via DFS.
     /// If an SATB-logged slot is found, reverts all decrements.
     fn mark(&self, o: ObjectReference, lxr: &LXR<VM>) {
+        let mut local_buffer = unsafe {lxr.curr_s_cycle_candidates_mut()}.local_buffer();
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
         debug_assert!(self.rc.count(o) > 0);
@@ -208,12 +204,15 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         is_logged = true;      
                 }
                 else if let Some(x) = child{
-                    let prev = self.rc.dec(x);
-                    debug_assert!(prev != Ok(1));
-                    debug_assert!(prev != Err(0));
-                    self.rc.strong_rc_dec(x);
-                    dfs_stack.push(x);
-                    num_of_childs += 1;
+                    if !is_logged{
+                        let prev = self.rc.dec(x);
+                        debug_assert!(prev != Ok(1));
+                        debug_assert!(prev != Err(0));
+                        self.rc.strong_rc_dec(x);
+                        dfs_stack.push(x);
+                        num_of_childs += 1;
+                    }
+
                 }
             };
 
@@ -235,9 +234,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
                             let _ = self.rc.inc(curr_child);
                             //let _ = self.rc.strong_rc_inc(curr_child); 
                            
-                        unsafe {
-                            lxr.curr_s_cycle_candidates_mut().push(curr_child);
-                        }
+
+                        local_buffer.push(curr_child);
+                        
                         CANDIDATES_STATUS.store_atomic::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                             if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
                                 let _ = self.rc.strong_rc_dec(curr_child);
@@ -248,9 +247,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         }
 
                     }
-                    unsafe {
-                        lxr.curr_s_cycle_candidates_mut().push(curr);
-                    }
+
+                    local_buffer.push(curr);
+                
                     CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                 }
             } else if is_black(curr) {
@@ -375,7 +374,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     } else if prev_s_rc == Ok(1) {
                         let s_candidates = unsafe { lxr.curr_s_cycle_candidates_mut() };
                         CANDIDATES_STATUS.store_atomic::<u8>(x.to_raw_address(), (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
-                        s_candidates.push(x);
+                        s_candidates.local_buffer().push(x);
                     }
                 }
             };

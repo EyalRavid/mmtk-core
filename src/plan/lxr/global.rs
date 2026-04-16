@@ -48,7 +48,7 @@ use std::cell::UnsafeCell;
 use std::cell::Cell;
 use crate::util::rc::RcBits;
 use dashmap::DashMap;
-
+use crate::plan::lxr::buffer::*;
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 const SATB_DEFAULT_SIZE: usize = 2048;
 static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -104,7 +104,7 @@ pub struct LXR<VM: VMBinding> {
     pub(super) barrier_decs: AtomicUsize,
     pub rc: RefCountHelper<VM>,
     gc_cause: Atomic<GCCause>,
-    pub s_cycle_candidates: UnsafeCell<Vec<Vec<ObjectReference>>>,
+    pub s_cycle_candidates: UnsafeCell<Vec<BufferPool<ObjectReference>>>,
     pub curr_vec: Cell<u8>,
     #[cfg(feature = "s_rc_stats")]
     pub cycle_candidates: Mutex<Vec<ObjectReference>>,
@@ -630,7 +630,8 @@ impl<VM: VMBinding> LXR<VM> {
             rc: RefCountHelper::NEW,
             gc_cause: Atomic::new(GCCause::Unknown),
             barrier_decs: AtomicUsize::default(),
-            s_cycle_candidates: UnsafeCell::new((0..NUM_OF_CANDIDATES_VECTORS).map(|_| Vec::with_capacity(2048)).collect()),
+            s_cycle_candidates: UnsafeCell::new((0..NUM_OF_CANDIDATES_VECTORS)
+                .map(|_| BufferPool::new(2048)).collect::<Vec<BufferPool<ObjectReference>>>()),
             curr_vec: Cell::new(NUM_OF_CANDIDATES_VECTORS - 1),
             #[cfg(feature = "s_rc_stats")]
             cycle_candidates: Mutex::new(Vec::new()),
@@ -1362,25 +1363,25 @@ impl<VM: VMBinding> LXR<VM> {
     /// - No other code may be using another mutable reference to it.
     /// Typically this should only be called in a stop-the-world / single-thread phase.
     #[inline]
-    pub unsafe fn s_cycle_candidates_mut(&self) -> &mut Vec<ObjectReference> {
+    pub unsafe fn s_cycle_candidates_mut(&self) -> &mut BufferPool<ObjectReference> {
         let next_index: usize = ((self.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS) as usize;
         &mut (&mut *self.s_cycle_candidates.get())[next_index]
     }
 
     /// Optional: read-only view (not strictly necessary)
     #[inline]
-    pub unsafe fn s_cycle_candidates(&self) -> &Vec<ObjectReference> {
+    pub unsafe fn s_cycle_candidates(&self) -> &BufferPool<ObjectReference> {
         let next_index: usize = ((self.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS) as usize;
         & (&*self.s_cycle_candidates.get())[next_index]
     }
 
-    pub unsafe fn curr_s_cycle_candidates_mut(&self) -> &mut Vec<ObjectReference> {
+    pub unsafe fn curr_s_cycle_candidates_mut(&self) -> &mut BufferPool<ObjectReference> {
         &mut (&mut *self.s_cycle_candidates.get())[self.curr_vec.get() as usize]
     }
 
     /// Optional: read-only view (not strictly necessary)
     #[inline]
-    pub unsafe fn curr_s_cycle_candidates(&self) -> &Vec<ObjectReference> {
+    pub unsafe fn curr_s_cycle_candidates(&self) -> &BufferPool<ObjectReference> {
         & (&*self.s_cycle_candidates.get())[self.curr_vec.get() as usize]
     }
 }
