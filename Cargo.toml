@@ -91,10 +91,10 @@ harness = false
 [features]
 # default = ["sanity"]
 default = [
-    "sanity",
+    #"sanity",
     "lxr_no_mature_evac",
     #"lxr_stw",
-    "lxr_rc_bits_32",
+    "lxr_rc_bits_16",
     "perf_counter",
     "dep:sysinfo",
     "dep:regex",
@@ -102,7 +102,7 @@ default = [
     "ix_always_defrag",
     "no_meta_counting",
     #"s_rc_stats",
-    "tracing",
+    #"tracing",
     "immix_non_moving",
 ]
 
