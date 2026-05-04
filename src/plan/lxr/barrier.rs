@@ -65,28 +65,22 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
     }
 
     fn attempt_to_log_field(&self, slot: VM::VMSlot) -> bool {
-        loop {
-            // Bailout if logged
-            if self.get_slot_logging_state(slot) == LOGGED_VALUE {
+
+        // Bailout if logged
+        if self.get_slot_logging_state(slot) == LOGGED_VALUE {
                 return false;
+        }
+        // Attempt to log the slots
+        match Self::UNLOG_BITS.fetch_and_atomic(
+            slot.to_address(),
+            LOGGED_VALUE,
+            Ordering::SeqCst,
+        ) {
+            UNLOGGED_VALUE => return true,
+            x => {
+                debug_assert!( x == LOGGED_VALUE);
+                return false;     
             }
-            // Attempt to log the slots
-            match Self::UNLOG_BITS.compare_exchange_atomic(
-                slot.to_address(),
-                UNLOGGED_VALUE,
-                LOGGED_VALUE,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(current) => {
-                    if current == LOGGED_VALUE {
-                        return false;
-                    }
-                }
-            }
-            // Failed to log the slot. Spin.
-            std::hint::spin_loop();
         }
     }
 
