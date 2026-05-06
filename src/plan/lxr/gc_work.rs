@@ -70,25 +70,79 @@ fn is_black(o: ObjectReference) -> bool {
     OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) <= BLACK_IN_STACK
 }
 
+#[cfg(feature = "s_rc_stats")]
+#[derive(Default)]
+struct CycleCollectorStats {
+    raw_cycle_candidates: usize,
+    candidates_after_filter: usize,
+    objects_in_mark: std::cell::Cell<usize>,
+    objects_in_scan: std::cell::Cell<usize>,
+    objects_in_scan_black: std::cell::Cell<usize>,
+    objects_in_collect: std::cell::Cell<usize>,
+    satb_map_size: usize,
+    satb_reads: std::cell::Cell<usize>,
+}
+
+#[cfg(feature = "s_rc_stats")]
+impl CycleCollectorStats {
+    const LOG_FILE: &'static str = "cycle_collector_stats.csv";
+
+    fn log_to_file(&self) {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let needs_header = !std::path::Path::new(Self::LOG_FILE).exists()
+            || std::fs::metadata(Self::LOG_FILE).map(|m| m.len() == 0).unwrap_or(true);
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(Self::LOG_FILE)
+            .expect("failed to open cycle collector stats file");
+
+        if needs_header {
+            writeln!(file,
+                "raw_cycle_candidates,candidates_after_filter,\
+                 objects_in_mark,objects_in_scan,objects_in_scan_black,\
+                 objects_in_collect,satb_map_size,satb_reads"
+            ).unwrap();
+        }
+
+        writeln!(file, "{},{},{},{},{},{},{},{}",
+            self.raw_cycle_candidates,
+            self.candidates_after_filter,
+            self.objects_in_mark.get(),
+            self.objects_in_scan.get(),
+            self.objects_in_scan_black.get(),
+            self.objects_in_collect.get(),
+            self.satb_map_size,
+            self.satb_reads.get(),
+        ).unwrap();
+    }
+}
+
 pub struct CycleCollector<VM: VMBinding> {
     rc: RefCountHelper<VM>,
     #[cfg(not(feature = "lxr_stw"))]
     _c: LazySweepingJobsCounter,
+    #[cfg(feature = "s_rc_stats")]
+    stats: CycleCollectorStats,
 }
 
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        
+        println!("do_work called");
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         lxr.in_cycle_collection.store(true, Ordering::SeqCst);
-        println!("hash_map size before cycle collection = {}", lxr.satb_map.len());
         lxr.satb_map.clear();
 
         let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
         let mut candidates = unsafe {lxr.s_cycle_candidates_mut()}.into_final_buffers();
         #[cfg(feature = "s_rc_stats")]
-        self.print_stats(lxr, vec_index);
+        {
+            self.stats.raw_cycle_candidates = candidates.len();
+        }
 
         // Mark phase: trial-delete candidates with strong_rc == 0
         {
@@ -108,7 +162,9 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         }
 
         #[cfg(feature = "s_rc_stats")]
-        println!("num of real candidates = {}", s_candidates.len());
+        {
+            self.stats.candidates_after_filter = candidates.len();
+        }
 
         // Scan phase: classify GREY objects as WHITE (garbage) or restore to BLACK
         let mut it = candidates.iter_mut();
@@ -119,22 +175,6 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 
 
         lxr.in_cycle_collection.store(false, Ordering::Relaxed);
-        #[cfg(feature = "s_rc_stats")]
-        {
-            let mut num_of_garbage_candidates = 0;
-            for obj in s_candidates.iter() {
-                if OBJ_COLOR_TABLE.load_atomic::<u8>((*obj).to_raw_address(), Ordering::SeqCst) == WHITE {
-                    num_of_garbage_candidates += 1;
-                }
-            }
-            println!("num of s_rc dead scanned candidates = {}", num_of_garbage_candidates);
-
-            let mut num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
-            println!("num of scanned objects in s_rc scan = {}", num_of_scanned);
-            *num_of_scanned = 0;
-
-            println!("===ENDED CYCLE COLLECTION PHASE===");
-        }
 
         // Collect phase: free WHITE objects and handle remaining BLACK_IN_STACK
         let mut it = candidates.iter_mut();
@@ -142,7 +182,11 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::SeqCst) != GREY);
             self.collect_whites(*cand, lxr);
         }
-        println!("hash_map size after cycle collection = {}", lxr.satb_map.len());
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.stats.satb_map_size = lxr.satb_map.len();
+            self.stats.log_to_file();
+        }
     }
 }
 
@@ -164,6 +208,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
             rc: RefCountHelper::NEW,
             #[cfg(not(feature = "lxr_stw"))]
             _c: c.clone_with_cc(),
+            #[cfg(feature = "s_rc_stats")]
+            stats: CycleCollectorStats::default(),
         }
     }
 
@@ -176,13 +222,12 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(self.get_slot_logging_state(slot) != Self::UNLOGGED_VALUE);
             let satb_child = loop {
                 if let Some(m) = lxr.satb_map.get(&slot).map(|v| *v) {
-                    println!("got child from satb map");
                     break m;
                 }
-                println!("loop in get child");
                 std::hint::spin_loop();
             };
-            
+            #[cfg(feature = "s_rc_stats")]
+            { self.stats.satb_reads.set(self.stats.satb_reads.get() + 1); }
             return satb_child;
         }
     }
@@ -223,10 +268,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), GREY, Ordering::SeqCst);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 #[cfg(feature = "s_rc_stats")]
-                {
-                    let mut num_of_scanned = lxr.num_of_scanned_s_rc_candidates.lock().unwrap();
-                    *num_of_scanned += 1;
-                }
+                { self.stats.objects_in_mark.set(self.stats.objects_in_mark.get() + 1); }
                 if is_logged{
                     OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed);
                     for _ in 0..num_of_childs{
@@ -264,6 +306,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
+            #[cfg(feature = "s_rc_stats")]
+            { self.stats.objects_in_scan.set(self.stats.objects_in_scan.get() + 1); }
             debug_assert!(self.rc.count(curr) > 0);
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 if let Some(x) = self.get_child(slot, lxr) {
@@ -311,6 +355,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         debug_assert!(self.rc.count(x) > 1);
                     }
                 });
+                #[cfg(feature = "s_rc_stats")]
+                { self.stats.objects_in_scan_black.set(self.stats.objects_in_scan_black.get() + 1); }
                 OBJ_COLOR_TABLE.store_atomic::<u8>(curr_copy.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst);
             } else {
                 OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
@@ -327,6 +373,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
+            #[cfg(feature = "s_rc_stats")]
+            { self.stats.objects_in_collect.set(self.stats.objects_in_collect.get() + 1); }
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
@@ -361,6 +409,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
         let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
+            #[cfg(feature = "s_rc_stats")]
+            { self.stats.objects_in_collect.set(self.stats.objects_in_collect.get() + 1); }
             debug_assert!(self.rc.count(curr) == 1);
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
@@ -441,52 +491,6 @@ impl<VM: VMBinding> CycleCollector<VM>{
             && STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0
         // STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) == 0
         //     && CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) != 0
-    }
-
-    
-    #[cfg(feature = "s_rc_stats")]
-    fn print_stats(&self, lxr: &LXR<VM>, vec_index: u8) {
-        println!("===GOT TO CYCLE COLLECTION PHASE===");
-        let s_candidates = unsafe { lxr.s_cycle_candidates_mut() };
-        let mut candidates = lxr.cycle_candidates.lock().unwrap();
-        let mut real_candidates = Vec::<ObjectReference>::new();
-        println!("num of trial deletion candidates with dead objects and duplicates = {}", candidates.len());
-        let mut num_of_dupcs = 0;
-        let mut num_of_dead_candidates = 0;
-        // Remove candidates with RC == 0 (already freed)
-        for obj in candidates.iter() {
-            if lxr.rc.count(*obj) > 0 {
-                if !real_candidates.contains(obj) {
-                    real_candidates.push(*obj);
-                } else {
-                    num_of_dupcs += 1;
-                }
-            } else {
-                num_of_dead_candidates += 1;
-            }
-        }
-        println!("num of duplicates candidates in trial deletion not including dead duplicates = {}", num_of_dupcs);
-        println!("num of dead candidates in trial deletion = {}", num_of_dead_candidates);
-        println!("num of trial deletion candidates after duplicates and dead objects removal = {}", real_candidates.len());
-        candidates.clear();
-        let mut real_strong_candidates = Vec::<ObjectReference>::new();
-        num_of_dupcs = 0;
-        num_of_dead_candidates = 0;
-        for obj in s_candidates.iter() {
-            if self.should_mark(*obj, vec_index) {
-                if !real_strong_candidates.contains(obj) {
-                    real_strong_candidates.push(*obj);
-                } else {
-                    num_of_dupcs += 1;
-                }
-            } else {
-                num_of_dead_candidates += 1;
-            }
-        }
-        println!("num of strong candidates before dead object removal = {}", s_candidates.len());
-        println!("num of duplicates candidates in s_rc scan not including dead duplicates = {}", num_of_dupcs);
-        println!("num of dead candidates in s_rc scan = {}", num_of_dead_candidates);
-        println!("num of s_rc candidates = {}", real_strong_candidates.len());
     }
 
 }

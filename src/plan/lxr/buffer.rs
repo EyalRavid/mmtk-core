@@ -166,6 +166,10 @@ impl<T> FinalBuffers<T> {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.buffers.iter().map(|b| b.len()).sum()
+    }
+
     pub fn len_buffers(&self) -> usize {
         self.buffers.len()
     }

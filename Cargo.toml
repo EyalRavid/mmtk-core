@@ -93,7 +93,7 @@ harness = false
 default = [
     #"sanity",
     "lxr_no_mature_evac",
-    #"lxr_stw",
+    "lxr_stw",
     "lxr_rc_bits_16",
     "perf_counter",
     "dep:sysinfo",
@@ -101,7 +101,7 @@ default = [
     "dep:env_logger",
     "ix_always_defrag",
     "no_meta_counting",
-    #"s_rc_stats",
+    "s_rc_stats",
     #"tracing",
     "immix_non_moving",
 ]
