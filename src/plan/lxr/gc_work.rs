@@ -132,7 +132,6 @@ pub struct CycleCollector<VM: VMBinding> {
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        println!("do_work called");
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         lxr.in_cycle_collection.store(true, Ordering::SeqCst);
         lxr.satb_map.clear();

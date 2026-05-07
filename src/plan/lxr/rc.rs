@@ -312,7 +312,6 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 //     target
                 // );
                 let rc = self.rc.count(target);
-                debug_assert!(rc != RC_DEATH_TRANSIENT);
                 if rc == RC_NURSERY_OR_DEAD {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
                     self.add_new_slot(slot);
@@ -433,7 +432,6 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             let new = if object_forwarding::is_forwarded::<VM>(o) {
                 object_forwarding::read_forwarding_pointer::<VM>(o)
             } else {
-                panic!("object must be copied");
                 o
             };
             let promoted = self.inc(new);
