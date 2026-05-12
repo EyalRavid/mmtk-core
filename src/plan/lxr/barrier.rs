@@ -183,9 +183,9 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         //self.lxr.satb_map.insert(slot, old);
         if (self.lxr.in_cycle_collection.load(Ordering::SeqCst) == true) {
             if let Some(obj) = _src {
-             if OBJ_COLOR_TABLE.load_atomic::<u8>(obj.to_raw_address(),Ordering::SeqCst) > BLACK_IN_STACK {
-                self.lxr.satb_map.insert(slot, old);
-             }
+                if OBJ_COLOR_TABLE.load_atomic::<u8>(obj.to_raw_address(),Ordering::SeqCst) >= BLACK_IN_STACK {
+                    self.lxr.satb_map.insert(slot, old);
+                }
          }
             else {
                 self.lxr.satb_map.insert(slot, old);

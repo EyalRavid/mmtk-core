@@ -221,7 +221,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(self.get_slot_logging_state(slot) != Self::UNLOGGED_VALUE);
             let satb_child = loop {
                 if let Some(m) = lxr.satb_map.get(&slot).map(|v| *v) {
-                    break m;
+                    return m;
                 }
                 std::hint::spin_loop();
             };
@@ -337,6 +337,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             assert!(self.rc.count(*curr) > 1);
             let curr_copy = *curr; // needed for the borrow checker
             if !is_black(*curr) {
+                OBJ_COLOR_TABLE.store_atomic::<u8>(curr_copy.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst);
                 let s_rc = self.rc.count(*curr) - 1;
                 if s_rc > MAX_STRONG_REF_COUNT as RcBits{
                     STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::Relaxed);
@@ -356,7 +357,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 });
                 #[cfg(feature = "s_rc_stats")]
                 { self.stats.objects_in_scan_black.set(self.stats.objects_in_scan_black.get() + 1); }
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr_copy.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst);
+              
             } else {
                 OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != 0);

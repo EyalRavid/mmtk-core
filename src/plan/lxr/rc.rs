@@ -319,10 +319,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     //this is assert may not be true
                     //debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
                     if rc != crate::util::rc::MAX_REF_COUNT {
-                        //Eyal changed this
-                        //Originaly was : let _ = self.rc.inc(target);
-                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0 || 
-                        CANDIDATES_STATUS.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
+
                         let result = self.rc.inc(target);
                         //this is assert may not be true
                         //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
@@ -1208,10 +1205,6 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     }
                 }
 
-                unsafe {
-                    //debug_assert!(s_rc_prev_val != Ok(STRONG_RC_ALREADY_ZERO) || lxr.curr_s_cycle_candidates_mut().contains(&o));
-                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(o));
-                }
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 ||
                 CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 || self.rc.count(o) == 0);
             }
