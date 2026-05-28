@@ -75,6 +75,8 @@ define_side_metadata_specs!(
     STRONG_RC_TABLE = (global: true, log_num_of_bits: crate::util::rc::LOG_STRONG_REF_COUNT_BITS, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
     // Sanity: counts how many GC cycles pass before a dead object is collected (2 bits per object)
     SANITY_DEAD_CYCLE_COUNT = (global: true, log_num_of_bits: 2, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
+
+    GRAPH_REPORT_MARK = (global: true, log_num_of_bits: 0, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
 );
 
 // This defines all LOCAL side metadata used by mmtk-core.

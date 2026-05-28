@@ -48,6 +48,11 @@ use std::cell::UnsafeCell;
 use std::cell::Cell;
 use crate::util::rc::RcBits;
 use dashmap::DashMap;
+#[cfg(feature = "graph_project")]
+use crate::plan::lxr:: graphs_project::{*};
+#[cfg(feature = "graph_project")]
+use crate::util::metadata::side_metadata::spec_defs::GRAPH_REPORT_MARK;
+
 use crate::plan::lxr::buffer::*;
 const LOG_CONSERVATIVE_SURVIVAL_RATIO_MULTIPLER: usize = 1;
 const SATB_DEFAULT_SIZE: usize = 2048;
@@ -114,6 +119,8 @@ pub struct LXR<VM: VMBinding> {
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, RcBits)>>,
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
     pub in_cycle_collection: AtomicBool,
+    #[cfg(feature = "graph_project")]
+    pub graph_reporter: std::sync::Mutex<GcCycleReport>,
 }
 
 pub static LXR_CONSTRAINTS: Lazy<PlanConstraints> = Lazy::new(|| PlanConstraints {
@@ -593,6 +600,8 @@ impl<VM: VMBinding> LXR<VM> {
             MetadataSpec::OnSide(STRONG_RC_TABLE),
             #[cfg(feature = "sanity")]
             MetadataSpec::OnSide(SANITY_DEAD_CYCLE_COUNT),
+            #[cfg(feature = "graph_project")]
+            MetadataSpec::OnSide(GRAPH_REPORT_MARK),
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
         let options = args.options.clone();
@@ -641,6 +650,8 @@ impl<VM: VMBinding> LXR<VM> {
             rc_sanity_objects: Mutex::new(Vec::new()),
             satb_map: DashMap::with_capacity(SATB_DEFAULT_SIZE),
             in_cycle_collection: AtomicBool::new(false),
+            #[cfg(feature = "graph_project")]
+           graph_reporter: std::sync::Mutex::new(GcCycleReport::new()),
         });
 
         lxr.update_fixed_alloc_trigger();

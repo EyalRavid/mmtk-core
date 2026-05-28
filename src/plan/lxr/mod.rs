@@ -9,6 +9,10 @@ pub mod rc;
 mod remset;
 //Eyal added this mod
 mod stack;
+#[cfg(feature = "graph_project")]
+mod graphs_project;
+
+
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;

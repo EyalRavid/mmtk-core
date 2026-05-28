@@ -374,6 +374,11 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         //debug_assert!(self.rc.count(o) != RC_DEATH_TRANSIENT, "RC=1 is reserved for death processing");
         if self.rc.inc(o) == Ok(RC_NURSERY_OR_DEAD) {
             // First promotion: establish the +1 bias (0 → 1 → RC_DEATH_THRESHOLD)
+            #[cfg(feature = "graph_project")]
+            {
+                let mut reporter =  self.lxr.graph_reporter.lock().unwrap();
+                reporter.add_allocated(o.to_raw_address().as_usize());
+            }
             self.rc.strong_rc_inc(o);
             self.rc.inc(o);
             return true;
@@ -419,6 +424,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             self.inc_objs += 1;
         }
         let los = self.lxr.los().in_space(o);
+
+
         if crate::args::RC_NURSERY_EVACUATION
             && !los
             && object_forwarding::is_forwarded_or_being_forwarded::<VM>(o)
@@ -431,6 +438,14 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             } else {
                 o
             };
+
+            #[cfg(feature = "graph_project")]
+            {
+                if K == EDGE_KIND_ROOT {
+                    let mut reporter =  self.lxr.graph_reporter.lock().unwrap();
+                    reporter.add_root(new.to_raw_address().as_usize());
+                }
+            }
             let promoted = self.inc(new);
             //debug_assert!(promoted == false);
             //Eyal added this if
@@ -1132,6 +1147,11 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             debug_assert!(result != Err(RC_NURSERY_OR_DEAD));
             debug_assert!(result != Ok(RC_DEATH_TRANSIENT));
             if result == Ok(RC_DEATH_THRESHOLD) {
+                #[cfg(feature = "graph_project")]
+                {
+                let mut reporter = lxr.graph_reporter.lock().unwrap();
+                reporter.add_rc_freed(o.to_raw_address().as_usize());
+                }
                 STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(), 0u8, Ordering::Relaxed);
                 CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(), 0u8, Ordering::SeqCst);
                 if is_los {

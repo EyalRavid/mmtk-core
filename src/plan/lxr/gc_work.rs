@@ -23,6 +23,11 @@ use crate::plan::lxr::stack::ChunkedStack;
 use crate::util::rc::RcBits;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::LazySweepingJobsCounter;
+#[cfg(feature = "graph_project")]
+use crate::plan::lxr:: graphs_project::{*};
+#[cfg(feature = "graph_project")]
+use crate::plan::lxr::buffer::FinalIterMut;
+
 pub(super) struct LXRGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
 impl<E: ProcessEdgesWork> crate::scheduler::GCWorkContext for LXRGCWorkContext<E> {
@@ -132,12 +137,25 @@ pub struct CycleCollector<VM: VMBinding> {
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+
         lxr.in_cycle_collection.store(true, Ordering::SeqCst);
         lxr.satb_map.clear();
 
         let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
         let mut candidates = unsafe {lxr.s_cycle_candidates_mut()}.into_final_buffers();
+
+
+        #[cfg(feature = "graph_project")]
+        {
+            let mut it = candidates.iter_mut();
+            let mut reporter = lxr.graph_reporter.lock().unwrap();
+            self.report_candidates_sub_graph(it, &mut reporter, vec_index);
+
+        }
+
+
         #[cfg(feature = "s_rc_stats")]
         {
             self.stats.raw_cycle_candidates = candidates.len();
@@ -385,6 +403,11 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
 
             if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == WHITE {
+                #[cfg(feature = "graph_project")]
+                {
+                    let mut reporter = lxr.graph_reporter.lock().unwrap();
+                    reporter.add_cycle_collector_freed(curr.to_raw_address().as_usize());
+                }
                 debug_assert!(self.rc.count(curr) == 1);
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                 CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed);
@@ -433,6 +456,11 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(is_black(curr));
             CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed);
             OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
+            #[cfg(feature = "graph_project")]
+            {
+                let mut reporter = lxr.graph_reporter.lock().unwrap();
+                reporter.add_cycle_collector_freed(curr.to_raw_address().as_usize());
+            }
             self.process_dead_object(curr, lxr);
             debug_assert!(lxr.rc.count(curr) == 1);
             self.rc.dec(curr);
@@ -493,4 +521,28 @@ impl<VM: VMBinding> CycleCollector<VM>{
         //     && CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed) != 0
     }
 
+}
+
+
+
+#[cfg(feature = "graph_project")]
+impl<VM: VMBinding> CycleCollector<VM> {
+
+    fn report_candidates_sub_graph(&self, mut candidates: FinalIterMut<'_, ObjectReference>, reporter: &mut GcCycleReport, vec_index: u8) {
+        while let Some(cand) = candidates.next(){
+            if self.should_mark(*cand, vec_index) {
+                reporter.mark_candidate_sub_graph::<VM>(*cand);
+                
+            }
+        }
+
+        while let Some(cand) = candidates.next(){
+            if self.should_mark(*cand, vec_index) {
+                reporter.sweep_candidate_sub_graph::<VM>(*cand);
+                
+            }
+        }
+        reporter.append_to_default_file();
+        reporter.clear();
+    }
 }
