@@ -74,7 +74,7 @@ pub const REF_COUNT_BITS: usize = 1 << LOG_REF_COUNT_BITS;
 pub const REF_COUNT_MASK: RcBits =
     ((1u128 << REF_COUNT_BITS) - 1) as RcBits;
 
-pub const MAX_REF_COUNT: RcBits = REF_COUNT_MASK;
+pub const MAX_REF_COUNT: RcBits = 15;
 
 
 pub const LOG_MIN_OBJECT_SIZE: usize = crate::util::constants::LOG_MIN_OBJECT_SIZE as _;
