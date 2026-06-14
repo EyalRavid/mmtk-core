@@ -8,12 +8,12 @@ use crate::vm::VMBinding; // or wherever VMBinding is imported from
 const MAX_RC_USIZE: usize = MAX_REF_COUNT as usize;
 
 
-pub struct OverflowRcCache<VM: VMBinding> {
+pub struct RefCountWithOverflow<VM: VMBinding> {
     entries: Mutex<Vec<(ObjectReference, usize)>>,
     rc: RefCountHelper<VM>,
 }
 
-impl<VM: VMBinding> OverflowRcCache<VM> {
+impl<VM: VMBinding> RefCountWithOverflow<VM> {
 
     pub fn new() -> Self {
         Self {

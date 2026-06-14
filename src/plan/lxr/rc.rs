@@ -32,12 +32,12 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// RC value for nursery/dead objects (no references tracked).
-const RC_NURSERY_OR_DEAD: RcBits = 0;
+const RC_NURSERY_OR_DEAD: usize = 0;
 /// Transient RC value used only during death processing. Never observed outside that path.
-const RC_DEATH_TRANSIENT: RcBits = 1;
+const RC_DEATH_TRANSIENT: usize = 1;
 /// RC value when an object has exactly 1 real reference (due to the +1 bias).
 /// This is the threshold at which a decrement triggers death processing.
-const RC_DEATH_THRESHOLD: RcBits = 2;
+const RC_DEATH_THRESHOLD: usize = 2;
 
 /// `strong_rc_dec` returned `Ok(STRONG_RC_LAST_BEFORE_ZERO)`: strong RC was 1, now 0.
 /// The object just became a cycle candidate.
@@ -311,25 +311,23 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 //     slot,
                 //     target
                 // );
-                let rc = self.rc.count(target);
+                let rc = self.rc.count(target) as usize;
                 if rc == RC_NURSERY_OR_DEAD {
                     // println!(" -- rec inc {:?}.{:?} -> {:?}", o, slot, target);
                     self.add_new_slot(slot);
                 } else {
                     //this is assert may not be true
                     //debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
-                    if rc != crate::util::rc::MAX_REF_COUNT {
-
-                        let result = self.rc.inc(target);
-                        //this is assert may not be true
-                        //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
-                        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(target));
-                        #[cfg(feature = "measure_rc_rate")]
-                        {
-                            self.inc_objs += 1;
-                        }
-                        debug_assert!(result != Ok(RC_NURSERY_OR_DEAD));
+                    let result = self.lxr.rc_with_overflow.inc(target);
+                    //this is assert may not be true
+                    //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
+                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(target));
+                    #[cfg(feature = "measure_rc_rate")]
+                    {
+                        self.inc_objs += 1;
                     }
+                    debug_assert!(result != RC_NURSERY_OR_DEAD);
+                    
                     self.record_mature_evac_remset2(obj_in_defrag, slot, target);
                 }
                 super::record_slot_for_validation(slot, Some(target));
@@ -372,7 +370,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     fn inc(&self, o: ObjectReference) -> bool {
         //this asseretion might not be true on multiple threads.
         //debug_assert!(self.rc.count(o) != RC_DEATH_TRANSIENT, "RC=1 is reserved for death processing");
-        if self.rc.inc(o) == Ok(RC_NURSERY_OR_DEAD) {
+        if self.lxr.rc_with_overflow.inc(o) == RC_NURSERY_OR_DEAD as usize {
             // First promotion: establish the +1 bias (0 → 1 → RC_DEATH_THRESHOLD)
             #[cfg(feature = "graph_project")]
             {
@@ -380,7 +378,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 reporter.add_allocated(o.to_raw_address().as_usize());
             }
             self.rc.strong_rc_inc(o);
-            self.rc.inc(o);
+            self.lxr.rc_with_overflow.inc(o);
             return true;
         }
         //debug_assert!(
@@ -395,7 +393,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             return true;
         }
         // Skip mature object
-        if self.rc.count(o) != RC_NURSERY_OR_DEAD {
+        if self.rc.count(o) != RC_NURSERY_OR_DEAD as u8 {
             return true;
         }
         // Skip recycled lines
@@ -482,7 +480,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
             new
         } else {
-            let is_nursery = self.rc.count(o) == RC_NURSERY_OR_DEAD;
+            let is_nursery = self.rc.count(o) == RC_NURSERY_OR_DEAD as u8;
             let copy_depth_reached = crate::args::INC_MAX_COPY_DEPTH && depth > 16;
             if is_nursery && !self.no_evac && !copy_depth_reached {
                 // Evacuate the object
@@ -1040,11 +1038,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     if let Some(x) = slot.load() {
                         // println!(" -- rec dec {:?}.{:?} -> {:?}", o, slot, x);
                         if !out_of_heap {
-                            let rc = self.rc.count(x);
-                            debug_assert!(rc > RC_DEATH_TRANSIENT);
-                            if rc != MAX_REF_COUNT && rc != RC_NURSERY_OR_DEAD {
-                                self.recursive_dec(x);
-                            }
+                            self.recursive_dec(x);
                         } else {
                             self.record_mature_evac_remset(lxr, slot, x);
                         }
@@ -1112,12 +1106,13 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             // if o.is_null() {
             //     continue;
             // }
-            if self.rc.is_dead_or_stuck(*o)
+            #[cfg(feature = "sanity")]
+            if self.lxr.rc_with_overflow.get(*o) == RC_NURSERY_OR_DEAD 
+                || self.lxr.rc_with_overflow.get(*o) == MAX_REF_COUNT
+                || self.lxr.rc_with_overflow.get(*o) == RC_DEATH_TRANSIENT 
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
-                debug_assert!(self.rc.count(*o) != 0);
-                //debug_assert!(self.rc.count(*o) != MAX_REF_COUNT);
-                continue;
+                panic!();
             }
             let o =
                 if crate::args::RC_MATURE_EVACUATION && object_forwarding::is_forwarded::<VM>(*o) {
@@ -1127,31 +1122,24 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 };
             let mut dead = false;
             let mut is_los = false;
-            debug_assert!(self.rc.count(o) > RC_DEATH_TRANSIENT, "RC must be > 1 due to +1 bias");
+            debug_assert!(self.rc.count(o) as usize > RC_DEATH_TRANSIENT, "RC must be > 1 due to +1 bias");
             // Atomically decrement RC. When RC=RC_DEATH_THRESHOLD (last real reference removed),
             // we process the object as dead inside the CAS closure.
             // Note: `process_dead_object` side-effects only run once thanks to the `dead` flag.
             // If the CAS retries, the closure re-evaluates `c` but skips death processing.
-            let result = self.rc.clone().fetch_update(o, |c| {
-                debug_assert!(c != RC_DEATH_TRANSIENT, "RC=1 is reserved for death processing");
-                debug_assert!(c != RC_NURSERY_OR_DEAD || c != MAX_REF_COUNT);
-                if c == RC_DEATH_THRESHOLD && !dead {
-                    dead = true;
-                    is_los = self.process_dead_object(o, lxr);
-                    Some(c - RC_DEATH_THRESHOLD)
-                }
-                else {
-                    Some(c - 1)
-                }
-            });
-            debug_assert!(result != Err(RC_NURSERY_OR_DEAD));
-            debug_assert!(result != Ok(RC_DEATH_TRANSIENT));
-            if result == Ok(RC_DEATH_THRESHOLD) {
+            debug_assert!(lxr.rc_with_overflow.get(o) > RC_DEATH_TRANSIENT, "RC=1 is reserved for death processing");
+            let result = lxr.rc_with_overflow.dec(o);
+
+
+            if result == RC_DEATH_THRESHOLD {
                 #[cfg(feature = "graph_project")]
                 {
                 let mut reporter = lxr.graph_reporter.lock().unwrap();
                 reporter.add_rc_freed(o.to_raw_address().as_usize());
                 }
+                 dead = true;
+                is_los = self.process_dead_object(o, lxr);
+                self.rc.dec_unconditionally(o);
                 STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(), 0u8, Ordering::Relaxed);
                 CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(), 0u8, Ordering::SeqCst);
                 if is_los {
@@ -1175,7 +1163,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         (lxr.curr_vec.get() + 1) as u8,
                         Ordering::SeqCst,
                     );
-                    if self.rc.count(o) == 0{
+                    if self.rc.count(o) == RC_NURSERY_OR_DEAD as u8{
                                            
                         CANDIDATES_STATUS.store_atomic::<u8>(
                             o.to_raw_address(),
@@ -1212,7 +1200,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                             Ordering::SeqCst,
                         );
 
-                        if self.rc.count(o) == 0{                  
+                        if self.rc.count(o) == RC_NURSERY_OR_DEAD as u8{                  
                             CANDIDATES_STATUS.store_atomic::<u8>(
                                 o.to_raw_address(),
                                 0,

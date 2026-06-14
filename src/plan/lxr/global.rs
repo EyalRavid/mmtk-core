@@ -48,6 +48,7 @@ use std::cell::UnsafeCell;
 use std::cell::Cell;
 use crate::util::rc::RcBits;
 use dashmap::DashMap;
+use crate::plan::lxr::overflow_rc_cache::RefCountWithOverflow;
 #[cfg(feature = "graph_project")]
 use crate::plan::lxr:: graphs_project::{*};
 #[cfg(feature = "graph_project")]
@@ -119,6 +120,7 @@ pub struct LXR<VM: VMBinding> {
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, RcBits)>>,
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
     pub in_cycle_collection: AtomicBool,
+    pub rc_with_overflow: RefCountWithOverflow<VM>,
     #[cfg(feature = "graph_project")]
     pub graph_reporter: std::sync::Mutex<GcCycleReport>,
 }
@@ -651,7 +653,8 @@ impl<VM: VMBinding> LXR<VM> {
             satb_map: DashMap::with_capacity(SATB_DEFAULT_SIZE),
             in_cycle_collection: AtomicBool::new(false),
             #[cfg(feature = "graph_project")]
-           graph_reporter: std::sync::Mutex::new(GcCycleReport::new()),
+            graph_reporter: std::sync::Mutex::new(GcCycleReport::new()),
+            rc_with_overflow: RefCountWithOverflow::new(),
         });
 
         lxr.update_fixed_alloc_trigger();

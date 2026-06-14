@@ -267,9 +267,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
                 else if let Some(x) = child{
                     if !is_logged{
-                        let prev = self.rc.dec(x);
-                        debug_assert!(prev != Ok(1));
-                        debug_assert!(prev != Err(0));
+                        let prev = lxr.rc_with_overflow.dec(x);
+                        debug_assert!(prev != 1);
+                        debug_assert!(prev != 0);
                         self.rc.strong_rc_dec(x);
                         dfs_stack.push(x);
                         num_of_childs += 1;
@@ -290,7 +290,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed);
                     for _ in 0..num_of_childs{
                         if let Some(curr_child) = dfs_stack.pop(){
-                            let _ = self.rc.inc(curr_child);
+                            let _ = lxr.rc_with_overflow.inc(curr_child);
                             //let _ = self.rc.strong_rc_inc(curr_child); 
                            
 
@@ -365,7 +365,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = self.get_child(slot, lxr) {
-                        let _prev = self.rc.inc(x);
+                        let _prev = lxr.rc_with_overflow.inc(x);
                         if !in_stack(x) {
                             self.rc.strong_rc_inc(x);
                             dfs_stack.push(x);
@@ -439,10 +439,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
                     assert!(self.rc.count(x) > 1);
-                    let prev_rc = self.rc.dec(x);
+                    let prev_rc = lxr.rc_with_overflow.dec(x);;
                     let prev_s_rc = self.rc.strong_rc_dec(x);
-                    debug_assert!(prev_rc != Ok(1));
-                    if prev_rc == Ok(2) {
+                    debug_assert!(prev_rc != 1);
+                    if prev_rc == 2 {
                         dfs_stack.push(x);
                     } else if prev_s_rc == Ok(1) {
                         let s_candidates = unsafe { lxr.curr_s_cycle_candidates_mut() };
