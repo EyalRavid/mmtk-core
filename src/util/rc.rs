@@ -195,6 +195,11 @@ impl<VM: VMBinding> RefCountHelper<VM> {
             }
         })
     }
+
+    pub fn dec_unconditionally(&self, o: ObjectReference) -> RcBits {
+        RC_TABLE.fetch_sub_atomic(o.to_raw_address(), 1,  Ordering::Relaxed)
+    }
+
     //Eyal change: all u16 was originaly u8
     pub fn set(&self, o: ObjectReference, count: RcBits) {
         RC_TABLE.store_atomic(o.to_raw_address(), count, Ordering::Relaxed)
