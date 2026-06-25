@@ -97,6 +97,20 @@ pub const BLACK_IN_STACK: u8 = 1;
 pub const GREY: u8 = 2;
 pub const WHITE: u8 = 3;
 
+pub const RC_NURSERY_OR_DEAD: usize = 0;
+/// Transient RC value used only during death processing. Never observed outside that path.
+pub const RC_DEATH_TRANSIENT: usize = 1;
+/// RC value when an object has exactly 1 real reference (due to the +1 bias).
+/// This is the threshold at which a decrement triggers death processing.
+pub const RC_DEATH_THRESHOLD: usize = 2;
+
+/// `strong_rc_dec` returned `Ok(STRONG_RC_LAST_BEFORE_ZERO)`: strong RC was 1, now 0.
+/// The object just became a cycle candidate.
+pub const STRONG_RC_LAST_BEFORE_ZERO: u8 = 1;
+/// `strong_rc_dec` returned `Err(STRONG_RC_ALREADY_ZERO)`: strong RC was already 0.
+pub const STRONG_RC_ALREADY_ZERO: u8 = 0;
+
+
 
 static INC_BUFFER_SIZE: AtomicUsize = AtomicUsize::new(0);
 

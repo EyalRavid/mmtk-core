@@ -31,19 +31,6 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-/// RC value for nursery/dead objects (no references tracked).
-const RC_NURSERY_OR_DEAD: usize = 0;
-/// Transient RC value used only during death processing. Never observed outside that path.
-const RC_DEATH_TRANSIENT: usize = 1;
-/// RC value when an object has exactly 1 real reference (due to the +1 bias).
-/// This is the threshold at which a decrement triggers death processing.
-const RC_DEATH_THRESHOLD: usize = 2;
-
-/// `strong_rc_dec` returned `Ok(STRONG_RC_LAST_BEFORE_ZERO)`: strong RC was 1, now 0.
-/// The object just became a cycle candidate.
-const STRONG_RC_LAST_BEFORE_ZERO: u8 = 1;
-/// `strong_rc_dec` returned `Err(STRONG_RC_ALREADY_ZERO)`: strong RC was already 0.
-const STRONG_RC_ALREADY_ZERO: u8 = 0;
 
 #[inline]
 fn prefetch_object<VM: VMBinding>(o: ObjectReference, rc: &RefCountHelper<VM>) {
@@ -561,7 +548,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         let new = self.process_inc_and_evacuate::<K>(o, depth);
 
         #[cfg(feature = "sanity")]
-        if self.rc.count(new) > MAX_REF_COUNT / 5{
+        if self.lxr.rc_with_overflow.get(new) == 2 * (MAX_REF_COUNT as usize){
             let mut rc_sanity_objects = self.lxr.rc_sanity_objects.lock().unwrap();
             if !rc_sanity_objects.contains(&(new, 0 )){
                 rc_sanity_objects.push((new, 0));
@@ -1107,9 +1094,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             //     continue;
             // }
             #[cfg(feature = "sanity")]
-            if self.lxr.rc_with_overflow.get(*o) == RC_NURSERY_OR_DEAD 
-                || self.lxr.rc_with_overflow.get(*o) == MAX_REF_COUNT
-                || self.lxr.rc_with_overflow.get(*o) == RC_DEATH_TRANSIENT 
+            if lxr.rc_with_overflow.get(*o) == RC_NURSERY_OR_DEAD 
+                || lxr.rc_with_overflow.get(*o) == RC_DEATH_TRANSIENT 
                 || (self.mature_sweeping_in_progress && !lxr.is_marked(*o))
             {
                 panic!();
@@ -1137,7 +1123,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 let mut reporter = lxr.graph_reporter.lock().unwrap();
                 reporter.add_rc_freed(o.to_raw_address().as_usize());
                 }
-                 dead = true;
+                dead = true;
                 is_los = self.process_dead_object(o, lxr);
                 self.rc.dec_unconditionally(o);
                 STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(), 0u8, Ordering::Relaxed);
@@ -1212,9 +1198,16 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         }
                     }
                 }
+                #[cfg(debug_assertions)]
+                {
+                    let val: u8 = s_rc_prev_val.unwrap_or_else(|e| e);
+                    debug_assert!(
+                        val != 0
+                         || CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 
+                         || self.rc.count(o) == 0);
+        
+                }
 
-                debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 ||
-                CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 || self.rc.count(o) == 0);
             }
             if crate::args::PREFETCH {
                 if let Some(o) = decs.get(i + crate::args::PREFETCH_STEP) {

@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use crate::util::ObjectReference;
-use crate::util::rc::{RefCountHelper, MAX_REF_COUNT};
+use crate::util::rc::{RefCountHelper, MAX_REF_COUNT, RC_DEATH_TRANSIENT};
 use crate::vm::VMBinding; // or wherever VMBinding is imported from
 
 
@@ -102,4 +102,10 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
             .map(|(_, cached_rc)| *cached_rc)
             .unwrap_or(table_rc)
     }
+
+    pub fn is_alive(&self, o: ObjectReference) -> bool {
+       self.rc.count(o) as usize > RC_DEATH_TRANSIENT 
+    }
+    
+
 }

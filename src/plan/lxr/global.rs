@@ -117,7 +117,7 @@ pub struct LXR<VM: VMBinding> {
     #[cfg(feature = "s_rc_stats")]
     pub num_of_scanned_s_rc_candidates: Mutex<u64>,
     #[cfg(feature = "sanity")]
-    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, RcBits)>>,
+    pub rc_sanity_objects: Mutex<Vec<(ObjectReference, usize)>>,
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
     pub in_cycle_collection: AtomicBool,
     pub rc_with_overflow: RefCountWithOverflow<VM>,
