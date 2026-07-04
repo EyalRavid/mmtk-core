@@ -201,7 +201,6 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
         {
             lxr.los().sanity_sweep_large_objects();
             let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
-
             for (obj, rc) in rc_sanity_objects.iter() {
                 let mut real_rc = lxr.rc_with_overflow.get(*obj);
                 if lxr.rc_with_overflow.is_alive(*obj) {
@@ -215,7 +214,6 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                     "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
 
             }
-
             for chunk in lxr.immix_space.chunk_map.all_chunks()
             .filter(|c| lxr.immix_space.chunk_map.get(*c) == ChunkState::Allocated){
                 for block in chunk.iter_region::<Block>().filter(|block| block.get_state() != BlockState::Unallocated) {
@@ -229,7 +227,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                             && (!Line::is_aligned(o.to_raw_address()) || !lxr.rc.is_straddle_line(Line::from(o.to_raw_address())))
                         {
                 
-                            let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);
+                            //let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);
                             cursor = cursor +  rc::MIN_OBJECT_SIZE;
                             assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
                                     CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
@@ -260,6 +258,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                     }
                 }
             }
+
             rc_sanity_objects.clear();
 
             let is_live = |o: ObjectReference| -> bool {
