@@ -294,16 +294,16 @@ impl<VM: VMBinding> CycleCollector<VM>{
                             //let _ = self.rc.strong_rc_inc(curr_child); 
                            
 
-                        local_buffer.push(curr_child);
+                            local_buffer.push(curr_child);
                         
-                        CANDIDATES_STATUS.store_atomic::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
-                            if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
+                            CANDIDATES_STATUS.store_atomic::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                                if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
                                 let _ = self.rc.strong_rc_dec(curr_child);
+                                }
                             }
-                        }
-                        else{
-                            panic!("num_of_childs is greater than the actual number of childs");
-                        }
+                            else{
+                                panic!("num_of_childs is greater than the actual number of childs");
+                            }
 
                     }
 
