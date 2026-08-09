@@ -119,6 +119,6 @@ pub const LOG_BYTES_IN_ADDRESS_SPACE: u8 = BITS_IN_ADDRESS as u8;
 
 /// log2 of the minimal object size in bytes.
 // TODO: this should be VM specific.
-pub const LOG_MIN_OBJECT_SIZE: u8 = LOG_BYTES_IN_WORD + 1;
+pub const LOG_MIN_OBJECT_SIZE: u8 = LOG_BYTES_IN_WORD;
 /// The minimal object size in bytes
 pub const MIN_OBJECT_SIZE: usize = 1 << LOG_MIN_OBJECT_SIZE;

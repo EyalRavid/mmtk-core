@@ -380,7 +380,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             return true;
         }
         // Skip mature object
-        if self.rc.count(o) != RC_NURSERY_OR_DEAD as u8 {
+        if self.rc.count(o) != RC_NURSERY_OR_DEAD as RcBits {
             return true;
         }
         // Skip recycled lines
@@ -467,7 +467,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
             new
         } else {
-            let is_nursery = self.rc.count(o) == RC_NURSERY_OR_DEAD as u8;
+            let is_nursery = self.rc.count(o) == RC_NURSERY_OR_DEAD as RcBits;
             let copy_depth_reached = crate::args::INC_MAX_COPY_DEPTH && depth > 16;
             if is_nursery && !self.no_evac && !copy_depth_reached {
                 // Evacuate the object
@@ -1149,7 +1149,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                         (lxr.curr_vec.get() + 1) as u8,
                         Ordering::SeqCst,
                     );
-                    if self.rc.count(o) == RC_NURSERY_OR_DEAD as u8{
+                    if self.rc.count(o) == RC_NURSERY_OR_DEAD as RcBits{
                                            
                         CANDIDATES_STATUS.store_atomic::<u8>(
                             o.to_raw_address(),
@@ -1186,7 +1186,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                             Ordering::SeqCst,
                         );
 
-                        if self.rc.count(o) == RC_NURSERY_OR_DEAD as u8{                  
+                        if self.rc.count(o) == RC_NURSERY_OR_DEAD as RcBits{                  
                             CANDIDATES_STATUS.store_atomic::<u8>(
                                 o.to_raw_address(),
                                 0,
