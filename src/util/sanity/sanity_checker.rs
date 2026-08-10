@@ -203,11 +203,9 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
             let mut rc_sanity_objects = lxr.rc_sanity_objects.lock().unwrap();
             for (obj, rc) in rc_sanity_objects.iter() {
                 let mut real_rc = lxr.rc_with_overflow.get(*obj);
-                if lxr.rc_with_overflow.is_alive(*obj) {
-                    real_rc -= 1;
-                }
-                
-                assert!(real_rc == *rc || 
+                 assert!(real_rc != 1 ||
+                    (Line::is_aligned(obj.to_raw_address()) && lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))));
+                assert!(real_rc == 0 || 
                     CANDIDATES_STATUS.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
                     STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
                     (Line::is_aligned(obj.to_raw_address()) && lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))),
@@ -223,7 +221,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                         let o = unsafe { cursor.to_object_reference::<P::VM>() };
                         let mark_state = MARK_STATE.load(Ordering::SeqCst);
                         let mark_val = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-                        if lxr.rc_with_overflow.is_alive(o)
+                        if lxr.rc_with_overflow.get(o) != 0
                             && (!Line::is_aligned(o.to_raw_address()) || !lxr.rc.is_straddle_line(Line::from(o.to_raw_address())))
                         {
                 
@@ -232,7 +230,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                             assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
                                     CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
                             assert!(cursor <= limit);
-
+                            assert!(lxr.rc_with_overflow.get(o) != 1);
                             // If the object is alive but not marked by sanity tracing, it is "dead" from sanity's perspective.
                             // Track how many cycles it survives unmarked.
                             if mark_val != mark_state {
