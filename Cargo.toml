@@ -96,7 +96,7 @@ default = [
     #"sanity",
     "lxr_no_mature_evac",
     #"lxr_stw",
-    "lxr_rc_bits_8",
+    "lxr_rc_bits_32",
     "perf_counter",
     "dep:sysinfo",
     "dep:regex",

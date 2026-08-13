@@ -139,9 +139,9 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
 
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
-
-        lxr.in_cycle_collection.store(true, Ordering::SeqCst);
         lxr.satb_map.clear();
+        lxr.in_cycle_collection.store(true, Ordering::SeqCst);
+        //println!("size of rc cache: {}, num of entreies: {}", lxr.rc_with_overflow.capacity(), lxr.rc_with_overflow.num_entries());
 
         let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
         let mut candidates = unsafe {lxr.s_cycle_candidates_mut()}.into_final_buffers();
@@ -223,8 +223,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
     pub fn new(#[cfg(not(feature = "lxr_stw"))] c: LazySweepingJobsCounter) -> CycleCollector<VM> {
         CycleCollector::<VM> {
             rc: RefCountHelper::NEW,
+            // Take ownership of the token handed over by `end_of_decs`.  Cloning it here and
+            // dropping the original would be a redundant +1/-1 on the same cc counter.
             #[cfg(not(feature = "lxr_stw"))]
-            _c: c.clone_with_cc(),
+            _c: c,
             #[cfg(feature = "s_rc_stats")]
             stats: CycleCollectorStats::default(),
         }

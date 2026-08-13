@@ -106,6 +106,18 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
     pub fn is_alive(&self, o: ObjectReference) -> bool {
        self.rc.count(o) as usize > RC_DEATH_TRANSIENT 
     }
-    
+
+
+    /// Number of entries currently stored in the overflow vector.
+    pub fn num_entries(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    /// Memory allocated for the overflow vector's backing storage, in bytes.
+    pub fn capacity(&self) -> usize {
+        let entries = self.entries.lock().unwrap();
+
+        entries.capacity()
+    } 
 
 }

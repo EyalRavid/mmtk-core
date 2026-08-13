@@ -89,9 +89,22 @@ pub use crate::plan::{
 
 static NUM_CONCURRENT_TRACING_PACKETS: AtomicUsize = AtomicUsize::new(0);
 
+/// A token that keeps one *generation* of lazy jobs alive.
+///
+/// A generation is the set of `{decs, cc, overall}` counters installed by one
+/// [`LazySweepingJobs::swap`].  A token belongs to exactly one generation for its whole life: it
+/// holds that generation's `Arc`s, so it can always reach its own counters without consulting
+/// [`LAZY_SWEEPING_JOBS`], which may have moved on to a newer generation since the token was made.
 pub struct LazySweepingJobsCounter {
+    /// `Some` iff this token is counted in its generation's decrement counter.
     decs_counter: Option<Arc<AtomicUsize>>,
+    /// `Some` iff this token is counted in its generation's cycle-collection counter.
+    ///
+    /// Decrement tokens are counted in this too, so it reaches zero only once the decrements *and*
+    /// the cycle collection that follows them are done.  That is what lets a decrement token hand
+    /// the cycle collector a token for its own generation, via [`Self::clone_with_cc`].
     cc_counter: Option<Arc<AtomicUsize>>,   // Eyal added this for cycle collection phase
+    /// This token's generation's overall counter.  Every token is counted in it.
     counter: Arc<AtomicUsize>,
 }
 impl LazySweepingJobsCounter {
@@ -106,31 +119,21 @@ impl LazySweepingJobsCounter {
         }
     }
 
+    /// Create a token for one unit of decrement work in the current generation.
+    ///
+    /// The cycle-collection counter is taken from the same generation and incremented here, so the
+    /// generation's cc counter stays non-zero for as long as any decrement work is outstanding.
     pub fn new_decs() -> Self {
         let lazy_sweeping_jobs = LAZY_SWEEPING_JOBS.read();
         let decs_counter = lazy_sweeping_jobs.curr_decs_counter.as_ref().unwrap();
         decs_counter.fetch_add(1, Ordering::SeqCst);
+        let cc_counter = lazy_sweeping_jobs.curr_cc_counter.as_ref().unwrap();
+        cc_counter.fetch_add(1, Ordering::SeqCst);
         let counter = lazy_sweeping_jobs.curr_counter.as_ref().unwrap();
         counter.fetch_add(1, Ordering::SeqCst);
         Self {
             decs_counter: Some(decs_counter.clone()),
-            cc_counter: None,
-            counter: counter.clone(),
-        }
-    }
-
-    pub fn new_cc() -> Self {
-        let lazy = LAZY_SWEEPING_JOBS.read();
-    
-        let cc = lazy.curr_cc_counter.as_ref().unwrap();
-        cc.fetch_add(1, Ordering::SeqCst);
-    
-        let counter = lazy.curr_counter.as_ref().unwrap();
-        counter.fetch_add(1, Ordering::SeqCst);
-    
-        Self {
-            decs_counter: None,
-            cc_counter: Some(cc.clone()),
+            cc_counter: Some(cc_counter.clone()),
             counter: counter.clone(),
         }
     }
@@ -145,19 +148,35 @@ impl LazySweepingJobsCounter {
         }
     }
 
+    /// Create a token for recursively generated decrement work, in the same generation as `self`.
+    ///
+    /// This must count in the cc counter as well, for the same reason [`Self::new_decs`] does:
+    /// otherwise a parent that spawned children could take the cc counter to zero — and fire
+    /// `end_of_cc` — while its children still have decrement work to do.
     pub fn clone_with_decs(&self) -> Self {
         self.decs_counter
+            .as_ref()
+            .unwrap()
+            .fetch_add(1, Ordering::SeqCst);
+        self.cc_counter
             .as_ref()
             .unwrap()
             .fetch_add(1, Ordering::SeqCst);
         self.counter.fetch_add(1, Ordering::SeqCst);
         Self {
             decs_counter: self.decs_counter.clone(),
-            cc_counter: None,
+            cc_counter: self.cc_counter.clone(),
             counter: self.counter.clone(),
         }
     }
 
+    /// Create a token for cycle-collection work, in the same generation as `self`.
+    ///
+    /// Called from `drop` when the last decrement token of a generation goes away, to hand the
+    /// cycle collector a token for *that* generation.  Deriving it from `self` rather than from
+    /// [`LAZY_SWEEPING_JOBS`] is what makes this correct in both configurations: lazy decrements
+    /// drop after the pause ends (so their generation is already `prev_*` by then), while STW
+    /// decrements drop inside the pause (so theirs is still `curr_*`).
     pub fn clone_with_cc(&self) -> Self {
         self.cc_counter.as_ref().unwrap().fetch_add(1, Ordering::SeqCst);
         self.counter.fetch_add(1, Ordering::SeqCst);
@@ -173,11 +192,16 @@ impl Drop for LazySweepingJobsCounter {
     fn drop(&mut self) {
         let lazy = LAZY_SWEEPING_JOBS.read();
 
-        // 1) decs finished? -> trigger end_of_decs(token_for_overall)
+        // 1) decs finished? -> trigger end_of_decs(token for cc + overall, NOT decs)
+        //
+        // The new token must come from `self`, not from `LAZY_SWEEPING_JOBS`: this generation may
+        // no longer be the current one by now.  It also has to be created *before* step 2 and 3
+        // decrement this token's own counters, so that neither the cc counter nor the overall
+        // counter can reach zero during the handover to the cycle collector.
         if let Some(decs) = self.decs_counter.as_ref() {
             if decs.fetch_sub(1, Ordering::SeqCst) == 1 {
                 let f = lazy.end_of_decs.as_ref().unwrap();
-                f(LazySweepingJobsCounter::new_cc()); // keeps overall alive, NOT decs
+                f(self.clone_with_cc());
             }
         }
 

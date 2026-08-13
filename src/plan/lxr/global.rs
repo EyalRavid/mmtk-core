@@ -251,6 +251,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         }
         //println!("REACHED schedule_collection");
         if !crate::LazySweepingJobs::all_finished() {
+            panic!();
             gc_log!([1] "WARNING: LXR Lazy Sweeping Not Finished");
             crate::counters()
                 .gc_with_unfinished_lazy_jobs
@@ -262,7 +263,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
         //Eyal commented this line
         //It must be commeted with the call on line 1187
-        //self.wait_for_decide_cycle_collection();
+        self.wait_for_decide_cycle_collection();
         let pause = Pause::RefCount;
         //########################################3
 
@@ -382,11 +383,15 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             "    - ({:.3}ms) vm_release start",
             crate::gc_start_time_ms(),
         );
-        let t = std::time::SystemTime::now();
-        <VM as VMBinding>::VMCollection::vm_release(perform_class_unloading);
-        let elapsed = t.elapsed().unwrap().as_micros() as f64;
+
         if perform_class_unloading {
+            let t = std::time::SystemTime::now();
+            <VM as VMBinding>::VMCollection::vm_release(perform_class_unloading);
+            let elapsed = t.elapsed().unwrap().as_micros() as f64;
             gc_log!([3] "    - class unloading finished in {:.3} ms", elapsed / 1000.0);
+        }
+        else {
+            <VM as VMBinding>::VMCollection::vm_release(perform_class_unloading);
         }
         self.common.los.is_end_of_satb_or_full_gc = false;
         #[cfg(feature = "lxr_release_stage_timer")]
@@ -1229,7 +1234,7 @@ impl<VM: VMBinding> LXR<VM> {
         };
         //Eyal commented this line
         //It must be commeted with the call on line 240
-        //self.decide_next_gc_may_perform_cycle_collection(pause);
+        self.decide_next_gc_may_perform_cycle_collection(pause);
     }
 
     fn gc_init(&mut self, options: &Options) {
