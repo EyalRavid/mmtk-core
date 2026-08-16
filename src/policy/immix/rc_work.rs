@@ -32,6 +32,15 @@ use super::{
 
 static SELECT_DEFRAG_BLOCK_JOB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Fully-dead blocks that `rc_sweep_mature` declined to free (a mutator was reusing them)
+/// and that were put back on the sweep queue for a later GC to retry. Only touched on the
+/// retry path, so it costs nothing on a run where the retry never fires. Reported and reset
+/// in `LXR::on_lazy_sweeping_finished`.
+///
+/// If this stays 0, block reclamation is not losing blocks this way and any retained memory
+/// is coming from somewhere else.
+pub static SW_REQUEUED: AtomicUsize = AtomicUsize::new(0);
+
 struct SelectDefragBlocks {
     pub chunks: Range<Chunk>,
     #[allow(unused)]
@@ -165,17 +174,49 @@ impl<VM: VMBinding> GCWork<VM> for SweepBlocksAfterDecs {
         }
         let mut count = 0;
         for (block, defrag) in &self.blocks {
+            // Sample deadness before `unlog()`. `rc_sweep_mature` returns a bare `false` for
+            // four different reasons, and this is the only way to tell "still holds live
+            // objects" (drop it, it gets re-enqueued when they die) from "refused because a
+            // mutator is reusing it" (must be retried, see below).
+            //
+            // Passing the sample on as the `rc_dead` argument short-circuits the identical
+            // check inside `rc_sweep_mature`, so a fully dead block is still scanned only
+            // once. The sample cannot go stale: RC counts only rise in `ProcessIncs` and
+            // `promote`, both of which run STW, so during the concurrent sweep `rc_dead()`
+            // only ever goes from false to true.
+            let was_rc_dead = block.rc_dead();
             block.unlog();
-            if block.rc_sweep_mature::<VM>(&lxr.immix_space, *defrag, false) {
+            if block.rc_sweep_mature::<VM>(&lxr.immix_space, *defrag, was_rc_dead) {
                 count += 1;
             } else {
-                assert!(
+                debug_assert!(
                     !*defrag,
                     "defrag block is freed? {:?} {:?} {}",
                     block,
                     block.get_state(),
                     block.is_defrag_source()
                 );
+                // The block holds no live objects, but `rc_sweep_mature` declined to free it
+                // because a mutator acquired it for hole allocation in the current phase.
+                // The `unlog()` above already dropped it from the sweep queue, and nothing
+                // can put it back: `add_to_possibly_dead_mature_blocks` is only reached from
+                // `process_dead_object`, and a block with no live objects has nothing left
+                // that can die. Re-queue it so a later GC retries.
+                //
+                // The `Unallocated` test is not redundant: a freed block also has an all-zero
+                // RC table, so without it an already-freed block would be re-queued forever
+                // and would carry a stale `IX_BLOCK_LOG` bit into its next clean allocation,
+                // which would silently bar it from ever being enqueued again.
+                //
+                // This terminates. The queue is drained once per GC, and `is_reusing()` only
+                // holds while the block's `phase_epoch` matches the current global epoch,
+                // which advances twice per GC. If the mutator keeps the block and promotes
+                // objects into it, it stops being `rc_dead` and leaves the retry set.
+                if was_rc_dead && block.get_state() != BlockState::Unallocated {
+                    SW_REQUEUED.fetch_add(1, Ordering::Relaxed);
+                    lxr.immix_space
+                        .add_to_possibly_dead_mature_blocks(*block, *defrag);
+                }
             }
         }
         if count != 0 {

@@ -12,6 +12,7 @@ use crate::plan::MutatorContext;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
 use crate::policy::immix::block::Block;
+use crate::policy::immix::rc_work::SW_REQUEUED;
 use crate::policy::immix::ImmixSpaceArgs;
 use crate::policy::largeobjectspace::LargeObjectSpace;
 use crate::policy::space::Space;
@@ -1177,6 +1178,13 @@ impl<VM: VMBinding> LXR<VM> {
     fn on_lazy_sweeping_finished(&self) {
         let ix = &self.immix_space;
         self.immix_space.flush_page_resource();
+        // Fully dead blocks the sweeper had to hand back because a mutator was reusing them.
+        // A non-zero value means the retry path in `SweepBlocksAfterDecs` fired; before that
+        // path existed these blocks left the sweep queue and were never reclaimed.
+        let requeued = SW_REQUEUED.swap(0, Ordering::Relaxed);
+        if requeued != 0 {
+            gc_log!([2] " - sweep requeued {} fully-dead blocks held by mutators", requeued);
+        }
         let released_blocks = ix.num_clean_blocks_released_lazy.load(Ordering::SeqCst);
         let released_los_pages = self.los().num_pages_released_lazy.load(Ordering::SeqCst);
         let total_released_bytes =
