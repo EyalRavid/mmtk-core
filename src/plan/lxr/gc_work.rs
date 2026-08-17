@@ -204,6 +204,15 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             self.stats.satb_map_size = lxr.satb_map.len();
             self.stats.log_to_file();
         }
+        // Timestamp the end of cycle collection. Together with the "lazy decs finished" and
+        // "lazy jobs finished" lines this splits the concurrent window into its three
+        // phases, which is what tells us whether overlapping the sweep with cycle
+        // collection is worth doing: this packet is single-threaded, so every millisecond
+        // between "decs finished" and here is time the other GC workers spend idle.
+        gc_log!([2]
+            " - lazy cc finished since-gc-start={:.3}ms",
+            crate::gc_start_time_ms(),
+        );
     }
 }
 
