@@ -10,6 +10,10 @@ mod remset;
 //Eyal added this mod
 mod stack;
 mod overflow_rc_cache;
+/// Fast/slow path counters for `overflow_rc_cache`. The whole module exists only under
+/// the feature, so a publication build contains none of it. See `rc_path_stats.rs`.
+#[cfg(feature = "lxr_rc_path_stats")]
+pub(crate) mod rc_path_stats;
 #[cfg(feature = "graph_project")]
 mod graphs_project;
 

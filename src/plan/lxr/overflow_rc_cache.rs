@@ -23,10 +23,24 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
     }
 
     pub fn inc(&self, o: ObjectReference) -> usize {
+        // `self.rc.inc` is a CAS retry loop internally, but it returns exactly one
+        // `Result` per logical inc, so matching on that result counts each operation
+        // once however many times the CAS was retried.
         match self.rc.inc(o) {
-            Ok(prev) => prev as usize,
+            Ok(prev) => {
+                // Fast: the count was below MAX_REF_COUNT and the side-metadata CAS
+                // completed the operation. The overflow table was never consulted.
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::inc_fast();
+                prev as usize
+            }
 
             Err(MAX_REF_COUNT) => {
+                // Slow: the count is saturated, so this inc must go through the
+                // mutex-protected Vec below. Counted here, before the lock, so that the
+                // hit and insert cases below share this single increment.
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::inc_slow();
                 let mut entries = self.entries.lock().unwrap();
 
                 for (key, rc) in entries.iter_mut() {
@@ -50,10 +64,23 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
     }
 
     pub fn dec(&self, o: ObjectReference) -> usize {
+        // As in `inc`: one `Result` per logical dec regardless of internal CAS retries.
         match self.rc.dec(o) {
-            Ok(prev_rc) => prev_rc as usize,
+            Ok(prev_rc) => {
+                // Fast: the count was neither 0 nor MAX_REF_COUNT, so the side-metadata
+                // CAS completed the operation without touching the overflow table.
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::dec_fast();
+                prev_rc as usize
+            }
 
             Err(MAX_REF_COUNT) => {
+                // Slow: the count is saturated. Counted once here, which covers all three
+                // outcomes below -- entry decremented, entry removed, or a full scan that
+                // misses and falls back to `dec_unconditionally`. That fallback re-enters
+                // `RefCountHelper`, not this method, so it cannot count a second time.
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::dec_slow();
                 let mut entries = self.entries.lock().unwrap();
 
                 for i in 0..entries.len() {
@@ -91,9 +118,18 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
         let table_rc = self.rc.count(o) as usize;
 
         if table_rc != MAX_RC_USIZE {
+            // Fast: a single side-metadata load answered the query. Note `get`'s boundary
+            // is a plain load-and-compare, not a CAS result like `inc`/`dec`.
+            #[cfg(feature = "lxr_rc_path_stats")]
+            super::rc_path_stats::get_fast();
             return table_rc;
         }
 
+        // Slow: the count is saturated, so the table must be consulted to tell
+        // MAX_REF_COUNT from anything above it. Counted before the lock, so the hit and
+        // the miss (which still scans the whole Vec, then returns `table_rc`) share it.
+        #[cfg(feature = "lxr_rc_path_stats")]
+        super::rc_path_stats::get_slow();
         let entries = self.entries.lock().unwrap();
 
         entries

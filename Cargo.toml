@@ -107,6 +107,7 @@ default = [
     #"tracing",
     "immix_non_moving",
     #"graph_project",
+    #"lxr_rc_path_stats",
 ]
 
 # Built-in env_logger.  This feature is enabled by default.
@@ -249,6 +250,10 @@ bpr_freelist = []
 freelist_best_fit_alloc = []
 bpr_spin_lock = []
 s_rc_stats = []
+# Fast/slow path counts for the LXR overflow RC table (src/plan/lxr/rc_path_stats.rs).
+# Diagnostic only: adds six columns to the MMTk stats block. Must NOT be enabled for
+# publication timing builds. With it off, the module and every call site are cfg'd away.
+lxr_rc_path_stats = []
 graph_project = ["serde", "serde_json", "lxr_stw"]
 # This feature is only supported on x86-64 for now
 # It's manually added to CI scripts

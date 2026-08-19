@@ -195,11 +195,15 @@ impl Stats {
         unsafe { crate::RETIRED_COUNTERS.print_values() };
         #[cfg(feature = "instrumentation")]
         crate::STAT.lock().print_values();
+        #[cfg(feature = "lxr_rc_path_stats")]
+        crate::plan::lxr::rc_path_stats::print_values();
         println!();
         print!("Total time: ");
         self.total_time.lock().unwrap().print_total(None);
         println!(" ms");
-        println!("------------------------------ End MMTk Statistics -----------------------------")
+        println!("------------------------------ End MMTk Statistics -----------------------------");
+        #[cfg(feature = "lxr_rc_path_stats")]
+        crate::plan::lxr::rc_path_stats::print_report();
     }
 
     pub fn print_column_names(&self, scheduler_stat: &HashMap<String, String>) {
@@ -219,6 +223,8 @@ impl Stats {
         unsafe { crate::RETIRED_COUNTERS.print_keys() };
         #[cfg(feature = "instrumentation")]
         crate::STAT.lock().print_keys();
+        #[cfg(feature = "lxr_rc_path_stats")]
+        crate::plan::lxr::rc_path_stats::print_keys();
         println!();
     }
 

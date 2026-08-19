@@ -341,6 +341,8 @@ impl<VM: VMBinding> MMTK<VM> {
         }
         self.inside_harness.store(true, Ordering::SeqCst);
         crate::reset_counters();
+        #[cfg(feature = "lxr_rc_path_stats")]
+        crate::plan::lxr::rc_path_stats::reset();
         self.stats.start_all();
         self.scheduler.enable_stat();
         crate::INSIDE_HARNESS.store(true, Ordering::SeqCst);
