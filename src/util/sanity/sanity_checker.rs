@@ -204,11 +204,11 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
             for (obj, rc) in rc_sanity_objects.iter() {
                 let mut real_rc = lxr.rc_with_overflow.get(*obj);
                  assert!(real_rc != 1 ||
-                    (Line::is_aligned(obj.to_raw_address()) && lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))));
+                    (lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))));
                 assert!(real_rc == 0 || 
                     CANDIDATES_STATUS.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
                     STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
-                    (Line::is_aligned(obj.to_raw_address()) && lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))),
+                    (lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))),
                     "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
 
             }
@@ -222,7 +222,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                         let mark_state = MARK_STATE.load(Ordering::SeqCst);
                         let mark_val = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
                         if lxr.rc_with_overflow.get(o) != 0
-                            && (!Line::is_aligned(o.to_raw_address()) || !lxr.rc.is_straddle_line(Line::from(o.to_raw_address())))
+                            && (!lxr.rc.is_straddle_line(Line::from(o.to_raw_address())))
                         {
                 
                             //let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);
