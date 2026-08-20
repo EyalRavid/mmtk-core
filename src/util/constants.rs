@@ -119,6 +119,14 @@ pub const LOG_BYTES_IN_ADDRESS_SPACE: u8 = BITS_IN_ADDRESS as u8;
 
 /// log2 of the minimal object size in bytes.
 // TODO: this should be VM specific.
-pub const LOG_MIN_OBJECT_SIZE: u8 = LOG_BYTES_IN_WORD;
+//
+// 16 bytes: this is the granularity of every side-metadata table specced with
+// `log_bytes_in_region: LOG_MIN_OBJECT_SIZE`, so raising it halves all of them.
+// Safe because HotSpot's minimum object is already 16 bytes, so no two objects
+// share an index. It does NOT make objects 16-byte *aligned*, so index -> address
+// is not invertible; walks that enumerate object starts by stepping MIN_OBJECT_SIZE
+// assert on this at entry.
+// `openjdk/mmtk.h::log_min_obj_size` must be kept in sync.
+pub const LOG_MIN_OBJECT_SIZE: u8 = LOG_BYTES_IN_WORD + 1;
 /// The minimal object size in bytes
 pub const MIN_OBJECT_SIZE: usize = 1 << LOG_MIN_OBJECT_SIZE;

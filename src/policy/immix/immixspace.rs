@@ -795,6 +795,14 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// 4. `avail-blocks-in-chunk` -  Number of available blocks in chunk (0-128)
     /// 5. `rc-live-words-in-block` -  RC Live size in block (0-4096)
     pub fn dump_memory(&self, lxr: &crate::plan::lxr::LXR<VM>) {
+        // The rc_live_bytes walk below reconstructs an object address from a metadata index, which
+        // is only valid when metadata granularity equals object alignment (8 bytes). Diagnostic
+        // path only.
+        assert_eq!(
+            crate::util::rc::LOG_MIN_OBJECT_SIZE,
+            crate::util::constants::LOG_BYTES_IN_WORD as usize,
+            "dump_memory requires 8-byte metadata granularity"
+        );
         #[derive(Default)]
         struct Dist {
             avail_blocks_in_chunk: Vec<u8>,

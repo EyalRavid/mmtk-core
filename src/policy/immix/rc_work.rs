@@ -281,6 +281,16 @@ impl<VM: VMBinding> SweepDeadCycles<VM> {
     }
 
     fn process_block(&mut self, block: Block, immix_space: &ImmixSpace<VM>) -> bool {
+        // This walk turns a metadata index back into an object address, which is only valid when
+        // metadata granularity equals object alignment. Objects are 8-byte aligned, so at a
+        // coarser granularity an object starting at 8 mod 16 is never visited and its RC entry is
+        // misattributed to the granule base. Dead in this fork (SweepDeadCycles is only scheduled
+        // for Pause::Full / Pause::FinalMark), so this fires only if SATB is re-enabled.
+        assert_eq!(
+            rc::LOG_MIN_OBJECT_SIZE,
+            crate::util::constants::LOG_BYTES_IN_WORD as usize,
+            "SweepDeadCycles::process_block requires 8-byte metadata granularity"
+        );
         let mut has_live = false;
         let mut cursor = block.start();
         let limit = block.end();
