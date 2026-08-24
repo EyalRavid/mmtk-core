@@ -98,11 +98,14 @@ static NUM_CONCURRENT_TRACING_PACKETS: AtomicUsize = AtomicUsize::new(0);
 pub struct LazySweepingJobsCounter {
     /// `Some` iff this token is counted in its generation's decrement counter.
     decs_counter: Option<Arc<AtomicUsize>>,
-    /// `Some` iff this token is counted in its generation's cycle-collection counter.
+    /// `Some` iff this token is counted in its generation's **middle-phase** counter.
     ///
-    /// Decrement tokens are counted in this too, so it reaches zero only once the decrements *and*
-    /// the cycle collection that follows them are done.  That is what lets a decrement token hand
-    /// the cycle collector a token for its own generation, via [`Self::clone_with_cc`].
+    /// Since the 2026-08-23 reorder of the concurrent chain to `decs -> sweep -> cc`, the middle
+    /// phase is **block sweeping**, not cycle collection; the field and [`Self::clone_with_cc`]
+    /// keep their names for now so the reorder stays a reviewable diff, but what they gate is the
+    /// sweep.  Decrement tokens are counted in this too, so it reaches zero only once the
+    /// decrements *and* the sweep that follows them are done.  That is what lets a decrement token
+    /// hand the next phase a token for its own generation, via [`Self::clone_with_cc`].
     cc_counter: Option<Arc<AtomicUsize>>,   // Eyal added this for cycle collection phase
     /// This token's generation's overall counter.  Every token is counted in it.
     counter: Arc<AtomicUsize>,
@@ -170,10 +173,12 @@ impl LazySweepingJobsCounter {
         }
     }
 
-    /// Create a token for cycle-collection work, in the same generation as `self`.
+    /// Create a token for **middle-phase** work, in the same generation as `self`.
     ///
-    /// Called from `drop` when the last decrement token of a generation goes away, to hand the
-    /// cycle collector a token for *that* generation.  Deriving it from `self` rather than from
+    /// Two callers since the 2026-08-23 reorder: `drop`, when the last decrement token of a
+    /// generation goes away, and `ImmixSpace::schedule_rc_block_sweeping_tasks`, for every sweep
+    /// packet.  The second is what holds the middle counter open for the duration of the sweep and
+    /// so orders cycle collection behind it.  Deriving it from `self` rather than from
     /// [`LAZY_SWEEPING_JOBS`] is what makes this correct in both configurations: lazy decrements
     /// drop after the pause ends (so their generation is already `prev_*` by then), while STW
     /// decrements drop inside the pause (so theirs is still `curr_*`).
@@ -192,7 +197,8 @@ impl Drop for LazySweepingJobsCounter {
     fn drop(&mut self) {
         let lazy = LAZY_SWEEPING_JOBS.read();
 
-        // 1) decs finished? -> trigger end_of_decs(token for cc + overall, NOT decs)
+        // 1) decs finished? -> trigger end_of_decs(token for mid + overall, NOT decs).
+        //    Since the reorder, end_of_decs schedules block sweeping.
         //
         // The new token must come from `self`, not from `LAZY_SWEEPING_JOBS`: this generation may
         // no longer be the current one by now.  It also has to be created *before* step 2 and 3
@@ -205,7 +211,8 @@ impl Drop for LazySweepingJobsCounter {
             }
         }
 
-        // 2) cc finished? -> trigger end_of_cc(token_for_overall)
+        // 2) middle phase finished? -> trigger end_of_cc(token_for_overall).
+        //    Since the reorder, that means sweeping is done and cycle collection is scheduled.
         if let Some(cc) = self.cc_counter.as_ref() {
             if cc.fetch_sub(1, Ordering::SeqCst) == 1 {
                 let f = lazy.end_of_cc.as_ref().unwrap();

@@ -204,11 +204,15 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             self.stats.satb_map_size = lxr.satb_map.len();
             self.stats.log_to_file();
         }
-        // Timestamp the end of cycle collection. Together with the "lazy decs finished" and
-        // "lazy jobs finished" lines this splits the concurrent window into its three
-        // phases, which is what tells us whether overlapping the sweep with cycle
-        // collection is worth doing: this packet is single-threaded, so every millisecond
-        // between "decs finished" and here is time the other GC workers spend idle.
+        // Timestamp the end of cycle collection. Together with "lazy decs finished",
+        // "lazy sweep finished" and "lazy jobs finished" this splits the concurrent window
+        // into its phases for `scripts/lxr/window.py`.
+        //
+        // Since the 2026-08-23 reorder the chain is decs -> sweep -> cc, so the interval that
+        // ends here starts at "lazy sweep finished", not at "lazy decs finished". This packet
+        // is still single-threaded, so every millisecond it runs is time the other GC workers
+        // spend idle -- the reorder moved reclamation off the far side of that wait, it did
+        // not shorten the wait.
         gc_log!([2]
             " - lazy cc finished since-gc-start={:.3}ms",
             crate::gc_start_time_ms(),

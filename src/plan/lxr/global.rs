@@ -1159,20 +1159,59 @@ impl<VM: VMBinding> LXR<VM> {
         &self.common.los
     }
 
+    /// Fires when the decrement phase of this generation has drained.
+    ///
+    /// **Reordered 2026-08-23. The chain is now decs -> sweep -> cc.** Block sweeping is
+    /// scheduled here, ahead of cycle collection, so the memory the decrement phase freed is
+    /// handed back at the *start* of the concurrent tail instead of behind ~1s of
+    /// single-threaded trial deletion. Sweeping is parallel and costs 0.08-5.10ms; cycle
+    /// collection is a single work packet and costs up to 2.7s, so queueing the cheap phase
+    /// behind the expensive one delayed every byte of reclamation by the length of a full
+    /// cycle collection.
+    ///
+    /// `c` is counted in the generation's middle counter, and
+    /// [`ImmixSpace::schedule_rc_block_sweeping_tasks`] derives every sweep packet's token
+    /// from it with `clone_with_cc`, so that counter stays non-zero until the last sweep
+    /// packet finishes. **That is the whole ordering mechanism**: it is what makes
+    /// `on_lazy_cc_finished` fire *after* sweeping rather than alongside it. Deriving the
+    /// packets with a plain `clone` instead would empty the middle counter immediately and
+    /// run cycle collection concurrently with the sweep.
     fn on_lazy_decs_finished(&self, c: LazySweepingJobsCounter) {
         gc_log!([2]
             " - lazy decs finished since-gc-start={:.3}ms",
             crate::gc_start_time_ms(),
         );
 
-        // Schedule cycle collection. Added the cfg guard add support for cycle collection in stw settings.
-        //with stw feature, cycle collection is scheduled at the end of the ref count pause. on the cycleCollection phaze.
-        #[cfg(not(feature = "lxr_stw"))]
-        self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained].add(CycleCollector::<VM>::new(c));
+        self.immix_space.schedule_rc_block_sweeping_tasks(c);
     }
 
+    /// Fires when **block sweeping** has drained. The name refers to the counter this hangs
+    /// off, not to the phase that just ended; see `on_lazy_decs_finished` for the reorder.
+    ///
+    /// Cycle collection is scheduled here, last in the chain.
+    ///
+    /// Blocks that trial deletion kills are pushed onto `possibly_dead_mature_blocks` by
+    /// `process_dead_object`, *after* this generation's sweep has already drained the queue.
+    /// There is deliberately **no second sweep** after cycle collection: those blocks are
+    /// picked up by the next GC's sweep, which now runs early in that GC's tail. The cost is
+    /// that cycle-reclaimed memory returns one cycle later; the benefit is that the queue is
+    /// still drained exactly once per GC, which is the premise of the retry-termination
+    /// argument in `policy/immix/rc_work.rs`.
     fn on_lazy_cc_finished(&self, c: LazySweepingJobsCounter) {
-        self.immix_space.schedule_rc_block_sweeping_tasks(c);
+        let ix = &self.immix_space;
+        gc_log!([2]
+            " - lazy sweep finished since-gc-start={:.3}ms, released-blocks={}, released-los-pages={}",
+            crate::gc_start_time_ms(),
+            ix.num_clean_blocks_released_lazy.load(Ordering::SeqCst),
+            self.los().num_pages_released_lazy.load(Ordering::SeqCst),
+        );
+
+        // With `lxr_stw`, cycle collection already ran inside the reference-counting pause
+        // (see `schedule_rc_collection`), so there is nothing to schedule here and `c` is
+        // simply dropped -- which is also what the pre-reorder code did in the other callback.
+        #[cfg(not(feature = "lxr_stw"))]
+        self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained]
+            .add(CycleCollector::<VM>::new(c));
     }
 
     fn on_lazy_sweeping_finished(&self) {
@@ -1185,17 +1224,31 @@ impl<VM: VMBinding> LXR<VM> {
         if requeued != 0 {
             gc_log!([2] " - sweep requeued {} fully-dead blocks held by mutators", requeued);
         }
+        // SCOPE, and the two halves differ since the decs -> sweep -> cc reorder:
+        //
+        //   `released-blocks`     Immix blocks the SWEEP returned. Cycle collection runs after
+        //                         the sweep and only *queues* the blocks it kills
+        //                         (`process_dead_object` -> `add_to_possibly_dead_mature_blocks`),
+        //                         so they are NOT counted here. They are counted by
+        //                         `deferred-blocks`, and swept by the next GC.
+        //   `released-los-pages`  LOS pages returned by the sweep AND by cycle collection, which
+        //                         frees large objects directly through `rc_free`.
+        //
+        // So the two fields cover different phases and `total-released` mixes them. Compare
+        // `released-blocks` against the "lazy sweep finished" line, not across the two orders:
+        // a drop there means reclamation moved to the next cycle, not that less was reclaimed.
         let released_blocks = ix.num_clean_blocks_released_lazy.load(Ordering::SeqCst);
         let released_los_pages = self.los().num_pages_released_lazy.load(Ordering::SeqCst);
         let total_released_bytes =
             (released_blocks << Block::LOG_BYTES) + (released_los_pages << LOG_BYTES_IN_PAGE);
         gc_log!([2]
-            " - lazy jobs finished since-gc-start={:.3}ms, current-reserved-heap={}M({}M), released-blocks={}, released-los-pages={}, total-released={}",
+            " - lazy jobs finished since-gc-start={:.3}ms, current-reserved-heap={}M({}M), released-blocks={}, released-los-pages={}, deferred-blocks={}, total-released={}",
             crate::gc_start_time_ms(),
             self.get_reserved_pages() / 256,
             self.get_total_pages() / 256,
             released_blocks,
             released_los_pages,
+            ix.possibly_dead_mature_blocks_len(),
             if total_released_bytes < BYTES_IN_KBYTE {
                 format!("{}B", total_released_bytes)
             } else if total_released_bytes < BYTES_IN_MBYTE {

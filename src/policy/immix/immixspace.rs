@@ -1596,6 +1596,28 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         }
     }
 
+    /// How many blocks are queued for sweeping but not yet swept.
+    ///
+    /// Read at the end of the concurrent window, where it is the number of blocks the cycle
+    /// collector killed *after* this GC's sweep had already drained the queue, and which are
+    /// therefore deferred to the next GC's sweep. Without this the "lazy jobs finished" line
+    /// looks like the fork reclaims less than it does: the memory is found, just not yet
+    /// handed back.
+    pub fn possibly_dead_mature_blocks_len(&self) -> usize {
+        self.possibly_dead_mature_blocks.len()
+    }
+
+    /// Split `possibly_dead_mature_blocks` into one packet per worker and schedule them.
+    ///
+    /// Called from `LXR::on_lazy_decs_finished`, i.e. **before** cycle collection since the
+    /// 2026-08-23 reorder of the concurrent chain to decs -> sweep -> cc.
+    ///
+    /// Each packet's token is derived with `clone_with_cc`, not `clone`. That is deliberate
+    /// and is what orders cycle collection behind this phase: `clone_with_cc` counts the
+    /// token in the generation's middle counter, so the counter cannot reach zero -- and
+    /// `end_of_cc` cannot fire and schedule the cycle collector -- until the last sweep
+    /// packet has been dropped. A plain `clone` counts only in the overall counter, which
+    /// would let cycle collection start while these packets are still running.
     pub fn schedule_rc_block_sweeping_tasks(&self, counter: LazySweepingJobsCounter) {
         // while let Some(x) = self.last_mutator_recycled_blocks.pop() {
         //     x.set_state(BlockState::Marked);
@@ -1619,7 +1641,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let packets = bins
             .into_iter()
             .map::<Box<dyn GCWork<VM>>, _>(|blocks| {
-                Box::new(SweepBlocksAfterDecs::new(blocks, counter.clone()))
+                Box::new(SweepBlocksAfterDecs::new(blocks, counter.clone_with_cc()))
             })
             .collect();
         self.scheduler().work_buckets[WorkBucketStage::Unconstrained].bulk_add_prioritized(packets);
