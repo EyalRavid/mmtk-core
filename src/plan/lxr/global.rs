@@ -264,7 +264,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
 
         //Eyal commented this line
         //It must be commeted with the call on line 1187
-        self.wait_for_decide_cycle_collection();
+        //self.wait_for_decide_cycle_collection();
         let pause = Pause::RefCount;
         //########################################3
 
@@ -1295,7 +1295,7 @@ impl<VM: VMBinding> LXR<VM> {
         };
         //Eyal commented this line
         //It must be commeted with the call on line 240
-        self.decide_next_gc_may_perform_cycle_collection(pause);
+        //self.decide_next_gc_may_perform_cycle_collection(pause);
     }
 
     fn gc_init(&mut self, options: &Options) {
