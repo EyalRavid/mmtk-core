@@ -43,16 +43,29 @@
 //!    zeroes an RC table without consulting this map, and its only caller is mature-evacuation
 //!    sweeping.
 //! 2. **`inc` and `dec` never run concurrently with each other.** `ProcessIncs` is STW,
-//!    `ProcessDecs` is concurrent, `CycleCollector` is a single packet ordered after decs, and the
-//!    `decide_cycle_collection` condvar keeps the next GC's increments behind the current GC's
-//!    concurrent window. Nothing enforces this; it is relied upon by the gap between
-//!    `RefCountHelper::{inc,dec}` returning `Err(MAX_REF_COUNT)` and this map being consulted.
+//!    `ProcessDecs` is concurrent, and since the `decs -> sweep -> cc` reorder `CycleCollector` is
+//!    a single packet ordered after sweeping, which is itself ordered after decs. What keeps the
+//!    *next* GC's increments behind the current GC's concurrent window is the scheduler, not any
+//!    LXR-level lock: a GC request becomes a `ScheduleCollection` packet only when the **last GC
+//!    worker parks** (`scheduler/scheduler.rs`, `on_last_parked` -> `respond_to_requests`), and a
+//!    worker parks only after `poll_schedulable_work` finds every bucket and every other worker's
+//!    queue empty. Concurrent work therefore holds the next GC off by occupying a worker.
+//!
+//!    *This justification changed on 2026-08-24.* It previously rested on the
+//!    `decide_cycle_collection` condvar, which has since been removed. The condvar was never the
+//!    binding constraint — it was released from `on_lazy_sweeping_finished`, i.e. inside the last
+//!    packet's `drop`, and so was always already granted by the time `ScheduleCollection` ran.
+//!    Nothing enforces this invariant; it is relied upon by the gap between
+//!    `RefCountHelper::{inc,dec}` returning `Err(MAX_REF_COUNT)` and this map being consulted, and
+//!    by the `*_exclusive` methods below, which additionally require that **no** other thread is
+//!    doing RC work at all.
 //! 3. **Every mutation of an entry's value happens while at least a shard read lock is held.**
 //!    This is what lets `remove_if` decide atomically whether a slot is still empty: its predicate
 //!    runs under the shard write lock, which excludes every `fetch_add`/CAS below.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use crate::util::rc::{RefCountHelper, MAX_REF_COUNT, RC_DEATH_TRANSIENT};
@@ -174,6 +187,143 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
             Err(other) => {
                 panic!("unexpected RC decrement error: {:?}", other);
             }
+        }
+    }
+
+    /// Single-writer [`Self::inc`].
+    ///
+    /// Identical in behaviour and return value, but reaches the RC table through
+    /// [`RefCountHelper::inc_exclusive`] and mutates the map slot with a plain load/store instead
+    /// of a `fetch_add`.  Both replacements drop an atomic read-modify-write: the table access
+    /// stops being a CAS retry loop, and the slot update stops being a `lock xadd`.
+    ///
+    /// The DashMap shard locking is unchanged — the map's *structure* is still shared, so insert
+    /// and remove still take the shard write lock.  Only the value RMW is relaxed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the only thread performing RC operations for the duration of the call,
+    /// which is stronger than invariant 2 above: that invariant only excludes `inc` against `dec`.
+    /// See [`RefCountHelper::inc_exclusive`] for what a violation costs.
+    pub unsafe fn inc_exclusive(&self, o: ObjectReference) -> usize {
+        let prev = unsafe { self.rc.inc_exclusive(o) };
+
+        if prev != MAX_REF_COUNT {
+            // Fast: the count was below MAX_REF_COUNT and the table store completed the
+            // operation. The overflow map was never consulted. `prev != MAX` is the exclusive
+            // spelling of `inc`'s `Ok(prev)`.
+            #[cfg(feature = "lxr_rc_path_stats")]
+            super::rc_path_stats::inc_fast();
+            return prev as usize;
+        }
+
+        // Slow: saturated. Counted before the map is touched so the hit and insert cases share it.
+        #[cfg(feature = "lxr_rc_path_stats")]
+        super::rc_path_stats::inc_slow();
+
+        // ONE lookup, not two. `inc` probes with `get` first so the common hit takes only a
+        // shard *read* lock, paying a second hash+probe when it has to fall through to `entry`.
+        // With no contention a read lock and a write lock cost the same single atomic on the lock
+        // word, so that trade stops paying: take the write lock once and handle both cases under
+        // it.
+        match self.entries.entry(o) {
+            Entry::Occupied(mut e) => {
+                let cur = e.get().load(Ordering::Relaxed);
+                e.get_mut().store(cur + 1, Ordering::Relaxed);
+                cur
+            }
+            Entry::Vacant(e) => {
+                // First overflow for this address: the table is saturated, so the real count is
+                // MAX_REF_COUNT and this inc takes it to MAX + 1.
+                e.insert(AtomicUsize::new(MAX_RC_USIZE + 1));
+                MAX_RC_USIZE
+            }
+        }
+    }
+
+    /// Single-writer [`Self::dec`].
+    ///
+    /// Identical in behaviour and return value, but reaches the RC table through
+    /// [`RefCountHelper::dec_exclusive`] / [`RefCountHelper::dec_unconditionally_exclusive`], and
+    /// walks the map slot down with a load/compare/store instead of a `compare_exchange_weak`
+    /// retry loop.  Under exclusive access the CAS can never fail, so the loop is dead weight.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::inc_exclusive`].
+    pub unsafe fn dec_exclusive(&self, o: ObjectReference) -> usize {
+        let prev = unsafe { self.rc.dec_exclusive(o) };
+
+        if prev != MAX_REF_COUNT {
+            // `dec` panics on `Err(0)`; `dec_exclusive` reports the same condition as a returned
+            // 0, so reproduce the panic rather than silently returning it as a count.
+            debug_assert!(prev != 0, "unexpected RC decrement error: {:?}", prev);
+
+            // Fast: the count was neither 0 nor MAX_REF_COUNT, so the table store completed the
+            // operation without touching the overflow map.
+            #[cfg(feature = "lxr_rc_path_stats")]
+            super::rc_path_stats::dec_fast();
+            return prev as usize;
+        }
+
+        // Slow: saturated. Counted once here, covering both outcomes below.
+        #[cfg(feature = "lxr_rc_path_stats")]
+        super::rc_path_stats::dec_slow();
+
+        // ONE lookup and one lock acquisition, where `dec` needs two: it decrements under a shard
+        // read lock, drops that guard, then re-hashes and re-probes to `remove` under the write
+        // lock, because DashMap's shard lock is not reentrant. Holding the write lock across both
+        // steps is only sound because nothing else can be touching the map.
+        //
+        // That fusion also removes the transient `MAX_REF_COUNT` slot the module header describes:
+        // on this path the decrement to MAX and the removal are a single step, so no other thread
+        // can observe the in-between state. The concurrent `dec` above can still produce one, but
+        // it cannot survive into this method -- see the assertion below, which enforces that
+        // rather than tolerating it.
+        match self.entries.entry(o) {
+            Entry::Occupied(mut e) => {
+                let cur = e.get().load(Ordering::Relaxed);
+
+                // An occupied slot must be strictly above MAX_REF_COUNT here, so unlike `dec`
+                // there is no "treat MAX as absent" fallback -- reaching that state means an
+                // assumption this method rests on has already broken.
+                //
+                // A slot at exactly MAX_REF_COUNT is the transient state the concurrent `dec`
+                // passes through between its CAS (`MAX + 1 -> MAX`) and its `remove`, both in one
+                // thread's straight-line code with no early return between them.  It therefore
+                // cannot outlive the decrement phase, and that phase fully drains before
+                // `CycleCollector` is scheduled.  `inc` never publishes one either: its
+                // `or_insert_with` holds the shard write guard across both the insert and the
+                // `fetch_add`.
+                //
+                // If this fires, that ordering no longer holds -- most likely decrement work has
+                // been allowed to overlap cycle collection.  Do **not** repair it by restoring a
+                // fallback: the exclusivity this whole method assumes would already have been
+                // violated, so the RC table is suspect too, not just this slot.
+                debug_assert!(
+                    cur > MAX_RC_USIZE,
+                    "overflow slot for {:?} holds {}, expected > MAX_REF_COUNT ({}): a transient \
+                     slot outlived the decrement phase, so RC work is no longer exclusive to the \
+                     cycle collector",
+                    o,
+                    cur,
+                    MAX_RC_USIZE
+                );
+
+                if cur == MAX_RC_USIZE + 1 {
+                    // Would land on MAX_REF_COUNT, i.e. "no longer overflowed". Drop the slot
+                    // instead of storing the sentinel.
+                    e.remove();
+                } else {
+                    e.get_mut().store(cur - 1, Ordering::Relaxed);
+                }
+                cur
+            }
+
+            // No entry: the real RC was exactly MAX_REF_COUNT, so step the table down from MAX to
+            // MAX - 1. `dec_exclusive` will not do this -- it guards MAX as sticky -- so this
+            // needs the unconditional variant, exactly as `dec` needs `dec_unconditionally`.
+            Entry::Vacant(_) => unsafe { self.rc.dec_unconditionally_exclusive(o) as usize },
         }
     }
 

@@ -3,7 +3,7 @@ use super::{barrier, LXR};
 use crate::scheduler::{gc_work::*, GCWork, GCWorker};
 use crate::util::ObjectReference;
 use crate::{vm::*, Plan, MMTK};
-use crate::util::rc::{CANDIDATES_STATUS, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, STRONG_RC_TABLE, BLACK_OUT_OF_STACK, BLACK_IN_STACK, GREY, WHITE};
+use crate::util::rc::{CANDIDATES_STATUS, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, STRONG_RC_TABLE, BLACK_OUT_OF_STACK, BLACK_IN_STACK, GREY, WHITE, STRONG_RC_LAST_BEFORE_ZERO};
 use atomic::Ordering;
 use crate::util::address::CLDScanPolicy;
 use crate::util::address::RefScanPolicy;
@@ -220,6 +220,23 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
     }
 }
 
+/// # A note on the `*_exclusive` RC calls below
+///
+/// The RC traversal in `mark`, `scan`, `scan_black`, `collect_whites` and `collect_blacks` uses the
+/// `*_exclusive` variants of the reference-count helpers, which skip the atomic read-modify-write
+/// (a CAS retry loop) that the ordinary `inc`/`dec` need.  Every one of them carries the same
+/// safety obligation: **this thread must be the only one performing RC work**.
+///
+/// That holds because `CycleCollector` is a single `GCWork` packet, so it runs on exactly one GC
+/// worker, and the concurrent chain is ordered `decs -> sweep -> cc`, so `ProcessDecs` has fully
+/// drained before it starts.  The next GC cannot begin either: a GC request becomes a
+/// `ScheduleCollection` packet only when the *last* GC worker parks, and this packet is occupying
+/// one.  The mutator write barrier stays clear of the RC tables during this window -- it touches
+/// only `OBJ_COLOR_TABLE` and `satb_map`.
+///
+/// **If any of that changes -- the packet is split across workers, cycle collection is moved off
+/// the GC worker pool, or decrement work is allowed to overlap it -- every `unsafe` block in this
+/// impl becomes unsound and must go back to the atomic variants.**
 impl<VM: VMBinding> CycleCollector<VM>{
     
     pub const UNLOGGED_VALUE: u8 = 0b1;
@@ -282,10 +299,12 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
                 else if let Some(x) = child{
                     if !is_logged{
-                        let prev = lxr.rc_with_overflow.dec(x);
+                        // SAFETY: single-threaded CycleCollector -- see the impl header.
+                        let prev = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
                         debug_assert!(prev != 1);
                         debug_assert!(prev != 0);
-                        self.rc.strong_rc_dec(x);
+                        // SAFETY: as above.
+                        unsafe { self.rc.strong_rc_dec_exclusive(x) };
                         dfs_stack.push(x);
                         num_of_childs += 1;
                     }
@@ -305,7 +324,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed);
                     for _ in 0..num_of_childs{
                         if let Some(curr_child) = dfs_stack.pop(){
-                            let _ = lxr.rc_with_overflow.inc(curr_child);
+                            // SAFETY: single-threaded CycleCollector -- see the impl header.
+                            let _ = unsafe { lxr.rc_with_overflow.inc_exclusive(curr_child) };
                             //let _ = self.rc.strong_rc_inc(curr_child); 
                            
 
@@ -313,7 +333,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         
                             CANDIDATES_STATUS.store_atomic::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                                 if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
-                                let _ = self.rc.strong_rc_dec(curr_child);
+                                // SAFETY: as above.
+                                let _ = unsafe { self.rc.strong_rc_dec_exclusive(curr_child) };
                                 }
                             }
                             else{
@@ -380,9 +401,11 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = self.get_child(slot, lxr) {
-                        let _prev = lxr.rc_with_overflow.inc(x);
+                        // SAFETY: single-threaded CycleCollector -- see the impl header.
+                        let _prev = unsafe { lxr.rc_with_overflow.inc_exclusive(x) };
                         if !in_stack(x) {
-                            self.rc.strong_rc_inc(x);
+                            // SAFETY: as above.
+                            unsafe { self.rc.strong_rc_inc_exclusive(x) };
                             dfs_stack.push(x);
                         }
                         debug_assert!(self.rc.count(x) > 1);
@@ -430,7 +453,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 debug_assert!(lxr.rc.count(curr) == 1);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 self.process_dead_object(curr, lxr);
-                self.rc.dec(curr);
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { self.rc.dec_exclusive(curr) };
             } else if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == BLACK_IN_STACK
                 && self.rc.count(curr) == 1
             {
@@ -454,12 +478,16 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
                     assert!(self.rc.count(x) > 1);
-                    let prev_rc = lxr.rc_with_overflow.dec(x);;
-                    let prev_s_rc = self.rc.strong_rc_dec(x);
+                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    let prev_rc = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
+                    // SAFETY: as above.  Returns the previous value directly rather than a
+                    // `Result`, so the `Ok(1)` test below becomes a plain comparison against
+                    // STRONG_RC_LAST_BEFORE_ZERO -- the same value, unwrapped.
+                    let prev_s_rc = unsafe { self.rc.strong_rc_dec_exclusive(x) };
                     debug_assert!(prev_rc != 1);
                     if prev_rc == 2 {
                         dfs_stack.push(x);
-                    } else if prev_s_rc == Ok(1) {
+                    } else if prev_s_rc == STRONG_RC_LAST_BEFORE_ZERO {
                         let s_candidates = unsafe { lxr.curr_s_cycle_candidates_mut() };
                         CANDIDATES_STATUS.store_atomic::<u8>(x.to_raw_address(), (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                         s_candidates.local_buffer().push(x);
@@ -478,7 +506,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
             }
             self.process_dead_object(curr, lxr);
             debug_assert!(lxr.rc.count(curr) == 1);
-            self.rc.dec(curr);
+            // SAFETY: single-threaded CycleCollector -- see the impl header.
+            unsafe { self.rc.dec_exclusive(curr) };
         }
     }
 

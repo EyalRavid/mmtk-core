@@ -620,6 +620,71 @@ impl SideMetadataSpec {
         )
     }
 
+    /// Store the given value to the side metadata for the given address **without an atomic
+    /// read-modify-write**, even when the field is smaller than a byte.
+    ///
+    /// This is the single-writer counterpart of [`Self::store_atomic`].  For a byte-or-wider
+    /// field the two are identical — both do one atomic store.  They differ only for
+    /// `log_num_of_bits < 3`, where several fields share a byte and the value cannot be written
+    /// without rewriting its neighbours:
+    ///
+    /// * [`Self::store_atomic`] uses a `fetch_update` **CAS loop** on the containing byte, so a
+    ///   concurrent write to a neighbouring field is preserved.
+    /// * This does an atomic byte load, a mask/merge, and an atomic byte store — **no CAS**, so a
+    ///   concurrent write to a neighbouring field is silently lost.
+    ///
+    /// The byte load and store remain *atomic* even though the pair is not.  That is deliberate
+    /// and is the difference from the fully non-atomic [`Self::store`]: an atomic relaxed byte
+    /// store is the same single `mov` on x86-64, so it costs nothing, but it keeps the access
+    /// inside the memory model.  Concurrent *readers* therefore always observe either the old or
+    /// the new byte, never a torn or compiler-synthesised one, and readers using
+    /// [`Self::load_atomic`] are not racing.  Prefer this over [`Self::store`] whenever anything
+    /// may read the field concurrently.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that **no other thread writes any field in the same byte** for
+    /// the duration of the call.  For a byte-or-wider field that is just "this field".  For a
+    /// sub-byte field it is a strictly stronger condition covering the neighbouring fields, which
+    /// belong to *different* objects — so in practice it means no other thread writes this
+    /// metadata spec at all.
+    pub unsafe fn store_atomic_exclusive<T: MetadataValue>(
+        &self,
+        data_addr: Address,
+        metadata: T,
+        order: Ordering,
+    ) {
+        self.side_metadata_access::<true, T, _, _, _>(
+            data_addr,
+            Some(metadata),
+            || {
+                let meta_addr = address_to_meta_address(self, data_addr);
+                let bits_num_log = self.log_num_of_bits;
+                if bits_num_log < 3 {
+                    let lshift = meta_byte_lshift(self, data_addr);
+                    let mask = meta_byte_mask(self) << lshift;
+                    let metadata_u8 = metadata.to_u8().unwrap();
+                    unsafe {
+                        // Read-merge-write of the containing byte, with no CAS.  Sound only
+                        // under the exclusivity contract above: a neighbour's concurrent write
+                        // would land between these two accesses and be dropped.
+                        let old_byte = <u8 as MetadataValue>::load_atomic(meta_addr, order);
+                        let new_byte = (old_byte & !mask) | (metadata_u8 << lshift);
+                        <u8 as MetadataValue>::store_atomic(meta_addr, new_byte, order);
+                    }
+                } else {
+                    unsafe {
+                        T::store_atomic(meta_addr, metadata, order);
+                    }
+                }
+            },
+            |_| {
+                #[cfg(feature = "extreme_assertions")]
+                sanity::verify_store(self, data_addr, metadata);
+            },
+        )
+    }
+
     /// Non-atomically store zero to the side metadata for the given address.
     /// This method mainly facilitates clearing multiple metadata specs for the same address in a loop.
     ///

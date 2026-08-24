@@ -364,6 +364,182 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
         //STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(), 1, Ordering::Relaxed)
     }
+    /// Unconditional decrement with no atomic read-modify-write.
+    ///
+    /// The exclusive-access counterpart of [`Self::dec_unconditionally`].  Like it, this applies
+    /// no guard at all — it steps `MAX_REF_COUNT` down to `MAX_REF_COUNT - 1`, which is exactly
+    /// what [`Self::dec_exclusive`] refuses to do, and wraps on 0 the same way
+    /// `fetch_sub_atomic` does.  It exists for the overflow cache's fallback path, where the RC
+    /// table reads `MAX_REF_COUNT` but the map holds no entry, so the true count is exactly
+    /// `MAX_REF_COUNT` and must be stepped down.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::dec_exclusive`]: the caller must be the only thread writing this entry — and,
+    /// if `RC_TABLE` is sub-byte, any entry in the same byte.
+    pub unsafe fn dec_unconditionally_exclusive(&self, o: ObjectReference) -> RcBits {
+        let addr = o.to_raw_address();
+        let old: RcBits = RC_TABLE.load_atomic(addr, Ordering::Relaxed);
+        unsafe {
+            RC_TABLE.store_atomic_exclusive(addr, old.wrapping_sub(1), Ordering::Relaxed)
+        };
+        old
+    }
+
+    /// Increment the RC of `o` with no atomic read-modify-write.
+    ///
+    /// Same semantics as [`Self::inc`] — `MAX_REF_COUNT` is sticky and is not incremented — but
+    /// it returns the **previous** value directly instead of a `Result`, matching
+    /// [`Self::dec_unconditionally`].  A returned `MAX_REF_COUNT` means "no change was made".
+    /// Unlike [`Self::dec_exclusive`] there is no zero guard: incrementing from 0 is how a
+    /// nursery or recycled entry becomes live, and is expected.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the only thread writing this entry for the duration of the call.  See
+    /// [`Self::dec_exclusive`] for the full argument and for why relaxed atomics are used rather
+    /// than a non-atomic store.
+    ///
+    /// The failure mode differs from the decrement's, and is worth knowing when auditing a call
+    /// site.  This function never stores 0 (`old + 1` is at least 1), so it cannot itself hand a
+    /// reader the spurious zero that [`Self::dec_exclusive`] can.  What a violated contract costs
+    /// here is a **lost increment**, leaving a live object's count too low and exposing it to a
+    /// premature free — the same end result, reached one step later.
+    pub unsafe fn inc_exclusive(&self, o: ObjectReference) -> RcBits {
+        let addr = o.to_raw_address();
+        let old: RcBits = RC_TABLE.load_atomic(addr, Ordering::Relaxed);
+        // Mirrors the guard in `inc`: MAX_REF_COUNT is sticky.  Once an entry saturates, the true
+        // count lives in the overflow cache and must not be disturbed from here.
+        if old == MAX_REF_COUNT {
+            return old;
+        }
+        unsafe { RC_TABLE.store_atomic_exclusive(addr, old + 1, Ordering::Relaxed) };
+        old
+    }
+
+    /// Decrement the RC of `o` with no atomic read-modify-write.
+    ///
+    /// Same semantics as [`Self::dec`] — 0 is already dead and `MAX_REF_COUNT` is sticky, so
+    /// neither is decremented — but it returns the **previous** value directly instead of a
+    /// `Result`, matching [`Self::dec_unconditionally`].  A returned `0` or `MAX_REF_COUNT`
+    /// therefore means "no change was made".
+    ///
+    /// # Why this is faster
+    ///
+    /// [`Self::dec`] goes through `fetch_update_atomic`, i.e. a **CAS loop**.  This does one
+    /// relaxed load and one relaxed store, which on x86-64 are both plain `mov`s — no `lock`
+    /// prefix, no fence.  That is the entire point of the function.
+    ///
+    /// # Safety
+    ///
+    /// **The caller must be the only thread writing this entry for the duration of the call.**
+    /// The load and store are individually atomic, but together they are not: a concurrent
+    /// writer's update lands between them and is silently lost.  Because a recycled or nursery
+    /// entry reads `RC_NURSERY_OR_DEAD` (0), the value most likely to be resurrected by such a
+    /// lost update is `0` — publishing a zero RC for a live object.
+    ///
+    /// Concurrent *readers* are explicitly fine, and that is why the accesses stay relaxed
+    /// atomics rather than the non-atomic `SideMetadataSpec::store` behind [`Self::set_relaxed`].
+    /// The generated code is the same, but this stays inside the memory model, so the compiler
+    /// may not invent, split, merge or vectorise the store.  That matters because the readers are
+    /// **wider than one entry** and test for zero: `RCArray::is_dead` (`line.rs`) loads a whole
+    /// line's worth of RC entries as one integer, and `Block::rc_dead` (`block.rs`) scans the
+    /// block's RC table as `u128`.  A store the compiler was free to tear or synthesise could
+    /// make a live line read as empty, and `rc_get_next_available_lines` would hand it to an
+    /// allocator.
+    ///
+    /// Intended caller: the cycle collector, which is a single work packet
+    /// (`plan/lxr/gc_work.rs`) and therefore the only mutator of these tables while it runs.
+    ///
+    /// **The contract widens if `RC_TABLE` ever becomes sub-byte.**  At `lxr_rc_bits_8` and wider
+    /// the entry is byte-aligned, `store_atomic_exclusive` is a single plain store, and "no other
+    /// writer of this entry" is the whole requirement.  At `lxr_rc_bits_4` or `lxr_rc_bits_2` two
+    /// or four objects share a byte, the store becomes a read-merge-write of that byte, and the
+    /// requirement strengthens to **no other writer of any entry in the same byte**.  Note the
+    /// failure mode there is not merely a lost count: dropping a *neighbour's* increment leaves
+    /// that neighbour reading 0, which is exactly the spurious zero the wide readers above turn
+    /// into a recycled live line.  The cycle collector satisfies the wider contract as written
+    /// today, but a 4-bit build makes the margin much thinner.
+    pub unsafe fn dec_exclusive(&self, o: ObjectReference) -> RcBits {
+        let addr = o.to_raw_address();
+        let old: RcBits = RC_TABLE.load_atomic(addr, Ordering::Relaxed);
+        // Mirrors the guard in `dec`: 0 is already dead, MAX_REF_COUNT is sticky (it means the
+        // true count lives in the overflow cache), so neither may be decremented here.
+        if old == 0 || old == MAX_REF_COUNT {
+            return old;
+        }
+        unsafe { RC_TABLE.store_atomic_exclusive(addr, old - 1, Ordering::Relaxed) };
+        old
+    }
+
+    /// Increment the strong RC of `o` with no atomic read-modify-write.
+    ///
+    /// The exclusive-access counterpart of [`Self::strong_rc_inc`], returning the **previous**
+    /// value instead of a `Result`.  A returned `MAX_STRONG_REF_COUNT` means no change was made.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::inc_exclusive`]: the caller must be the only thread writing this entry for the
+    /// duration of the call.
+    ///
+    /// **The contract here is stronger than for [`Self::inc_exclusive`].**  `STRONG_RC_TABLE` is
+    /// 4 bits per entry (`LOG_STRONG_REF_COUNT_BITS = 2`), so **two adjacent objects share a
+    /// byte**, and one nibble cannot be written without rewriting the other object's nibble along
+    /// with it.  `SideMetadataSpec::store_atomic_exclusive` does that read-merge-write with no
+    /// CAS, so a concurrent write to the *neighbouring* object's strong count would be silently
+    /// lost.  The caller must therefore guarantee no other thread writes **any entry in the same
+    /// byte** — in practice, that nothing else writes `STRONG_RC_TABLE` at all.
+    ///
+    /// That is what this saves: `SideMetadataSpec::store_atomic` would take its `bits_num_log < 3`
+    /// path, a CAS loop on the containing byte, making [`Self::strong_rc_inc`] (a CAS alone)
+    /// *cheaper* than a load-plus-CAS here.  With the exclusive store it is two plain `mov`s.
+    ///
+    /// In practice the contract holds for the cycle collector: as of the `decs -> sweep -> cc`
+    /// reorder the decrement phase (`plan/lxr/rc.rs`, `process_decs`) has fully drained before the
+    /// collector starts, the mutator barrier touches only `OBJ_COLOR_TABLE` and `satb_map`, and
+    /// the remaining `STRONG_RC_TABLE` sites are either commented-out asserts or `sanity`-gated.
+    /// **Re-check that if the phase order changes again, or if decrement work is ever allowed to
+    /// overlap cycle collection.**
+    ///
+    /// Unlike `RC_TABLE`, `STRONG_RC_TABLE` is not consulted by any wide zero-test — the
+    /// allocator's hole finder (`RCArray::is_dead`, `Block::rc_dead`) reads `RC_TABLE` only — so
+    /// the spurious-zero hazard described on [`Self::dec_exclusive`] does not apply to this table.
+    pub unsafe fn strong_rc_inc_exclusive(&self, o: ObjectReference) -> u8 {
+        let addr = o.to_raw_address();
+        let old: u8 = STRONG_RC_TABLE.load_atomic(addr, Ordering::Relaxed);
+        if old == MAX_STRONG_REF_COUNT {
+            return old;
+        }
+        unsafe { STRONG_RC_TABLE.store_atomic_exclusive(addr, old + 1, Ordering::Relaxed) };
+        old
+    }
+
+    /// Decrement the strong RC of `o` with no atomic read-modify-write.
+    ///
+    /// The exclusive-access counterpart of [`Self::strong_rc_dec`], returning the **previous**
+    /// value instead of a `Result`.  A returned `0` means no change was made.
+    ///
+    /// Note the guard is `old == 0` only, matching `strong_rc_dec`.  `MAX_STRONG_REF_COUNT` is
+    /// **not** treated as sticky on the way down even though `strong_rc_inc` saturates at it —
+    /// that asymmetry is pre-existing and is reproduced here deliberately so this function and
+    /// `strong_rc_dec` cannot disagree.  If it is wrong, it is wrong in both and should be fixed
+    /// in both.
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`Self::strong_rc_inc_exclusive`], and note that its contract is the
+    /// **stronger** one: because `STRONG_RC_TABLE` packs two objects per byte, the caller must be
+    /// the only thread writing the whole table, not just this entry.  See that function for the
+    /// full argument and for why the non-atomic accesses are the point rather than an oversight.
+    pub unsafe fn strong_rc_dec_exclusive(&self, o: ObjectReference) -> u8 {
+        let addr = o.to_raw_address();
+        let old: u8 = STRONG_RC_TABLE.load_atomic(addr, Ordering::Relaxed);
+        if old == 0 {
+            return old;
+        }
+        unsafe { STRONG_RC_TABLE.store_atomic_exclusive(addr, old - 1, Ordering::Relaxed) };
+        old
+    }
 }
 
 impl<VM: VMBinding> Clone for RefCountHelper<VM> {
