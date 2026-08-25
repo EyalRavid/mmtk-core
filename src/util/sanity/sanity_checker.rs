@@ -4,7 +4,7 @@ use crate::policy::immix::block::{Block, BlockState};
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
-use crate::util::ObjectReference;
+use crate::util::{Address, ObjectReference};
 
 pub const SANITY_DEAD_CYCLE_COUNT: SideMetadataSpec =
     crate::util::metadata::side_metadata::spec_defs::SANITY_DEAD_CYCLE_COUNT;
@@ -191,6 +191,22 @@ impl<P: Plan> SanityRelease<P> {
     }
 }
 
+/// Is `a` a straddle-line filler slot rather than a real object?
+///
+/// `RefCountHelper::mark_straddle_object_with_size` writes RC = 1 at the **start of each
+/// continuation line** of a large object and flags that line in `RC_STRADDLE_LINES`.  Those slots
+/// carry a reference count but are not objects, so every linear block walk has to skip them.
+///
+/// The alignment test is part of the predicate, not just a guard: only line *starts* carry the
+/// marker.  It also keeps `Line::from`'s alignment assertion (`line.rs:68`) satisfied, which is
+/// why the identical walks in `policy/immix/immixspace.rs` and `policy/immix/rc_work.rs` both
+/// write `Line::is_aligned(..) && is_straddle_line(..)`.  The sanity checker previously called
+/// `Line::from` unguarded and aborted on the first non-line-aligned slot holding a non-zero RC --
+/// 15 of every 16 positions, since the walk steps by `MIN_OBJECT_SIZE` (16 B) across a 256 B line.
+fn is_straddle_filler<VM: VMBinding>(rc: &crate::util::rc::RefCountHelper<VM>, a: Address) -> bool {
+    rc.is_straddle_line(Line::from(Line::align(a)))
+}
+
 impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
     fn do_work(&mut self, _worker: &mut GCWorker<P::VM>, mmtk: &'static MMTK<P::VM>) {
         info!("Sanity GC release");
@@ -204,11 +220,11 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
             for (obj, rc) in rc_sanity_objects.iter() {
                 let mut real_rc = lxr.rc_with_overflow.get(*obj);
                  assert!(real_rc != 1 ||
-                    (lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))));
+                    is_straddle_filler(&lxr.rc, obj.to_raw_address()));
                 assert!(real_rc == 0 || 
                     CANDIDATES_STATUS.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
                     STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
-                    (lxr.rc.is_straddle_line(Line::from(obj.to_raw_address()))),
+                    is_straddle_filler(&lxr.rc, obj.to_raw_address()),
                     "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
 
             }
@@ -222,7 +238,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                         let mark_state = MARK_STATE.load(Ordering::SeqCst);
                         let mark_val = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
                         if lxr.rc_with_overflow.get(o) != 0
-                            && (!lxr.rc.is_straddle_line(Line::from(o.to_raw_address())))
+                            && !is_straddle_filler(&lxr.rc, o.to_raw_address())
                         {
                 
                             //let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);

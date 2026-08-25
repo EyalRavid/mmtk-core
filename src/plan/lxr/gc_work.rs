@@ -166,12 +166,14 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             let mut it = candidates.iter_mut();
             while let Some(cand) = it.next(){
                 if self.should_mark(*cand, vec_index) {
-                    CANDIDATES_STATUS.store_atomic::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed);
+                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed) };
                     debug_assert!(self.rc.count(*cand) > 0);
                     self.mark(*cand, lxr);
                 } else {
                     if STRONG_RC_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::Relaxed) > 0 {
-                        CANDIDATES_STATUS.store_atomic::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed);
+                        // SAFETY: single-threaded CycleCollector -- see the impl header.
+                        unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed) };
                     }
                     it.swap_remove_current();
                 }
@@ -233,6 +235,22 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 /// `ScheduleCollection` packet only when the *last* GC worker parks, and this packet is occupying
 /// one.  The mutator write barrier stays clear of the RC tables during this window -- it touches
 /// only `OBJ_COLOR_TABLE` and `satb_map`.
+///
+/// The same applies to the `OBJ_COLOR_TABLE` and `CANDIDATES_STATUS` stores, which use
+/// `store_atomic_exclusive`.  Both specs are **2 bits per entry**, so four objects share a byte and
+/// the store is a read-merge-write of that byte with no CAS -- meaning the obligation there is the
+/// wider one: no other thread may write *any* entry in the same byte.  Concurrent *readers* are
+/// fine, because the byte store is still atomic and a reader's own bits are untouched by a write to
+/// a neighbour; that is what lets the mutator barrier keep loading `OBJ_COLOR_TABLE`
+/// (`plan/lxr/barrier.rs`) while this runs.
+///
+/// The two tables differ in how much they depend on the phase order:
+///
+/// * `OBJ_COLOR_TABLE` is written **only** by this impl, anywhere in the codebase, so it needs no
+///   assumption beyond "one worker runs this packet".
+/// * `CANDIDATES_STATUS` is also written by `ProcessDecs` (`plan/lxr/rc.rs`), so it is safe only
+///   because decrements have fully drained first.  It is the one that breaks first if the
+///   `decs -> sweep -> cc` order is relaxed.
 ///
 /// **If any of that changes -- the packet is split across workers, cycle collection is moved off
 /// the GC worker pool, or decrement work is allowed to overlap it -- every `unsafe` block in this
@@ -316,12 +334,14 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 && STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == 0
                 && CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == 0
             {
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), GREY, Ordering::SeqCst);
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), GREY, Ordering::SeqCst) };
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 #[cfg(feature = "s_rc_stats")]
                 { self.stats.objects_in_mark.set(self.stats.objects_in_mark.get() + 1); }
                 if is_logged{
-                    OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed);
+                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(),BLACK_IN_STACK, Ordering::Relaxed) };
                     for _ in 0..num_of_childs{
                         if let Some(curr_child) = dfs_stack.pop(){
                             // SAFETY: single-threaded CycleCollector -- see the impl header.
@@ -331,7 +351,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
                             local_buffer.push(curr_child);
                         
-                            CANDIDATES_STATUS.store_atomic::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                            // SAFETY: single-threaded CycleCollector -- see the impl header.
+                            unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
                                 if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
                                 // SAFETY: as above.
                                 let _ = unsafe { self.rc.strong_rc_dec_exclusive(curr_child) };
@@ -345,10 +366,12 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
                     local_buffer.push(curr);
                 
-                    CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(curr.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
                 }
             } else if is_black(curr) {
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_IN_STACK, Ordering::Relaxed);
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), BLACK_IN_STACK, Ordering::Relaxed) };
             }
         }
     }
@@ -374,7 +397,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 if RefCountHelper::<VM>::NEW.count(curr) > 1 {
                     self.scan_black(curr, lxr);
                 } else {
-                    OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), WHITE, Ordering::Relaxed);
+                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), WHITE, Ordering::Relaxed) };
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 }
             }
@@ -391,7 +415,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
             assert!(self.rc.count(*curr) > 1);
             let curr_copy = *curr; // needed for the borrow checker
             if !is_black(*curr) {
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr_copy.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst);
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr_copy.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst) };
                 let s_rc = self.rc.count(*curr) - 1;
                 if s_rc > MAX_STRONG_REF_COUNT as RcBits{
                     STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::Relaxed);
@@ -415,7 +440,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 { self.stats.objects_in_scan_black.set(self.stats.objects_in_scan_black.get() + 1); }
               
             } else {
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed) };
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) != 0);
                 dfs_stack.pop();
             }
@@ -448,8 +474,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
                 debug_assert!(self.rc.count(curr) == 1);
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
-                CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed);
-                OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed) };
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed) };
                 debug_assert!(lxr.rc.count(curr) == 1);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 self.process_dead_object(curr, lxr);
@@ -489,7 +517,8 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         dfs_stack.push(x);
                     } else if prev_s_rc == STRONG_RC_LAST_BEFORE_ZERO {
                         let s_candidates = unsafe { lxr.curr_s_cycle_candidates_mut() };
-                        CANDIDATES_STATUS.store_atomic::<u8>(x.to_raw_address(), (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                        // SAFETY: single-threaded CycleCollector -- see the impl header.
+                        unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(x.to_raw_address(), (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
                         s_candidates.local_buffer().push(x);
                     }
                 }
@@ -497,8 +526,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
             curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
             debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
             debug_assert!(is_black(curr));
-            CANDIDATES_STATUS.store_atomic::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed);
-            OBJ_COLOR_TABLE.store_atomic::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed);
+            // SAFETY: single-threaded CycleCollector -- see the impl header.
+            unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(curr.to_raw_address(), 0, Ordering::Relaxed) };
+            // SAFETY: single-threaded CycleCollector -- see the impl header.
+            unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), BLACK_OUT_OF_STACK, Ordering::Relaxed) };
             #[cfg(feature = "graph_project")]
             {
                 let mut reporter = lxr.graph_reporter.lock().unwrap();
