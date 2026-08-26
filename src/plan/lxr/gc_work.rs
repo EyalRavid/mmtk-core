@@ -19,7 +19,7 @@ use crate::policy::immix::block::Block;
 use crate::util::rc::RefCountHelper;
 use crate::vm::slot::MemorySlice;
 use crate::plan::lxr::global::NUM_OF_CANDIDATES_VECTORS;
-use crate::plan::lxr::stack::ChunkedStack;
+use crate::plan::lxr::buffer::LocalBuffer;
 use crate::util::rc::RcBits;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::LazySweepingJobsCounter;
@@ -161,6 +161,41 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             self.stats.raw_cycle_candidates = candidates.len();
         }
 
+        // The two scratch DFS stacks, reused by every traversal below.
+        //
+        // Two are needed, and exactly two: the phases run in sequence, but `scan` nests into
+        // `scan_black` and `collect_whites` nests into `collect_blacks`, so at most two are live
+        // at once.  Neither nested traversal is recursive or reachable from anywhere else, so the
+        // depth is 2 and never grows.
+        //
+        // They are locals rather than `CycleCollector` fields on purpose: this packet is
+        // constructed fresh per GC and `do_work` runs once, so a field would retain nothing across
+        // GCs, and a local cannot be aliased by construction -- which keeps them out of the
+        // exclusivity argument in the impl header below.
+        //
+        // `Vec`, not `ChunkedStack`: a `Vec` keeps its capacity as it drains, so it grows once per
+        // GC and every later candidate reuses resident pages.  `ChunkedStack::pop` frees the top
+        // chunk once it empties, so reusing one would still churn 16 KB malloc/free pairs at every
+        // chunk boundary -- which is the cost this change exists to remove.
+        let mut dfs_stack = Vec::<ObjectReference>::with_capacity(4096);
+        let mut nested_stack = Vec::<ObjectReference>::with_capacity(4096);
+
+        // One producer handle into the *next* GC's candidate pool, held for the whole packet.
+        //
+        // `mark` and `collect_blacks` are the only producers, they both target `curr_vec` (the
+        // pool being filled), and nothing drains that pool between the two phases -- it is read
+        // by `into_final_buffers` at the *start of the next GC*, by which time this handle has
+        // long been dropped.  So one handle covers both phases.
+        //
+        // Acquiring per candidate (`mark`) and per qualifying edge (`collect_blacks`) cost a
+        // `BufferPool` mutex on both `acquire_buffer` and `LocalBuffer::drop`; hoisting it pays
+        // that pair once per GC instead.
+        //
+        // Taken through the shared accessor rather than `curr_s_cycle_candidates_mut`: pushing
+        // only needs `&BufferPool`, so this avoids minting a `&mut` out of the `UnsafeCell` and
+        // keeps the two former call sites from ever holding overlapping `&mut`s to the same pool.
+        let mut cand_buffer = unsafe { lxr.curr_s_cycle_candidates() }.local_buffer();
+
         // Mark phase: trial-delete candidates with strong_rc == 0
         {
             let mut it = candidates.iter_mut();
@@ -169,7 +204,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
                     // SAFETY: single-threaded CycleCollector -- see the impl header.
                     unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed) };
                     debug_assert!(self.rc.count(*cand) > 0);
-                    self.mark(*cand, lxr);
+                    self.mark(*cand, lxr, &mut dfs_stack, &mut cand_buffer);
                 } else {
                     if STRONG_RC_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::Relaxed) > 0 {
                         // SAFETY: single-threaded CycleCollector -- see the impl header.
@@ -188,7 +223,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         // Scan phase: classify GREY objects as WHITE (garbage) or restore to BLACK
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
-            self.scan(*cand, lxr);
+            self.scan(*cand, lxr, &mut dfs_stack, &mut nested_stack);
         }
 
 
@@ -199,7 +234,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
             debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::SeqCst) != GREY);
-            self.collect_whites(*cand, lxr);
+            self.collect_whites(*cand, lxr, &mut dfs_stack, &mut nested_stack, &mut cand_buffer);
         }
         #[cfg(feature = "s_rc_stats")]
         {
@@ -301,9 +336,19 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
     /// Trial deletion: decrements RC of children for each GREY candidate via DFS.
     /// If an SATB-logged slot is found, reverts all decrements.
-    fn mark(&self, o: ObjectReference, lxr: &LXR<VM>) {
-        let mut local_buffer = unsafe {lxr.curr_s_cycle_candidates_mut()}.local_buffer();
-        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
+    /// `dfs_stack` is scratch owned by `do_work` and reused across every candidate.  It is drained
+    /// to empty before returning, so it needs no clearing on entry; the debug assertions hold that
+    /// invariant in place.
+    /// `cand_buffer` is the shared producer handle owned by `do_work`; see its comment there for
+    /// why one handle covers every phase.
+    fn mark(
+        &self,
+        o: ObjectReference,
+        lxr: &LXR<VM>,
+        dfs_stack: &mut Vec<ObjectReference>,
+        cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+    ) {
+        debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
         debug_assert!(self.rc.count(o) > 0);
         while let Some(curr) = dfs_stack.pop() {
@@ -349,7 +394,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                             //let _ = self.rc.strong_rc_inc(curr_child); 
                            
 
-                            local_buffer.push(curr_child);
+                            cand_buffer.push(curr_child);
                         
                             // SAFETY: single-threaded CycleCollector -- see the impl header.
                             unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(curr_child.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
@@ -364,7 +409,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
                     }
 
-                    local_buffer.push(curr);
+                    cand_buffer.push(curr);
                 
                     // SAFETY: single-threaded CycleCollector -- see the impl header.
                     unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(curr.to_raw_address(),(lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
@@ -378,8 +423,19 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
     /// Scan phase: GREY objects with RC > 1 are externally referenced — restore them (scan_black).
     /// GREY objects with RC == 1 are garbage — mark WHITE.
-    fn scan(&self, o: ObjectReference, lxr: &LXR<VM>) {
-        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
+    /// `dfs_stack` is scratch owned by `do_work` and reused across every candidate.  It is drained
+    /// to empty before returning, so it needs no clearing on entry; the debug assertions hold that
+    /// invariant in place.
+    /// `black_stack` is handed straight through to `scan_black`, which nests inside this
+    /// traversal and therefore needs a second stack of its own.
+    fn scan(
+        &self,
+        o: ObjectReference,
+        lxr: &LXR<VM>,
+        dfs_stack: &mut Vec<ObjectReference>,
+        black_stack: &mut Vec<ObjectReference>,
+    ) {
+        debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
             #[cfg(feature = "s_rc_stats")]
@@ -395,7 +451,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             if OBJ_COLOR_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == GREY {
                 debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::SeqCst) == 0);
                 if RefCountHelper::<VM>::NEW.count(curr) > 1 {
-                    self.scan_black(curr, lxr);
+                    self.scan_black(curr, lxr, black_stack);
                 } else {
                     // SAFETY: single-threaded CycleCollector -- see the impl header.
                     unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), WHITE, Ordering::Relaxed) };
@@ -408,21 +464,33 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
     /// Restores RCs for objects found to be externally reachable.
     /// Reconstructs strong_rc and marks objects BLACK.
-    fn scan_black(&self, o: ObjectReference, lxr: &LXR<VM>) {
-        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
+    /// `dfs_stack` is scratch owned by `do_work` and reused across every candidate.  It is drained
+    /// to empty before returning, so it needs no clearing on entry; the debug assertions hold that
+    /// invariant in place.
+    fn scan_black(&self, o: ObjectReference, lxr: &LXR<VM>, dfs_stack: &mut Vec<ObjectReference>) {
+        debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
-        while let Some(curr) = dfs_stack.last() {
-            assert!(self.rc.count(*curr) > 1);
-            let curr_copy = *curr; // needed for the borrow checker
-            if !is_black(*curr) {
+        // `Vec::last` borrows immutably and copies out here, so the visitor below is free to push.
+        // `ChunkedStack::last` took `&mut self` (it dropped an emptied chunk as a side effect),
+        // which is what the old `curr_copy` dance was working around.
+        while let Some(&curr) = dfs_stack.last() {
+            debug_assert!(self.rc.count(curr) > 1);
+            if !is_black(curr) {
                 // SAFETY: single-threaded CycleCollector -- see the impl header.
-                unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr_copy.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst) };
-                let s_rc = self.rc.count(*curr) - 1;
+                unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), BLACK_IN_STACK, Ordering::SeqCst) };
+                let s_rc = self.rc.count(curr) - 1;
+                // SAFETY: single-threaded CycleCollector -- see the impl header.  Note the
+                // obligation here is the *wider* one: `STRONG_RC_TABLE` is 4 bits per entry, so
+                // two adjacent objects share a byte and the exclusive store is a read-merge-write
+                // of that byte with no CAS.  No other thread may write *any* entry in the same
+                // byte -- in practice, nothing else may write this table at all.  That holds only
+                // because `ProcessDecs` has fully drained under the `decs -> sweep -> cc` order;
+                // see `RefCountHelper::strong_rc_inc_exclusive` for the full argument.
                 if s_rc > MAX_STRONG_REF_COUNT as RcBits{
-                    STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::Relaxed);
+                    unsafe { STRONG_RC_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(),MAX_STRONG_REF_COUNT, Ordering::Relaxed) };
                 }
                 else{
-                    STRONG_RC_TABLE.store_atomic::<u8>(curr.to_raw_address(),s_rc as u8, Ordering::Relaxed);
+                    unsafe { STRONG_RC_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(),s_rc as u8, Ordering::Relaxed) };
                 }
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = self.get_child(slot, lxr) {
@@ -451,8 +519,20 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
     /// Frees WHITE (garbage) objects. Also handles BLACK_IN_STACK objects with RC == 1
     /// by delegating to collect_blacks.
-    fn collect_whites(&self, o: ObjectReference, lxr: &LXR<VM>) {
-        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
+    /// `dfs_stack` is scratch owned by `do_work` and reused across every candidate.  It is drained
+    /// to empty before returning, so it needs no clearing on entry; the debug assertions hold that
+    /// invariant in place.
+    /// `black_stack` is handed straight through to `collect_blacks`, which nests inside this
+    /// traversal and therefore needs a second stack of its own.
+    fn collect_whites(
+        &self,
+        o: ObjectReference,
+        lxr: &LXR<VM>,
+        dfs_stack: &mut Vec<ObjectReference>,
+        black_stack: &mut Vec<ObjectReference>,
+        cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+    ) {
+        debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
             #[cfg(feature = "s_rc_stats")]
@@ -487,7 +567,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 && self.rc.count(curr) == 1
             {
                 debug_assert!(CANDIDATES_STATUS.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) != 0);
-                self.collect_blacks(curr, lxr);
+                self.collect_blacks(curr, lxr, black_stack, cand_buffer);
             }
         }
     }
@@ -495,8 +575,19 @@ impl<VM: VMBinding> CycleCollector<VM>{
     
     /// Frees BLACK objects with RC == 1 by decrementing children and reclaiming.
     /// Children that reach RC == 2 (death threshold) are also freed recursively.
-    fn collect_blacks(&self, o: ObjectReference, lxr: &LXR<VM>) {
-        let mut dfs_stack = ChunkedStack::<ObjectReference>::new();
+    /// `dfs_stack` is scratch owned by `do_work` and reused across every candidate.  It is drained
+    /// to empty before returning, so it needs no clearing on entry; the debug assertions hold that
+    /// invariant in place.
+    /// `cand_buffer` is the shared producer handle owned by `do_work`; see its comment there for
+    /// why one handle covers every phase.
+    fn collect_blacks(
+        &self,
+        o: ObjectReference,
+        lxr: &LXR<VM>,
+        dfs_stack: &mut Vec<ObjectReference>,
+        cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+    ) {
+        debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
             #[cfg(feature = "s_rc_stats")]
@@ -505,7 +596,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
-                    assert!(self.rc.count(x) > 1);
+                    debug_assert!(self.rc.count(x) > 1);
                     // SAFETY: single-threaded CycleCollector -- see the impl header.
                     let prev_rc = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
                     // SAFETY: as above.  Returns the previous value directly rather than a
@@ -516,10 +607,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     if prev_rc == 2 {
                         dfs_stack.push(x);
                     } else if prev_s_rc == STRONG_RC_LAST_BEFORE_ZERO {
-                        let s_candidates = unsafe { lxr.curr_s_cycle_candidates_mut() };
                         // SAFETY: single-threaded CycleCollector -- see the impl header.
                         unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(x.to_raw_address(), (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
-                        s_candidates.local_buffer().push(x);
+                        cand_buffer.push(x);
                     }
                 }
             };

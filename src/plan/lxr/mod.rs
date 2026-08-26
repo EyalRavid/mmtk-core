@@ -8,6 +8,8 @@ pub(super) mod mutator;
 pub mod rc;
 mod remset;
 //Eyal added this mod
+// Unused since the cycle collector moved to reused `Vec` scratch stacks.
+#[allow(dead_code)]
 mod stack;
 mod overflow_rc_cache;
 /// Fast/slow path counters for `overflow_rc_cache`. The whole module exists only under
