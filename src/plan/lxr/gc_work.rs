@@ -355,25 +355,6 @@ impl<VM: VMBinding> CycleCollector<VM>{
             debug_assert!(self.rc.count(curr) > 0);
             let mut is_logged = false;
             let mut num_of_childs = 0;
-            let visitor = |slot: <VM as vm::VMBinding>::VMSlot, b| {
-                let child = slot.load();
-                if self.get_slot_logging_state(slot) == Self::LOGGED_VALUE{
-                        is_logged = true;      
-                }
-                else if let Some(x) = child{
-                    if !is_logged{
-                        // SAFETY: single-threaded CycleCollector -- see the impl header.
-                        let prev = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
-                        debug_assert!(prev != 1);
-                        debug_assert!(prev != 0);
-                        // SAFETY: as above.
-                        unsafe { self.rc.strong_rc_dec_exclusive(x) };
-                        dfs_stack.push(x);
-                        num_of_childs += 1;
-                    }
-
-                }
-            };
 
             if is_black(curr)
                 && STRONG_RC_TABLE.load_atomic::<u8>(curr.to_raw_address(), Ordering::Relaxed) == 0
@@ -381,7 +362,71 @@ impl<VM: VMBinding> CycleCollector<VM>{
             {
                 // SAFETY: single-threaded CycleCollector -- see the impl header.
                 unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(curr.to_raw_address(), GREY, Ordering::SeqCst) };
-                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                if VM::VMScanning::is_obj_array(curr) {
+                    // An object array's references are one contiguous, indexable run of slots, so
+                    // this walk can be written directly -- and, unlike `iterate_fields`, *stopped*
+                    // at the first logged field.
+                    //
+                    // Through `iterate_fields` there is no way out: `SlotVisitor` has no abort
+                    // hook and the binding's `oop_iterate` loops unconditionally, so once
+                    // `is_logged` is set every remaining element is still visited, each one paying
+                    // a heap load and a metadata load to do nothing.  On a large array whose first
+                    // element is logged that is a full array walk for no result.
+                    //
+                    // These are exactly the slots `iterate_fields` would visit, in the same order:
+                    // under `CLDScanPolicy::Ignore`, `ObjArrayKlass::oop_iterate` skips `do_klass`
+                    // and walks `array.data(T_OBJECT)`, which is the same base and length that
+                    // `obj_array_data` describes.  The per-field work below is unchanged, so the
+                    // children pushed, `num_of_childs`, and therefore the revert set the caller
+                    // acts on are all identical to the generic path -- this changes only *when the
+                    // loop stops*, never what it decides.
+                    let data = VM::VMScanning::obj_array_data(curr);
+                    for i in 0..data.len() {
+                        let slot = data.get(i);
+                        // Load the value *before* testing this slot's unlog bit, exactly as the
+                        // generic visitor does.  A mutator that writes and logs between the two is
+                        // caught by the test; one that did so between a test and a *later* load
+                        // would not be, and the collector would then decrement the new referent
+                        // while the restore path increments the old one -- leaving the new one
+                        // permanently short.  These two lines must not be reordered.
+                        let child = slot.load();
+                        if self.get_slot_logging_state(slot) == Self::LOGGED_VALUE {
+                            is_logged = true;
+                            break;
+                        }
+                        if let Some(x) = child {
+                            // SAFETY: single-threaded CycleCollector -- see the impl header.
+                            let prev = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
+                            debug_assert!(prev != 1);
+                            debug_assert!(prev != 0);
+                            // SAFETY: as above.
+                            unsafe { self.rc.strong_rc_dec_exclusive(x) };
+                            dfs_stack.push(x);
+                            num_of_childs += 1;
+                        }
+                    }
+                } else {
+                    let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
+                        let child = slot.load();
+                        if self.get_slot_logging_state(slot) == Self::LOGGED_VALUE{
+                                is_logged = true;
+                        }
+                        else if let Some(x) = child{
+                            if !is_logged{
+                                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                                let prev = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
+                                debug_assert!(prev != 1);
+                                debug_assert!(prev != 0);
+                                // SAFETY: as above.
+                                unsafe { self.rc.strong_rc_dec_exclusive(x) };
+                                dfs_stack.push(x);
+                                num_of_childs += 1;
+                            }
+
+                        }
+                    };
+                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                }
                 #[cfg(feature = "s_rc_stats")]
                 { self.stats.objects_in_mark.set(self.stats.objects_in_mark.get() + 1); }
                 if is_logged{
