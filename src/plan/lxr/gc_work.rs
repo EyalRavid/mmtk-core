@@ -20,6 +20,7 @@ use crate::util::rc::RefCountHelper;
 use crate::vm::slot::MemorySlice;
 use crate::plan::lxr::global::NUM_OF_CANDIDATES_VECTORS;
 use crate::plan::lxr::buffer::LocalBuffer;
+use crate::plan::lxr::buffer::FinalBuffers;
 use crate::util::rc::RcBits;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::LazySweepingJobsCounter;
@@ -27,6 +28,7 @@ use crate::LazySweepingJobsCounter;
 use crate::plan::lxr:: graphs_project::{*};
 #[cfg(feature = "graph_project")]
 use crate::plan::lxr::buffer::FinalIterMut;
+use crate::Pause;
 
 pub(super) struct LXRGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
@@ -135,7 +137,7 @@ pub struct CycleCollector<VM: VMBinding> {
 }
 
 impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
-    
+
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
 
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
@@ -143,30 +145,14 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         lxr.in_cycle_collection.store(true, Ordering::SeqCst);
         //println!("size of rc cache: {}, num of entreies: {}", lxr.rc_with_overflow.capacity(), lxr.rc_with_overflow.num_entries());
 
-        let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
-        let mut candidates = unsafe {lxr.s_cycle_candidates_mut()}.into_final_buffers();
-
-
-        #[cfg(feature = "graph_project")]
-        {
-            let mut it = candidates.iter_mut();
-            let mut reporter = lxr.graph_reporter.lock().unwrap();
-            self.report_candidates_sub_graph(it, &mut reporter, vec_index);
-
-        }
-
-
-        #[cfg(feature = "s_rc_stats")]
-        {
-            self.stats.raw_cycle_candidates = candidates.len();
-        }
-
         // The two scratch DFS stacks, reused by every traversal below.
         //
         // Two are needed, and exactly two: the phases run in sequence, but `scan` nests into
         // `scan_black` and `collect_whites` nests into `collect_blacks`, so at most two are live
         // at once.  Neither nested traversal is recursive or reachable from anywhere else, so the
-        // depth is 2 and never grows.
+        // depth is 2 and never grows.  Running the phases over three candidate buffers instead of
+        // one does not change that: the buffers are walked in sequence within a phase, so the
+        // nesting depth is a property of the phases, not of how many candidates they see.
         //
         // They are locals rather than `CycleCollector` fields on purpose: this packet is
         // constructed fresh per GC and `do_work` runs once, so a field would retain nothing across
@@ -180,67 +166,20 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         let mut dfs_stack = Vec::<ObjectReference>::with_capacity(4096);
         let mut nested_stack = Vec::<ObjectReference>::with_capacity(4096);
 
-        // One producer handle into the *next* GC's candidate pool, held for the whole packet.
+        // How many candidate pools this collection drains.
         //
-        // `mark` and `collect_blacks` are the only producers, they both target `curr_vec` (the
-        // pool being filled), and nothing drains that pool between the two phases -- it is read
-        // by `into_final_buffers` at the *start of the next GC*, by which time this handle has
-        // long been dropped.  So one handle covers both phases.
-        //
-        // Acquiring per candidate (`mark`) and per qualifying edge (`collect_blacks`) cost a
-        // `BufferPool` mutex on both `acquire_buffer` and `LocalBuffer::drop`; hoisting it pays
-        // that pair once per GC instead.
-        //
-        // Taken through the shared accessor rather than `curr_s_cycle_candidates_mut`: pushing
-        // only needs `&BufferPool`, so this avoids minting a `&mut` out of the `UnsafeCell` and
-        // keeps the two former call sites from ever holding overlapping `&mut`s to the same pool.
-        let mut cand_buffer = unsafe { lxr.curr_s_cycle_candidates() }.local_buffer();
-
-        // Mark phase: trial-delete candidates with strong_rc == 0
-        {
-            let mut it = candidates.iter_mut();
-            while let Some(cand) = it.next(){
-                if self.should_mark(*cand, vec_index) {
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
-                    unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed) };
-                    debug_assert!(self.rc.count(*cand) > 0);
-                    self.mark(*cand, lxr, &mut dfs_stack, &mut cand_buffer);
-                } else {
-                    if STRONG_RC_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::Relaxed) > 0 {
-                        // SAFETY: single-threaded CycleCollector -- see the impl header.
-                        unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed) };
-                    }
-                    it.swap_remove_current();
-                }
-            }
+        // The test is against `FullRC`, and swapping it for `== Some(Pause::RefCount)` is NOT
+        // equivalent: in an ordinary reference-counting GC this packet runs in the *concurrent
+        // tail*, scheduled by `on_lazy_cc_finished` after `gc_pause_end` has already stored `None`
+        // into `current_pause` (`global.rs:553`).  So for the ordinary case `current_pause()` is
+        // `None`, not `Some(Pause::RefCount)`, and a `== RefCount` test would send every ordinary
+        // pause down `all_buff_gc`.  `FullRC` is the only pause that runs this packet inside the
+        // pause, which is exactly what makes it the one that can afford to drain everything.
+        match lxr.current_pause() {
+            Some(Pause::FullRC) => self.all_buff_gc(lxr, &mut dfs_stack, &mut nested_stack),
+            _ => self.single_buff_gc(lxr, &mut dfs_stack, &mut nested_stack),
         }
 
-        #[cfg(feature = "s_rc_stats")]
-        {
-            self.stats.candidates_after_filter = candidates.len();
-        }
-
-        // Scan phase: classify GREY objects as WHITE (garbage) or restore to BLACK
-        let mut it = candidates.iter_mut();
-        while let Some(cand) = it.next() {
-            self.scan(*cand, lxr, &mut dfs_stack, &mut nested_stack);
-        }
-
-
-
-        lxr.in_cycle_collection.store(false, Ordering::Relaxed);
-
-        // Collect phase: free WHITE objects and handle remaining BLACK_IN_STACK
-        let mut it = candidates.iter_mut();
-        while let Some(cand) = it.next() {
-            debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::SeqCst) != GREY);
-            self.collect_whites(*cand, lxr, &mut dfs_stack, &mut nested_stack, &mut cand_buffer);
-        }
-        #[cfg(feature = "s_rc_stats")]
-        {
-            self.stats.satb_map_size = lxr.satb_map.len();
-            self.stats.log_to_file();
-        }
         // Timestamp the end of cycle collection. Together with "lazy decs finished",
         // "lazy sweep finished" and "lazy jobs finished" this splits the concurrent window
         // into its phases for `scripts/lxr/window.py`.
@@ -298,6 +237,247 @@ impl<VM: VMBinding> CycleCollector<VM>{
     const UNLOG_BITS: SideMetadataSpec = *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
         .as_spec()
         .extract_side_spec();
+
+
+    /// Run mark over one candidate buffer.
+    ///
+    /// Shared by both collection modes so they cannot drift: `single_buff_gc` calls it once and
+    /// `all_buff_gc` calls it once per pool, and the per-candidate decision is identical in both.
+    ///
+    /// `vec_index` must be the tag of the pool `candidates` was drained from. The pool/tag
+    /// relation is `tag(pool i) == i + 1`, with 0 meaning "not a candidate" -- three pools and a
+    /// null value is exactly the four states `CANDIDATES_STATUS` can hold (`spec_defs.rs`,
+    /// `log_num_of_bits: 1`). That is the hard ceiling on `NUM_OF_CANDIDATES_VECTORS`.
+    ///
+    /// `cand_buffer` must be a handle on pool `lxr.curr_vec`, because `mark` tags what it pushes
+    /// with `curr_vec + 1` while this pushes it into whichever pool the handle came from. If the
+    /// two disagree, the object lands in one pool carrying another pool's tag, `should_mark` can
+    /// never match it again, and it is leaked as a candidate for the life of the process.
+    fn mark_buffer(
+        &self,
+        lxr: &LXR<VM>,
+        candidates: &mut FinalBuffers<ObjectReference>,
+        vec_index: u8,
+        dfs_stack: &mut Vec<ObjectReference>,
+        cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+    ) {
+        let mut it = candidates.iter_mut();
+        while let Some(cand) = it.next() {
+            if self.should_mark(*cand, vec_index) {
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed) };
+                debug_assert!(self.rc.count(*cand) > 0);
+                self.mark(*cand, lxr, dfs_stack, cand_buffer);
+            } else {
+                if STRONG_RC_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::Relaxed) > 0 {
+                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(cand.to_raw_address(), 0, Ordering::Relaxed) };
+                }
+                it.swap_remove_current();
+            }
+        }
+    }
+
+    /// Cycle collection over **one** candidate pool: the one filled two GCs ago.
+    ///
+    /// This is the ordinary path, taken by every collection except `Pause::FullRC`, and it is the
+    /// behaviour this collector has always had. `curr_vec` is not touched, so the pool rotation is
+    /// driven solely by `schedule_collection`.
+    ///
+    /// Candidates registered by *this* GC's decrements land in pool `curr_vec` and are not looked
+    /// at here; they are drained two GCs later. That lag is what `all_buff_gc` removes.
+    fn single_buff_gc(
+        &mut self,
+        lxr: &LXR<VM>,
+        dfs_stack: &mut Vec<ObjectReference>,
+        nested_stack: &mut Vec<ObjectReference>,
+    ) {
+        let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
+        let mut candidates = unsafe { lxr.s_cycle_candidates_mut() }.into_final_buffers();
+
+        #[cfg(feature = "graph_project")]
+        {
+            let it = candidates.iter_mut();
+            let mut reporter = lxr.graph_reporter.lock().unwrap();
+            self.report_candidates_sub_graph(it, &mut reporter, vec_index);
+        }
+
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.stats.raw_cycle_candidates = candidates.len();
+        }
+
+        // One producer handle into the pool being filled, held for both producing phases.
+        //
+        // `mark` and `collect_blacks` are the only producers, they both target `curr_vec`, and
+        // nothing drains that pool between them -- it is read by `into_final_buffers` two GCs
+        // from now, by which time this handle has long been dropped. So one handle covers both.
+        //
+        // Acquiring per candidate (`mark`) and per qualifying edge (`collect_blacks`) costs a
+        // `BufferPool` mutex on both `acquire_buffer` and `LocalBuffer::drop`; hoisting it pays
+        // that pair once per GC instead.
+        //
+        // Taken through the shared accessor rather than `curr_s_cycle_candidates_mut`: pushing
+        // only needs `&BufferPool`, so this avoids minting a `&mut` out of the `UnsafeCell` and
+        // keeps the two call sites from ever holding overlapping `&mut`s to the same pool.
+        let mut cand_buffer = unsafe { lxr.curr_s_cycle_candidates() }.local_buffer();
+
+        // Mark phase: trial-delete candidates with strong_rc == 0
+        self.mark_buffer(lxr, &mut candidates, vec_index, dfs_stack, &mut cand_buffer);
+
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.stats.candidates_after_filter = candidates.len();
+        }
+
+        // Scan phase: classify GREY objects as WHITE (garbage) or restore to BLACK
+        let mut it = candidates.iter_mut();
+        while let Some(cand) = it.next() {
+            self.scan(*cand, lxr, dfs_stack, nested_stack);
+        }
+
+        lxr.in_cycle_collection.store(false, Ordering::Relaxed);
+
+        // Collect phase: free WHITE objects and handle remaining BLACK_IN_STACK
+        let mut it = candidates.iter_mut();
+        while let Some(cand) = it.next() {
+            debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::SeqCst) != GREY);
+            self.collect_whites(*cand, lxr, dfs_stack, nested_stack, &mut cand_buffer);
+        }
+
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.stats.satb_map_size = lxr.satb_map.len();
+            self.stats.log_to_file();
+        }
+    }
+
+    /// Cycle collection over **all three** candidate pools, phase-major:
+    /// mark(all) -> scan(all) -> collect_whites(all).
+    ///
+    /// Only `Pause::FullRC` takes this path. It removes the N-2 lag: candidates registered by this
+    /// GC's own decrements sit in pool `curr_vec` and are collected here rather than two GCs from
+    /// now, which is the point of a stop-the-world collection at an iteration boundary.
+    ///
+    /// **Phase-major is load-bearing, not stylistic.** A cycle whose members were registered in
+    /// different GCs spans two pools, and trial deletion only classifies it correctly if every
+    /// candidate has been marked before anything is scanned. Calling `single_buff_gc` three times
+    /// would run a full mark/scan/collect per pool and mis-classify exactly those cycles.
+    ///
+    /// One consequence to be aware of: `should_mark` filters on `STRONG_RC_TABLE == 0`, and `mark`
+    /// decrements the strong RC of children -- so marking one buffer can make a later buffer's
+    /// candidate qualify that did not before, or `mark`'s restore path can disqualify one. Which
+    /// candidates get marked is therefore order-dependent here, which it never was with one pool.
+    /// It errs towards collecting more, and every candidate that misses out keeps its tag and is
+    /// drained by a later GC.
+    fn all_buff_gc(
+        &mut self,
+        lxr: &LXR<VM>,
+        dfs_stack: &mut Vec<ObjectReference>,
+        nested_stack: &mut Vec<ObjectReference>,
+    ) {
+        println!("in full gc");
+
+        // `curr_vec` on entry. Rotated below to walk the pools, then restored before the scan
+        // phase so that a FullRC pause is invisible to the global rotation: the next GC's
+        // `schedule_collection` advances from this same value, exactly as it would have.
+        //
+        // Mutating it here is sound for the same reason every `*_exclusive` call in this impl is
+        // (see the header): this is a single packet on one worker, `ProcessDecs` has fully
+        // drained, and no next GC can start while this packet occupies a worker. Nothing else
+        // reads `curr_vec` in that window.
+        let entry_vec = lxr.curr_vec.get();
+
+        // Drain all three pools BEFORE any producer handle exists.
+        //
+        // Up front, and not per round, for two reasons. `into_final_buffers` takes `&mut self` and
+        // is only valid with no live `LocalBuffer`, so it cannot be interleaved with the marking
+        // it feeds. And draining everything first means nothing this collection *produces* can be
+        // consumed by it -- without that, the pool filled by the first round's `mark` is the pool
+        // the third round would drain, and `mark`'s retry path would re-process objects it had
+        // just deferred. That path fires on `is_logged`, which is a static property of the
+        // object's field unlog bits, so re-processing them could only defer them again.
+        //
+        // Rotating `curr_vec` here rather than indexing the pools directly keeps the two existing
+        // accessors honest: `s_cycle_candidates_mut()` is defined as pool `curr_vec + 1` and the
+        // `vec_index` expression is its tag, so advancing `curr_vec` re-points both together and
+        // they cannot disagree. The pools visited are `curr+1`, `curr+2`, `curr` -- all three,
+        // each exactly once.
+        let mut buffers: Vec<(FinalBuffers<ObjectReference>, u8)> =
+            Vec::with_capacity(NUM_OF_CANDIDATES_VECTORS as usize);
+        for i in 0..NUM_OF_CANDIDATES_VECTORS {
+            lxr.curr_vec.set((entry_vec + i) % NUM_OF_CANDIDATES_VECTORS);
+            let vec_index = ((lxr.curr_vec.get() + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
+            let candidates = unsafe { lxr.s_cycle_candidates_mut() }.into_final_buffers();
+            buffers.push((candidates, vec_index));
+        }
+
+        #[cfg(feature = "graph_project")]
+        {
+            let mut reporter = lxr.graph_reporter.lock().unwrap();
+            for (candidates, vec_index) in buffers.iter_mut() {
+                let it = candidates.iter_mut();
+                self.report_candidates_sub_graph(it, &mut reporter, *vec_index);
+            }
+        }
+
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.stats.raw_cycle_candidates = buffers.iter().map(|(c, _)| c.len()).sum();
+        }
+
+        // Mark phase, over every buffer, rotating `curr_vec` between them.
+        //
+        // The handle is re-acquired every round and dropped at the end of it. It cannot be hoisted
+        // the way `single_buff_gc` hoists it: the handle is bound to a pool at acquisition while
+        // `mark` reads the tag from `curr_vec` at push time, so a handle that outlived a rotation
+        // would write one pool's objects under another pool's tag. Nothing would catch that -- the
+        // accessors mint references out of an `UnsafeCell`, so it is not a borrow error, and the
+        // damage is silent: `should_mark` never matches those objects again.
+        for (i, (candidates, vec_index)) in buffers.iter_mut().enumerate() {
+            lxr.curr_vec
+                .set((entry_vec + i as u8) % NUM_OF_CANDIDATES_VECTORS);
+            let mut cand_buffer = unsafe { lxr.curr_s_cycle_candidates() }.local_buffer();
+            self.mark_buffer(lxr, candidates, *vec_index, dfs_stack, &mut cand_buffer);
+        }
+
+        lxr.curr_vec.set(entry_vec);
+
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.stats.candidates_after_filter = buffers.iter().map(|(c, _)| c.len()).sum();
+        }
+
+        // Scan phase, over every buffer. `scan` and `scan_black` produce no candidates, so this
+        // phase needs no handle.
+        for (candidates, _) in buffers.iter_mut() {
+            let mut it = candidates.iter_mut();
+            while let Some(cand) = it.next() {
+                self.scan(*cand, lxr, dfs_stack, nested_stack);
+            }
+        }
+
+        lxr.in_cycle_collection.store(false, Ordering::Relaxed);
+
+        // Collect phase, over every buffer. `curr_vec` is back to its entry value, so the
+        // candidates `collect_blacks` discovers are tagged and filed exactly as they would be by
+        // an ordinary collection, and are drained two GCs from now.
+        let mut cand_buffer = unsafe { lxr.curr_s_cycle_candidates() }.local_buffer();
+        for (candidates, _) in buffers.iter_mut() {
+            let mut it = candidates.iter_mut();
+            while let Some(cand) = it.next() {
+                debug_assert!(OBJ_COLOR_TABLE.load_atomic::<u8>(cand.to_raw_address(), Ordering::SeqCst) != GREY);
+                self.collect_whites(*cand, lxr, dfs_stack, nested_stack, &mut cand_buffer);
+            }
+        }
+        drop(cand_buffer);
+
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.stats.satb_map_size = lxr.satb_map.len();
+            self.stats.log_to_file();
+        }
+    }
 
     fn get_slot_logging_state(&self, slot: VM::VMSlot) -> u8 {
         Self::UNLOG_BITS.load_atomic(slot.to_address(), Ordering::SeqCst)

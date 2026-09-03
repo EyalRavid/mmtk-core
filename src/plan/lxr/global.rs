@@ -265,7 +265,45 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         //Eyal commented this line
         //It must be commeted with the call on line 1187
         //self.wait_for_decide_cycle_collection();
-        let pause = Pause::RefCount;
+        //
+        // A program-requested collection -- `System.gc()`, or MMTk's own `harness_begin` hook --
+        // is escalated to the stop-the-world reference-counting pause.
+        //
+        // This mirrors the baseline, which sends every user-triggered GC to `Pause::Full`
+        // (9988d781 global.rs:798-806).  Measured: across the whole baseline arm of the
+        // mutator-threads-16 run that path was taken 5 765 times and chose `Full` every time --
+        // its one escape, `cm_in_progress` giving `FinalMark` instead, never fired.  The fork has
+        // no such escape, because it runs no concurrent marking.
+        //
+        // GATED ON `!inside_harness()`, i.e. only OUTSIDE the timed iteration.
+        //
+        // The baseline escalates in-workload `System.gc()` too, and this deliberately does not.
+        // The reason is cost, not policy: a `FullRC` collection on `biojava` runs 1.2-1.7 s
+        // (measured -- ~94 candidates whose trial-deletion DFS walks the whole dead heap), against
+        // the baseline's 9.4 ms `Full`, because trial deletion costs O(garbage) while a trace
+        // costs O(live) and at a boundary the heap is ~99% garbage.  Matching a policy at 150x the
+        // price is not matching it.
+        //
+        // What that would corrupt: 11 of the 22 benchmarks call `System.gc()` from inside their
+        // timed iteration -- `tomcat` 25 times in a 12.6 s iteration, `jme` 6, `tradesoap` 4.
+        // Escalating those puts seconds of pause inside the measured number.
+        //
+        // Why every boundary GC still escalates: `harness_begin` issues its own collection at
+        // `mmtk.rs:336` and only sets the flag afterwards at `:348`, and the per-iteration
+        // `System.gc()` (DaCapo `Benchmark.run` bc 58) precedes `callback.start` at bc 61 which is
+        // what reaches `harness_begin` at all.  So the flag reads false at all six of them.
+        //
+        // The cost of gating: inside the timed iteration the fork now reclaims less at a
+        // `System.gc()` than the baseline does, so it carries more garbage there.  That asymmetry
+        // predates `Pause::FullRC` -- this restores prior behaviour inside the harness rather than
+        // introducing something new -- but it is a real difference and belongs in `FINDINGS.md`.
+        let pause = if self.base().global_state.is_user_triggered_collection()
+            && !crate::inside_harness()
+        {
+            Pause::FullRC
+        } else {
+            Pause::RefCount
+        };
         //########################################3
 
 
@@ -293,6 +331,9 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         match pause {
             Pause::Full => self
                 .schedule_emergency_full_heap_collection::<RCImmixCollectRootEdges<VM>>(scheduler),
+            Pause::FullRC => {
+                self.schedule_stw_rc_collection::<RCImmixCollectRootEdges<VM>>(scheduler)
+            }
             Pause::FullDefrag => unreachable!(),
             Pause::RefCount => self.schedule_rc_collection(scheduler),
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
@@ -931,6 +972,11 @@ impl<VM: VMBinding> LXR<VM> {
         }
         match pause {
             Pause::RefCount => counters.rc.fetch_add(1, Ordering::Relaxed),
+            // FullRC is a reference-counting pause, so it counts as one.  Explicit rather than
+            // falling into the `_` arm below: that would make `gc.full` non-zero, and both
+            // `scripts/lxr/load.py::KNOWN_STRUCTURAL_ZEROS` and `ARTIFACT.md` 6.1 declare
+            // `gc.full` structurally zero for this fork.
+            Pause::FullRC => counters.rc.fetch_add(1, Ordering::Relaxed),
             Pause::InitialMark => counters.initial_mark.fetch_add(1, Ordering::Relaxed),
             Pause::FinalMark => counters.final_mark.fetch_add(1, Ordering::Relaxed),
             _ => counters.full.fetch_add(1, Ordering::Relaxed),
@@ -951,10 +997,13 @@ impl<VM: VMBinding> LXR<VM> {
     }
 
     fn disable_unnecessary_buckets(&'static self, scheduler: &GCWorkScheduler<VM>, pause: Pause) {
-        if pause == Pause::RefCount {
+        // FullRC takes the RefCount answer everywhere in this function except the
+        // STWRCDecsAndSweep decision below: it runs the reference-counting pipeline, so none of
+        // the trace buckets have anything scheduled into them.
+        if pause == Pause::RefCount || pause == Pause::FullRC {
             scheduler.work_buckets[WorkBucketStage::Prepare].set_as_disabled();
         }
-        if pause == Pause::RefCount || pause == Pause::InitialMark {
+        if pause == Pause::RefCount || pause == Pause::InitialMark || pause == Pause::FullRC {
             scheduler.work_buckets[WorkBucketStage::Closure].set_as_disabled();
             scheduler.work_buckets[WorkBucketStage::WeakRefClosure].set_as_disabled();
             scheduler.work_buckets[WorkBucketStage::FinalRefClosure].set_as_disabled();
@@ -970,8 +1019,13 @@ impl<VM: VMBinding> LXR<VM> {
         scheduler.work_buckets[WorkBucketStage::RefForwarding].set_as_disabled();
         scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_as_disabled();
         scheduler.work_buckets[WorkBucketStage::Compact].set_as_disabled();
+        // ...and here it takes the FULL answer, which is the whole point of the pause: this is the
+        // bucket the decrements are promoted into at Release (immixspace.rs:588 ->
+        // scheduler.rs:142).  Leaving FullRC out of this exemption would disable that bucket, the
+        // promoted packets would never run, and the collection would silently reclaim nothing.
         if crate::args::LAZY_DECREMENTS
             && pause != Pause::Full
+            && pause != Pause::FullRC
             && !cfg!(feature = "fragmentation_analysis")
         {
             scheduler.work_buckets[WorkBucketStage::STWRCDecsAndSweep].set_as_disabled();
@@ -1083,6 +1137,55 @@ impl<VM: VMBinding> LXR<VM> {
         scheduler.schedule_ref_proc_work::<LXRWeakRefWorkContext<VM>>(self);
     }
 
+    /// The reference-counting pipeline, run stop-the-world.
+    ///
+    /// Same phases a `Pause::RefCount` schedules -- incs, then decrements, then the concurrent
+    /// tail -- but none of it escapes the pause.  There is no trace here, so nothing may depend
+    /// on a mark bit, and `Pause::FullRC` is deliberately a distinct variant so that the ~44
+    /// `== Pause::Full` tests elsewhere keep giving the `RefCount` answer by default.
+    ///
+    /// How it becomes stop-the-world, in one hop: the flag stored below is read back at
+    /// `ImmixSpace::release_rc` (immixspace.rs:588) once the `Release` packet has run, and that
+    /// read turns the decrements from `postpone_all_prioritized` into
+    /// `bulk_add(STWRCDecsAndSweep)` (scheduler.rs:142).  Everything downstream follows on its
+    /// own: `LazySweepingJobsCounter::drop` (lib.rs:196-226) fires `end_of_decs` synchronously on
+    /// the worker, so block sweeping and then the cycle collector are queued into `Unconstrained`
+    /// while the GC is still running -- and `on_gc_finished` cannot proceed until every bucket is
+    /// empty (scheduler.rs:837).  `Unconstrained` means "no ordering constraint", not "concurrent".
+    ///
+    /// Ordering of inc before dec is free: incs run in `RCProcessIncs` (= `Initial`), and the
+    /// decrements are not promoted until `Release`, which is fifteen buckets later.
+    ///
+    /// NOT a fixpoint.  This still scans one candidate buffer -- the one filled two GCs ago -- so
+    /// it reclaims what a `Pause::RefCount` would, only synchronously.  Draining every buffer to
+    /// quiescence is separate work.
+    fn schedule_stw_rc_collection<E: ProcessEdgesWork<VM = VM>>(
+        &'static self,
+        scheduler: &GCWorkScheduler<VM>,
+    ) {
+        // The stop-the-world switch.  Cleared in `gc_pause_end` (:493), so it scopes to this GC.
+        crate::DISABLE_LASY_DEC_FOR_CURRENT_GC.store(true, Ordering::SeqCst);
+        // Disables the trace buckets and, unlike `Pause::RefCount`, leaves STWRCDecsAndSweep
+        // enabled -- see the two FullRC arms in that function.
+        self.disable_unnecessary_buckets(scheduler, Pause::FullRC);
+        // Wrap the previous GC's roots as ProcessDecs packets.  They are postponed here exactly as
+        // in any other pause; the flag above is what pulls them back in at Release.
+        self.process_prev_roots(scheduler);
+        // Stop & scan mutators (mutator scanning can happen before STW)
+        scheduler.work_buckets[WorkBucketStage::Unconstrained]
+            .add_prioritized(Box::new(StopMutators::<LXRGCWorkContext<E>>::new()));
+        // Prepare, in RCProcessIncs rather than the (now disabled) Prepare bucket.  Equivalent for
+        // this plan: LXR returns true from `no_mutator_prepare_release`, `no_worker_prepare` and
+        // `fast_worker_release` (:548-558), so `Prepare::<LXRGCWorkContext<..>>` reduces to
+        // `plan.prepare(tls)`, which is all `FastRCPrepare` does (gc_work.rs:52-56).
+        scheduler.work_buckets[WorkBucketStage::RCProcessIncs].add(FastRCPrepare);
+        // Release.  This is the hop that promotes the decrements.
+        scheduler.work_buckets[WorkBucketStage::Release]
+            .add(Release::<LXRGCWorkContext<UnsupportedProcessEdges<VM>>>::new(self));
+        // No `schedule_ref_proc_work`: that is trace-based weak reference processing, and there is
+        // no trace.  A `Pause::RefCount` does not do it either.
+    }
+
     fn process_prev_roots(&self, scheduler: &GCWorkScheduler<VM>) {
         let mut count = 0usize;
         let prev_roots = self.prev_roots.write().unwrap();
@@ -1176,13 +1279,30 @@ impl<VM: VMBinding> LXR<VM> {
     /// `on_lazy_cc_finished` fire *after* sweeping rather than alongside it. Deriving the
     /// packets with a plain `clone` instead would empty the middle counter immediately and
     /// run cycle collection concurrently with the sweep.
+    ///
+    /// **`Pause::FullRC` inverts this**, and takes the pre-reorder chain: decs -> cc -> sweep.
+    /// The reasoning above is about handing memory back early during a *concurrent* tail, and a
+    /// FullRC pause has no concurrent tail -- it runs to completion before mutators resume, so
+    /// nothing is gained by returning blocks earlier within it.  What IS gained by putting the
+    /// sweep last is that the blocks trial deletion kills get swept in the same pause instead of
+    /// being deferred to the next GC, which for a between-iterations collection means the next
+    /// iteration boundary.
     fn on_lazy_decs_finished(&self, c: LazySweepingJobsCounter) {
         gc_log!([2]
             " - lazy decs finished since-gc-start={:.3}ms",
             crate::gc_start_time_ms(),
         );
 
-        self.immix_space.schedule_rc_block_sweeping_tasks(c);
+        if self.current_pause() == Some(Pause::FullRC) {
+            // `c` already holds the middle counter, which is exactly what the middle slot needs,
+            // so it is handed to the single CycleCollector packet directly.  When that packet
+            // drops, the middle counter reaches zero and `on_lazy_cc_finished` schedules the
+            // sweep.
+            self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained]
+                .add(CycleCollector::<VM>::new(c));
+        } else {
+            self.immix_space.schedule_rc_block_sweeping_tasks(c, false);
+        }
     }
 
     /// Fires when **block sweeping** has drained. The name refers to the counter this hangs
@@ -1199,6 +1319,18 @@ impl<VM: VMBinding> LXR<VM> {
     /// argument in `policy/immix/rc_work.rs`.
     fn on_lazy_cc_finished(&self, c: LazySweepingJobsCounter) {
         let ix = &self.immix_space;
+
+        if self.current_pause() == Some(Pause::FullRC) {
+            // FullRC: this slot means CYCLE COLLECTION just ended, and `CycleCollector` has
+            // already logged that itself -- so nothing is printed here.  The sweep line is
+            // emitted by `on_lazy_sweeping_finished`, where the sweep actually drains, which
+            // keeps both orders emitting the same four lines and lets a reader tell them apart
+            // from the timestamps alone.  `c` holds only the overall counter, so the sweep
+            // packets must be derived from it with a plain `clone` -- hence `true`.
+            self.immix_space.schedule_rc_block_sweeping_tasks(c, true);
+            return;
+        }
+
         gc_log!([2]
             " - lazy sweep finished since-gc-start={:.3}ms, released-blocks={}, released-los-pages={}",
             crate::gc_start_time_ms(),
@@ -1239,6 +1371,21 @@ impl<VM: VMBinding> LXR<VM> {
         // a drop there means reclamation moved to the next cycle, not that less was reclaimed.
         let released_blocks = ix.num_clean_blocks_released_lazy.load(Ordering::SeqCst);
         let released_los_pages = self.los().num_pages_released_lazy.load(Ordering::SeqCst);
+        // Under FullRC the sweep is the LAST phase, so this is where it drains and this is where
+        // its line belongs.  `on_lazy_cc_finished` deliberately prints nothing in that mode.
+        // Both orders therefore emit the same four lines -- decs, sweep, cc, jobs -- and which
+        // order ran is readable from the `since-gc-start` values:
+        //     decs -> sweep -> cc -> jobs   the default chain
+        //     decs -> cc -> sweep -> jobs   Pause::FullRC
+        // `scripts/lxr/window.py` relies on exactly that.
+        if self.current_pause() == Some(Pause::FullRC) {
+            gc_log!([2]
+                " - lazy sweep finished since-gc-start={:.3}ms, released-blocks={}, released-los-pages={}",
+                crate::gc_start_time_ms(),
+                released_blocks,
+                released_los_pages,
+            );
+        }
         let total_released_bytes =
             (released_blocks << Block::LOG_BYTES) + (released_los_pages << LOG_BYTES_IN_PAGE);
         gc_log!([2]

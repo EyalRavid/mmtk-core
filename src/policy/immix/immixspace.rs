@@ -537,7 +537,22 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
         }
         // Release nursery blocks
-        if pause != Pause::RefCount {
+        //
+        // FullRC MUST take the RefCount answer here.  `prepare_rc` is reached from
+        // `FastRCPrepare`, which sits in the `RCProcessIncs` bucket alongside root scanning and
+        // every `ProcessIncs` packet -- so it runs CONCURRENTLY with nursery evacuation on the
+        // other workers.  `reset_before_mature_evac` rewinds `clean_block_cursor` /
+        // `reuse_block_cursor` to 0, and `acquire_clean_blocks_fast` only avoids handing the same
+        // clean block to two allocators because that cursor never moves backwards: a block sits in
+        // a worker's local `buf` still `BlockState::Unallocated` until `initialize_new_clean_block`
+        // runs, and the copy path of `append_to_buf` re-checks that state WITHOUT a lock.  Rewind
+        // the cursor and a second worker rescans from 0, sees `Unallocated`, and takes a block the
+        // first worker is already copying into.
+        //
+        // It is safe for the pauses that do take this branch: they reset the cursor to reposition
+        // it for mature evacuation, and their evacuation runs in `Closure`/`RCEvacuateMature`,
+        // after `Prepare` has drained -- not in the same bucket.
+        if pause != Pause::RefCount && pause != Pause::FullRC {
             self.pr.reset_before_mature_evac();
             if pause == Pause::Full || pause == Pause::FinalMark {
                 // Reset worker TLABs.
@@ -1618,7 +1633,25 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// `end_of_cc` cannot fire and schedule the cycle collector -- until the last sweep
     /// packet has been dropped. A plain `clone` counts only in the overall counter, which
     /// would let cycle collection start while these packets are still running.
-    pub fn schedule_rc_block_sweeping_tasks(&self, counter: LazySweepingJobsCounter) {
+    /// Schedule the block sweep.
+    ///
+    /// `sweep_is_last` says which slot of the lazy-sweeping chain this sweep occupies, and it
+    /// decides which token every packet gets.  The chain's three counters are POSITIONAL
+    /// (`lib.rs:196-226`): whatever runs in the middle slot must keep the middle counter alive,
+    /// whatever runs last must keep only the overall counter alive.
+    ///
+    ///   `false`  decs -> SWEEP -> cc   (the default chain)   -> `clone_with_cc`
+    ///   `true`   decs -> cc -> SWEEP   (`Pause::FullRC`)     -> `clone`
+    ///
+    /// Passing `false` in the last slot would empty the middle counter immediately and run the
+    /// next phase concurrently with the sweep; passing `true` in the middle slot is worse still
+    /// -- `clone_with_cc` unwraps the middle counter (`lib.rs:186`), which is `None` in a
+    /// last-slot token, so it would panic.
+    pub fn schedule_rc_block_sweeping_tasks(
+        &self,
+        counter: LazySweepingJobsCounter,
+        sweep_is_last: bool,
+    ) {
         // while let Some(x) = self.last_mutator_recycled_blocks.pop() {
         //     x.set_state(BlockState::Marked);
         // }
@@ -1641,7 +1674,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let packets = bins
             .into_iter()
             .map::<Box<dyn GCWork<VM>>, _>(|blocks| {
-                Box::new(SweepBlocksAfterDecs::new(blocks, counter.clone_with_cc()))
+                let token = if sweep_is_last {
+                    counter.clone()
+                } else {
+                    counter.clone_with_cc()
+                };
+                Box::new(SweepBlocksAfterDecs::new(blocks, token))
             })
             .collect();
         self.scheduler().work_buckets[WorkBucketStage::Unconstrained].bulk_add_prioritized(packets);

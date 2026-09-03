@@ -793,6 +793,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             let pause_time = pause_time.as_micros() as f64 / 1000f64;
             let pause_s = match pause {
                 Pause::RefCount => "RefCount",
+                Pause::FullRC => "FullRC",
                 Pause::InitialMark => "InitialMark",
                 Pause::FinalMark => "FinalMark",
                 _ => "Full",
