@@ -376,7 +376,6 @@ impl<VM: VMBinding> CycleCollector<VM>{
         dfs_stack: &mut Vec<ObjectReference>,
         nested_stack: &mut Vec<ObjectReference>,
     ) {
-        println!("in full gc");
 
         // `curr_vec` on entry. Rotated below to walk the pools, then restored before the scan
         // phase so that a FullRC pause is invisible to the global rotation: the next GC's
