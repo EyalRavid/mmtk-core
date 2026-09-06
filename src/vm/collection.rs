@@ -1,6 +1,7 @@
 use crate::util::alloc::AllocationError;
 use crate::util::heap::gc_trigger::GCTriggerPolicy;
 use crate::util::opaque_pointer::*;
+use crate::util::ObjectReference;
 use crate::vm::VMBinding;
 use crate::{scheduler::*, Mutator};
 
@@ -100,6 +101,37 @@ pub trait Collection<VM: VMBinding> {
     fn process_phantom_refs<E: ProcessEdgesWork<VM = VM>>(_worker: &mut GCWorker<VM>) {}
 
     fn update_weak_processor(_lxr: bool) {}
+
+    /// Enumerate every object registered for finalization, as `(finalizer, referent)` pairs.
+    ///
+    /// For OpenJDK this walks the static `java.lang.ref.Finalizer.unfinalized` list, which is a
+    /// permanent GC root: every finalizable object ever allocated is on it until its finalizer
+    /// has run. That makes each `referent` field a strong edge the collector must account for
+    /// explicitly -- see `FINALIZER_RC_PLAN.md`.
+    ///
+    /// STOP-THE-WORLD ONLY. The list is mutated by mutators under a Java-level lock and this
+    /// takes none.
+    ///
+    /// The default returns nothing, which is correct for a VM with no finalization.
+    fn finalizer_candidates() -> Vec<(ObjectReference, ObjectReference)> {
+        vec![]
+    }
+
+    /// Hand these `Finalizer` objects to the VM's pending-reference list, so the VM's own
+    /// finalizer thread runs `finalize()` on their referents -- outside any GC pause.
+    ///
+    /// The collector must NOT run finalizers itself: `finalize()` is arbitrary user code that
+    /// allocates, takes locks, and may resurrect its object. It must also not clear the
+    /// referent, which `finalize()` still needs. Both are the VM's job after the pause.
+    ///
+    /// Each reference must be passed at most once, ever.
+    ///
+    /// Returns the previous head of the pending list. The caller needs it because splicing
+    /// creates real heap edges through the `discovered` fields, and those edges bypass the write
+    /// barrier -- so their reference counts must be applied by hand. See the caller.
+    fn enqueue_finalizers(_refs: &[ObjectReference]) -> Option<ObjectReference> {
+        None
+    }
 
     fn clear_cld_claimed_marks() {}
 

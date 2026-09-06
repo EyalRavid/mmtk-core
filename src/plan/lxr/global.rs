@@ -359,8 +359,14 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         //     scheduler.work_buckets[WorkBucketStage::Final].add(ScheduleSanityGC::<Self>::new(self));
         // }
         //Eyal added this
+        // `FullRC` is included deliberately.  It is the pause that runs at every iteration
+        // boundary and carries the newest pipeline -- STW decrements, the three-pool
+        // `all_buff_gc`, the inverted phase order, weak-root clearing -- and until this clause
+        // was added, sanity never ran after it: the `Full || FinalMark` arm above is dead code in
+        // this fork, so `RefCount` was the only kind ever checked.  See `FINALIZER_RC_PLAN.md`
+        // step 1; the finalizer work needs this check to exist before it lands.
         #[cfg(feature = "sanity")]
-        if pause == Pause::RefCount
+        if pause == Pause::RefCount || pause == Pause::FullRC
         {
             scheduler.work_buckets[WorkBucketStage::Final].add(ScheduleSanityGC::<Self>::new(self));
         }
