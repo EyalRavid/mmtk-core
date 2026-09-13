@@ -358,13 +358,42 @@ struct Counters {
     pub final_mark: AtomicUsize,
     pub cm_early_quit: AtomicUsize,
     pub full: AtomicUsize,
+    // How many of the `rc` pauses above were `Pause::FullRC` -- the
+    // stop-the-world RC collection the fork performs for a user-triggered GC
+    // outside the harness (DaCapo's per-iteration `System.gc()`).
+    //
+    // ADDITIVE, not a re-route: `FullRC` still increments `rc`, so `gc.rc` and
+    // every figure derived from it are unchanged, and `gc.full` stays
+    // structurally zero as `load.py::KNOWN_STRUCTURAL_ZEROS` and `ARTIFACT.md`
+    // 6.1 both assert. `gc.rc - gc.full_rc` is the ordinary RefCount count.
+    //
+    // Why it exists: before this, the boundary cleanup added by `2ee54824` was
+    // invisible in every counter, so no run could show that a single FullRC had
+    // ever happened. EVALUATION_PLAN.md E45.
+    pub full_rc: AtomicUsize,
     pub emergency: AtomicUsize,
     pub yield_nanos: Atomic<u128>,
     pub roots_nanos: Atomic<u128>,
     pub satb_nanos: Atomic<u128>,
-    pub total_used_pages: AtomicUsize,
-    pub min_used_pages: AtomicUsize,
-    pub max_used_pages: AtomicUsize,
+    // RESERVED pages after each GC, net of what lazy sweeping subsequently
+    // returned. `reserved = used + collection_reserve + vm_live_pages`
+    // (plan/global.rs:241), so this is NOT live occupancy -- it was named
+    // `*_used_pages` until 2026-09-13 and every run recorded before that date
+    // carries the old name for this same quantity. Renamed rather than
+    // repurposed: `HEAP_AFTER_GC`, which this is derived from, also feeds the
+    // mature-space sizing that drives the concurrent-marking and emergency
+    // thresholds (plan/lxr/global.rs:798), so changing what it holds would
+    // change collector BEHAVIOUR and not merely a report.
+    pub total_reserved_pages: AtomicUsize,
+    pub min_reserved_pages: AtomicUsize,
+    pub max_reserved_pages: AtomicUsize,
+    // Genuine `Plan::get_used_pages()`, sampled at the same instant as the
+    // reserved figure above and with the same lazy-release subtraction, so the
+    // two differ by exactly `collection_reserve + vm_live_pages`. New on
+    // 2026-09-13; no run before that date has these columns.
+    pub total_live_pages: AtomicUsize,
+    pub min_live_pages: AtomicUsize,
+    pub max_live_pages: AtomicUsize,
     pub gc_with_unfinished_lazy_jobs: AtomicUsize,
     pub incs_triggerd: AtomicUsize,
     pub alloc_triggerd: AtomicUsize,
@@ -386,15 +415,19 @@ impl Counters {
         "gc.initial_satb": self.initial_mark.load(Ordering::SeqCst),
         "gc.final_satb": self.final_mark.load(Ordering::SeqCst),
         "gc.full": self.full.load(Ordering::SeqCst),
+        "gc.full_rc": self.full_rc.load(Ordering::SeqCst),
         "gc.emergency": self.emergency.load(Ordering::SeqCst),
         "cm_early_quit": self.cm_early_quit.load(Ordering::SeqCst),
         "gc_with_unfinished_lazy_jobs": self.gc_with_unfinished_lazy_jobs.load(Ordering::SeqCst),
         "time.yield": self.yield_nanos.load(Ordering::SeqCst) as f64 / 1000000.0,
         "time.roots": self.roots_nanos.load(Ordering::SeqCst) as f64 / 1000000.0,
         "time.satb": self.satb_nanos.load(Ordering::SeqCst) as f64 / 1000000.0,
-        "total_used_pages": self.total_used_pages.load(Ordering::SeqCst),
-        "min_used_pages": self.min_used_pages.load(Ordering::SeqCst),
-        "max_used_pages": self.max_used_pages.load(Ordering::SeqCst),
+        "total_reserved_pages": self.total_reserved_pages.load(Ordering::SeqCst),
+        "min_reserved_pages": self.min_reserved_pages.load(Ordering::SeqCst),
+        "max_reserved_pages": self.max_reserved_pages.load(Ordering::SeqCst),
+        "total_live_pages": self.total_live_pages.load(Ordering::SeqCst),
+        "min_live_pages": self.min_live_pages.load(Ordering::SeqCst),
+        "max_live_pages": self.max_live_pages.load(Ordering::SeqCst),
         "incs_triggerd": self.incs_triggerd.load(Ordering::SeqCst),
         "alloc_triggerd": self.alloc_triggerd.load(Ordering::SeqCst),
         "survival_triggerd": self.survival_triggerd.load(Ordering::SeqCst),
@@ -406,7 +439,8 @@ impl Counters {
 const fn create_counters() -> Counters {
     let mut counters: Counters =
         unsafe { std::mem::transmute([0u8; std::mem::size_of::<Counters>()]) };
-    counters.min_used_pages = AtomicUsize::new(usize::MAX);
+    counters.min_reserved_pages = AtomicUsize::new(usize::MAX);
+    counters.min_live_pages = AtomicUsize::new(usize::MAX);
     counters
 }
 

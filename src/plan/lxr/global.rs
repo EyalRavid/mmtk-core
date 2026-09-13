@@ -62,6 +62,15 @@ static INCS_TRIGGERED: AtomicBool = AtomicBool::new(false);
 static ALLOC_TRIGGERED: AtomicBool = AtomicBool::new(false);
 static SURVIVAL_TRIGGERED: AtomicBool = AtomicBool::new(false);
 static HEAP_AFTER_GC: AtomicUsize = AtomicUsize::new(0);
+/// Genuine `Plan::get_used_pages()` at the end of the pause, stored beside
+/// `HEAP_AFTER_GC` so the two are sampled at the SAME instant and differ by
+/// exactly `collection_reserve + vm_live_pages`.
+///
+/// Deliberately a second static rather than a change to `HEAP_AFTER_GC`:
+/// that one also feeds the mature-space sizing at `:798`, which drives the
+/// concurrent-marking and emergency thresholds, so repurposing it would change
+/// collector behaviour. Reporting only. See `Counters` in `lib.rs`.
+static USED_AFTER_GC: AtomicUsize = AtomicUsize::new(0);
 
 static RC_PAUSES_BEFORE_SATB: AtomicUsize = AtomicUsize::new(0);
 static MAX_RC_PAUSES_BEFORE_SATB: AtomicUsize = AtomicUsize::new(128);
@@ -569,6 +578,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         self.avail_pages_at_end_of_last_gc
             .store(self.get_available_pages(), Ordering::SeqCst);
         HEAP_AFTER_GC.store(self.get_reserved_pages(), Ordering::SeqCst);
+        USED_AFTER_GC.store(self.get_used_pages(), Ordering::SeqCst);
         self.dump_heap_usage(false);
         if cfg!(feature = "object_size_distribution") {
             if pause == Pause::FinalMark || pause == Pause::Full {
@@ -982,7 +992,12 @@ impl<VM: VMBinding> LXR<VM> {
             // falling into the `_` arm below: that would make `gc.full` non-zero, and both
             // `scripts/lxr/load.py::KNOWN_STRUCTURAL_ZEROS` and `ARTIFACT.md` 6.1 declare
             // `gc.full` structurally zero for this fork.
-            Pause::FullRC => counters.rc.fetch_add(1, Ordering::Relaxed),
+            Pause::FullRC => {
+                // Counted in BOTH: `rc` so no existing figure moves, `full_rc`
+                // so the boundary cleanup is visible at all. E45.
+                counters.full_rc.fetch_add(1, Ordering::Relaxed);
+                counters.rc.fetch_add(1, Ordering::Relaxed)
+            }
             Pause::InitialMark => counters.initial_mark.fetch_add(1, Ordering::Relaxed),
             Pause::FinalMark => counters.final_mark.fetch_add(1, Ordering::Relaxed),
             _ => counters.full.fetch_add(1, Ordering::Relaxed),
@@ -1447,18 +1462,44 @@ impl<VM: VMBinding> LXR<VM> {
         }
         gc_log!([2] " - num_clean_blocks_released_lazy = {}", ix.num_clean_blocks_released_lazy.load(Ordering::SeqCst));
         // Update counters
+        // DEAD in every evaluation build: `LAZY_DECREMENTS = !cfg!(feature =
+        // "lxr_no_lazy")` and no config sets that feature, so this never runs
+        // and `HEAP_AFTER_GC` always holds RESERVED pages. Left in place rather
+        // than deleted because under `lxr_no_lazy` it IS live and also feeds the
+        // mature-space sizing at `:798`; removing it would change collector
+        // behaviour under that feature. Note that if it ever does run,
+        // `*_reserved_pages` would report used pages under a reserved name --
+        // `*_live_pages` is unaffected, since it reads its own static.
         if !crate::args::LAZY_DECREMENTS {
             HEAP_AFTER_GC.store(self.get_used_pages(), Ordering::SeqCst);
         }
         {
-            let used_pages_after_gc = HEAP_AFTER_GC.load(Ordering::Relaxed);
+            // Both figures were sampled at the same instant in `gc_pause_end`,
+            // and both get the same lazy-release subtraction, so they differ by
+            // exactly `collection_reserve + vm_live_pages`.
+            //
+            // `*_reserved_pages` was called `*_used_pages` until 2026-09-13 and
+            // never measured used pages: the only live store into
+            // `HEAP_AFTER_GC` is `get_reserved_pages()`, because the
+            // `get_used_pages()` store below sits behind `!LAZY_DECREMENTS`,
+            // which is always false in every evaluation build. Every run
+            // recorded before that date carries the old name for this exact
+            // quantity. `*_live_pages` is the genuinely new one.
             let lazy_released_pages =
                 ix.num_clean_blocks_released_lazy.load(Ordering::Relaxed) << Block::LOG_PAGES;
-            let x = used_pages_after_gc.saturating_sub(lazy_released_pages);
+            let reserved = HEAP_AFTER_GC
+                .load(Ordering::Relaxed)
+                .saturating_sub(lazy_released_pages);
+            let live = USED_AFTER_GC
+                .load(Ordering::Relaxed)
+                .saturating_sub(lazy_released_pages);
             let c = crate::counters();
-            c.total_used_pages.fetch_add(x, Ordering::Relaxed);
-            c.min_used_pages.fetch_min(x, Ordering::Relaxed);
-            c.max_used_pages.fetch_max(x, Ordering::Relaxed);
+            c.total_reserved_pages.fetch_add(reserved, Ordering::Relaxed);
+            c.min_reserved_pages.fetch_min(reserved, Ordering::Relaxed);
+            c.max_reserved_pages.fetch_max(reserved, Ordering::Relaxed);
+            c.total_live_pages.fetch_add(live, Ordering::Relaxed);
+            c.min_live_pages.fetch_min(live, Ordering::Relaxed);
+            c.max_live_pages.fetch_max(live, Ordering::Relaxed);
         }
         let pause = match self.current_pause() {
             Some(p) => p,
