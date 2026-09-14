@@ -380,63 +380,76 @@ impl<VM: VMBinding> CycleCollector<VM>{
         // reads `curr_vec` in that window.
         let entry_vec = lxr.curr_vec.get();
 
-        // FINALIZER_RC_PLAN step 3A -- subtract the finalizer edge.
+        // FINALIZER_RC_PLAN step 3A -- cut the ONE root edge into the unfinalized chain.
         //
-        // `Finalizer.unfinalized` is a permanent GC root, so every referent reachable from it
-        // carries an edge that nothing will ever remove on its own. Take that edge away here and
-        // the cycle collector answers, for free, the only question finalization needs: is this
-        // object wanted by anything *other* than its own Finalizer?
+        // `Finalizer.unfinalized` is a static field holding the head of a chain that is otherwise
+        // linked only by its own `Finalizer.next`/`prev`. That static is therefore the single
+        // reference into the chain from outside it. Take it away, seed the head as a candidate,
+        // and ordinary trial deletion walks the whole chain by itself -- `mark` decrements both
+        // `rc` and `strong_rc` of every child, so each node's own walk is what makes its successor
+        // eligible. Every `Finalizer.referent` edge is then subtracted exactly once, by `mark`.
         //
-        // Must run BEFORE `into_final_buffers()` drains the pools below, so a referent tagged
-        // here is picked up by the mark phase of THIS collection.
+        // THIS REPLACES A PER-REFERENT SUBTRACTION, and that is the bug it fixes. The previous
+        // version reached into each referent and decremented it by hand to cancel the finalizer's
+        // edge -- but `mark` then walked the `Finalizer` and subtracted the *same* edge again. One
+        // edge, two subtractions: the referent's count fell one below the truth every time both
+        // happened, and on `batik` it reached the +1-bias floor and tripped
+        // `debug_assert!(prev != 1)` in `mark`. Confirmed by instrumenting the assertion, which
+        // reported `is_a_registered_Finalizer=true` on the parent and `was_dec_by_step3A=true` on
+        // the child. `lusearch` has no finalizers, so none of it ran and it passed.
         //
-        // The decrement is the raw `*_exclusive` form on purpose. A `ProcessDecs`-style
+        // The raw `*_exclusive` decrements are deliberate, as before: a `ProcessDecs`-style
         // decrement crossing `RC_DEATH_THRESHOLD` would run death processing and free the object
-        // outright -- before the CC ever looks at it -- and recursively decrement its children.
-        let mut pending_finalizers: Vec<(ObjectReference, ObjectReference)> = vec![];
-        {
+        // outright, before the CC ever looks at it.
+        //
+        // Must run BEFORE `into_final_buffers()` drains the pools below, so the head seeded here
+        // is picked up by the mark phase of THIS collection.
+        let pending_finalizers: Vec<(ObjectReference, ObjectReference)> =
+            <VM::VMCollection as Collection<VM>>::finalizer_candidates();
+        let mut cut_head: Option<ObjectReference> = None;
+        if !pending_finalizers.is_empty() {
             // The pool drained first by the loop below (i = 0, `curr_vec` still `entry_vec`),
             // and its tag. `tag(pool i) == i + 1`; `CANDIDATES_STATUS` is 2 bits and all four
             // values are taken, so there is no spare tag for a buffer of our own.
             let tag = ((entry_vec + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
             let pool = unsafe { lxr.s_cycle_candidates() };
             let mut buf = pool.local_buffer();
-            for (f, t) in <VM::VMCollection as Collection<VM>>::finalizer_candidates() {
-                // Java guarantees finalize() runs at most once. The guard lives in the VM walker,
-                // which reports only finalizers whose own Java state says they have not been
-                // handed over yet -- `referent != null && discovered == null && next == null`.
-                // Deliberately NOT a bit the collector remembers: state we remember is state
-                // that can go stale on recycled memory, and a stale mark would silently suppress
-                // finalization of whatever object later lands at that address.
-                //
+            // The true head, NOT `pending_finalizers[0].0`: the VM walker skips finalizers
+            // already handed to Java, so its first report need not be the head. Cutting the edge
+            // into a non-head node would leave the real head rooted and the nodes in front of the
+            // cut unreachable from the seed.
+            if let Some(head) = <VM::VMCollection as Collection<VM>>::finalizer_list_head() {
                 // Already at real rc 0: nothing to subtract, and decrementing would underflow.
-                if lxr.rc.count(t) <= 1 {
-                    continue;
+                if lxr.rc.count(head) > 1 {
+                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    unsafe { lxr.rc_with_overflow.dec_exclusive(head) };
+                    // `s_rc == 0` is what makes an object a candidate: `should_mark` requires it.
+                    // Nothing is lost -- `scan_black` reconstructs `s_rc` from `rc` in step 3B.
+                    // SAFETY: as above.
+                    unsafe { self.rc.strong_rc_dec_exclusive(head) };
+                    cut_head = Some(head);
+                    // Only seed if the head is not already filed in some pool. If it is, it will
+                    // be marked through that pool and a second entry would mark it twice.
+                    if CANDIDATES_STATUS
+                        .load_atomic::<u8>(head.to_raw_address(), Ordering::Relaxed)
+                        == 0
+                    {
+                        // SAFETY: as above.
+                        unsafe {
+                            CANDIDATES_STATUS.store_atomic_exclusive::<u8>(
+                                head.to_raw_address(),
+                                tag,
+                                Ordering::Relaxed,
+                            )
+                        };
+                        buf.push(head);
+                    }
                 }
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
-                unsafe { lxr.rc_with_overflow.dec_exclusive(t) };
-                // `s_rc == 0` is what makes an object a candidate: `should_mark` requires it.
-                // Nothing is lost by zeroing -- `scan_black` reconstructs it from `rc`.
-                unsafe {
-                    STRONG_RC_TABLE.store_atomic_exclusive::<u8>(
-                        t.to_raw_address(),
-                        0,
-                        Ordering::Relaxed,
-                    )
-                };
-                unsafe {
-                    CANDIDATES_STATUS.store_atomic_exclusive::<u8>(
-                        t.to_raw_address(),
-                        tag,
-                        Ordering::Relaxed,
-                    )
-                };
-                buf.push(t);
-                pending_finalizers.push((f, t));
             }
             gc_log!([2]
-                "    - finalizers: {} subtracted",
+                "    - finalizers: {} pending, head {}",
                 pending_finalizers.len(),
+                if cut_head.is_some() { "cut" } else { "not cut" },
             );
         }
 
@@ -511,52 +524,73 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
         lxr.in_cycle_collection.store(false, Ordering::Relaxed);
 
-        // FINALIZER_RC_PLAN step 3B -- resurrect the finished referents and enqueue them.
+        // FINALIZER_RC_PLAN step 3B -- read the verdict, restore the chain, enqueue.
         //
         // THIS SEAM IS LOAD-BEARING. `all_buff_gc` runs mark-over-all-buffers, then
         // scan-over-all-buffers, then collect-over-all-buffers. That global phase structure is
-        // the only reason it is safe to hand a WHITE object back here: no `collect_whites` has
-        // run yet, so nothing has freed this object or its children. If the phases are ever
-        // restructured per-candidate, this breaks SILENTLY -- a neighbouring candidate would
-        // free a child out from under a referent we are about to resurrect.
+        // the only reason it is safe to act on a WHITE object here: no `collect_whites` has run
+        // yet, so nothing has been freed. If the phases are ever restructured per-candidate, this
+        // breaks SILENTLY -- a neighbouring candidate would free a referent out from under us.
         if !pending_finalizers.is_empty() {
+            // 1. READ THE VERDICT FIRST. `scan_black` below re-increments every referent and
+            //    repaints it black, which erases exactly the colouring being read here. The two
+            //    steps cannot be merged into one loop.
+            //
+            //    WHITE == the collector actually decided this is garbage, i.e. nothing outside the
+            //    collected subgraph wants it -- which, with the finalizer edge subtracted by
+            //    `mark`, is precisely "wanted by nothing but its own Finalizer".
+            //
+            //    NOT `rc.count(t) == 1`: `mark` aborts and reverts whenever it meets an
+            //    SATB-logged slot, recolouring the object BLACK_IN_STACK and deferring it to a
+            //    later GC. `scan` only acts on GREY, so an aborted candidate is never scanned and
+            //    its count can read 1 without the collector ever having reasoned about its graph.
+            //    Treating that as "finished" resurrected such an object and `collect_whites` then
+            //    walked into it. Crashed `pmd`.
+            //
+            //    Not-WHITE simply means "not decided this time"; the finalizer is retried at the
+            //    next FullRC.
             let mut to_enqueue: Vec<ObjectReference> = vec![];
-            for (f, t) in pending_finalizers.drain(..) {
-                // Finished == the cycle collector actually decided this is garbage, i.e. `scan`
-                // coloured it WHITE.
-                //
-                // NOT `rc.count(t) == 1`, which is what this used to test and which is wrong.
-                // `mark` aborts and reverts whenever it meets an SATB-logged slot -- a field the
-                // mutator wrote -- recolouring the object BLACK_IN_STACK and deferring it to a
-                // later GC (see the `is_logged` path in `mark`). `scan` only acts on GREY, so an
-                // aborted candidate is never scanned, its subgraph is never processed, and its
-                // count still reads 1 from step A's subtraction. Treating that as "finished"
-                // resurrected an object whose graph the collector had explicitly declined to
-                // reason about, and `collect_whites` then walked into it. Crashed `pmd`.
-                //
-                // Referents are far more exposed to this than ordinary candidates: they are live,
-                // actively-mutated objects, not ones whose strong RC just fell to zero.
-                //
-                // Not-WHITE simply means "not decided this time" -- the count is restored below
-                // and the finalizer is retried at the next FullRC.
-                let finished =
-                    OBJ_COLOR_TABLE.load_atomic::<u8>(t.to_raw_address(), Ordering::Relaxed)
-                        == WHITE;
-                // Restore the edge FIRST, unconditionally: `scan_black` asserts `count > 1` on
-                // entry, and the object has to survive this GC either way -- `finalize()` has
-                // not run, so it is not garbage yet.
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
-                unsafe { lxr.rc_with_overflow.inc_exclusive(t) };
-                if finished {
-                    // Rebuilds `s_rc[t]` from the restored count and walks the subgraph,
-                    // undoing the mark phase's trial decrements, so nothing underneath is
-                    // collected before `finalize()` runs.
-                    self.scan_black(t, lxr, nested_stack);
-                    // No mark to set: `enqueue_finalizers` writes `discovered`, and that is
-                    // itself the "already handed over" state the VM walker filters on.
-                    to_enqueue.push(f);
+            // Gated on the cut actually having happened. Without it the chain is still rooted, so
+            // a WHITE referent could only have come from some unrelated candidate -- and the
+            // restore below, which is rooted at the head, would not cover it. Enqueueing an object
+            // we have not restored hands the VM something `collect_whites` is about to free.
+            if cut_head.is_some() {
+                for (f, t) in pending_finalizers.iter() {
+                    if OBJ_COLOR_TABLE.load_atomic::<u8>(t.to_raw_address(), Ordering::Relaxed)
+                        == WHITE
+                    {
+                        to_enqueue.push(*f);
+                    }
                 }
             }
+
+            // 2. RESTORE. Put the root edge back and re-blacken the chain.
+            //
+            // One `scan_black` from the head covers the whole chain AND every referent, because
+            // each `Finalizer` reaches its referent as an ordinary field. Where it stops early at
+            // an already-black node, that node was restored by `scan`'s own `scan_black`, which
+            // re-incremented its children -- so the chain past it is restored too. Every node is
+            // therefore either already black, or reached from here.
+            //
+            // The finalizers have to survive regardless of the verdict: `finalize()` has not run
+            // yet, so nothing here is garbage until the VM says so.
+            if let Some(head) = cut_head {
+                // `scan_black` asserts `count > 1` on entry, so the edge goes back first.
+                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                unsafe { lxr.rc_with_overflow.inc_exclusive(head) };
+                if !is_black(head) {
+                    self.scan_black(head, lxr, nested_stack);
+                }
+            }
+
+            // 3. ENQUEUE. Anything still not black was not restored by step 2, which means the
+            //    reasoning above is wrong for this object -- drop it rather than hand the VM an
+            //    object `collect_whites` is about to free. It is retried at the next FullRC.
+            to_enqueue.retain(|f| {
+                let ok = is_black(*f);
+                debug_assert!(ok, "finalizer {:?} not restored by scan_black from the list head", f);
+                ok
+            });
             if !to_enqueue.is_empty() {
                 gc_log!([2] "    - finalizers: {} enqueued for Java", to_enqueue.len());
                 let old_head =

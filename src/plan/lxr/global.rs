@@ -29,7 +29,7 @@ use crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::metadata::MetadataSpec;
 use crate::util::options::{GCTriggerSelector, Options};
-use crate::util::rc::{RefCountHelper, RC_TABLE, STRONG_RC_TABLE, CANDIDATES_STATUS};
+use crate::util::rc::{RefCountHelper, RC_TABLE, OVERFLOW_RC_TABLE, STRONG_RC_TABLE, CANDIDATES_STATUS};
 #[cfg(feature = "sanity")]
 use crate::util::sanity::sanity_checker::*;
 use crate::util::{metadata, Address, ObjectReference};
@@ -654,6 +654,11 @@ impl<VM: VMBinding> LXR<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Box<Self> {
         let immix_specs = metadata::extract_side_metadata(&[
             MetadataSpec::OnSide(RC_TABLE),
+            // Exact counts for saturated objects. MUST be registered here, not merely declared in
+            // `spec_defs.rs`: declaring assigns the offset, but only registration puts the spec in
+            // the `SideMetadataContext` that gets mapped as heap chunks are acquired. A declared
+            // but unregistered spec compiles and then faults on first access.
+            MetadataSpec::OnSide(OVERFLOW_RC_TABLE),
             MetadataSpec::OnSide(
                 *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
                     .as_spec()

@@ -3,45 +3,63 @@
 //! When `RefCountHelper::{inc,dec}` reports `Err(MAX_REF_COUNT)` the real count no longer fits in
 //! the RC table, and the remainder lives here.
 //!
-//! # Encoding
+//! # Why this is a side table and not a map
 //!
-//! A map value of `MAX_REF_COUNT` means *no overflow* — it is indistinguishable from having no
-//! entry at all. `dec` walks an overflowed count down through `MAX + 1 -> MAX` and then drops the
-//! slot, so in the steady state the map holds only objects that are *currently* overflowed.
+//! Until 2026-09-14 this was a `DashMap<ObjectReference, AtomicUsize>`, and every saturated
+//! operation paid a hash, a shard `RwLock`, a probe and an atomic. `FINDINGS.md` 20 measured what
+//! that costs: **99.1% of `biojava`'s increments reach this path**, and 99.4% of them come from the
+//! cycle collector's trial deletion. Only **43 objects** are ever saturated, so a general-purpose
+//! concurrent hash map was managing a population that fits in a cache line.
 //!
-//! The `MAX_REF_COUNT` value is nevertheless a legal, transient state that every path must handle,
-//! because the removal cannot be fused with the decrement: the CAS runs under a shard **read** lock
-//! and `remove_if` needs the shard **write** lock, and DashMap's shard lock is not reentrant. Two
-//! things can therefore be observed by another thread:
+//! `OVERFLOW_RC_TABLE` replaces it: a 32-bit side-metadata spec at object granularity, so the slot
+//! for an object is *computed from its address*. No hashing, no locking, no probing, no allocation,
+//! no insertion or removal. The cost is address space, not memory — side metadata is demand-zero
+//! mmapped (`memory.rs::dzmmap`, no `MAP_POPULATE`; the explicit zeroing is
+//! `cfg(not(target_os = "linux"))`) at 4 KiB pages (`MmapStrategy::SIDE_METADATA` is
+//! `HugePageSupport::No`), so pages that are never written are never committed. 43 scattered
+//! objects commit at most 43 pages.
 //!
-//! * the window between the CAS that stores `MAX` and the `remove_if` that drops the slot, and
-//! * a slot deliberately left behind because an `inc` raced in and pushed the value back above
-//!   `MAX`, which makes the removal predicate fail (see `dec`).
+//! # Encoding: the table holds the EXCESS, not the count
 //!
-//! Treating `MAX_REF_COUNT` as "absent" everywhere is what makes both harmless: `inc` on such a
-//! slot `fetch_add`s it to `MAX + 1` exactly as a fresh insert would, `dec` falls through to
-//! `dec_unconditionally`, and `get` returns the table value it already read.
+//! `OVERFLOW_RC_TABLE[o] == true_count - MAX_REF_COUNT`, consulted only when the RC table reads
+//! `MAX_REF_COUNT`.
 //!
-//! # Why the value is an `AtomicUsize`
+//!     0      not overflowed — the true count is exactly `MAX_REF_COUNT`
+//!     n > 0  the true count is `MAX_REF_COUNT + n`
 //!
-//! With a plain `usize` value every increment would need DashMap's shard **write** lock. Roughly
-//! one in seven to one in ten RC operations reaches this path (`rc_path.*` counters), and that
-//! traffic concentrates on a small number of heavily-referenced objects — so the hot objects would
-//! re-serialise on their shard. Holding an atomic instead means the common case takes only a shard
-//! **read** lock, which readers do not contend on, and the mutation is a `fetch_add`/CAS on the
-//! value itself. The shard write lock is then taken only when an address first overflows and when
-//! it stops being overflowed.
+//! Storing the excess rather than the count is what makes **`inc` a single unconditional
+//! `fetch_add`**. Under the old encoding the first overflow was a distinct case ("insert an entry
+//! seeded at `MAX`"), so `inc` needed to branch on whether an entry existed — and doing that
+//! race-free without a lock would have needed a CAS loop. With the excess, "no entry" and "excess
+//! zero" are the same state, and `0 -> 1` is just another increment. `inc` is the hot path here, so
+//! it gets the cheapest possible form.
+//!
+//! Zero is therefore the correct initial state and needs no initialisation: it is what demand-zero
+//! mmap already provides.
+//!
+//! # What this encoding deletes
+//!
+//! The old module documented a transient `MAX_REF_COUNT` slot — the window between the CAS that
+//! stored `MAX` and the `remove_if` that dropped the slot, plus slots deliberately left behind when
+//! an `inc` raced the removal — and every path had to treat that value as "absent". **None of that
+//! exists now.** There is no insertion, no removal, and therefore no window between them; excess 0
+//! *is* "absent". The old invariant 3 (every value mutation happens under at least a shard read
+//! lock, so `remove_if`'s predicate can decide atomically) is likewise gone with the shard locks.
 //!
 //! # Invariants
 //!
-//! 1. **An entry with value `> MAX_REF_COUNT` implies the object's RC field is `MAX_REF_COUNT`.**
-//!    Every path to death walks the count back down through `MAX + 1 -> MAX`, which empties the
-//!    entry first; `Block::rc_dead` needs an all-zero RC table, so an overflowed object can never
-//!    be reclaimed while its entry is live. This is what keeps a stranded entry safe against
-//!    address reuse: a recycled address either finds no entry or finds `MAX_REF_COUNT`, i.e.
-//!    "absent". Note the argument depends on `lxr_no_mature_evac`: `Block::clear_rc_table` bulk
-//!    zeroes an RC table without consulting this map, and its only caller is mature-evacuation
-//!    sweeping.
+//! 1. **A non-zero excess implies the object's RC field is `MAX_REF_COUNT`.** Every path to death
+//!    walks the count back down through `MAX + 1 -> MAX`, which zeroes the excess first;
+//!    `Block::rc_dead` needs an all-zero RC table, so an overflowed object can never be reclaimed
+//!    while its excess is non-zero. This is what keeps a stale excess safe against address reuse: a
+//!    recycled address finds excess 0, i.e. "not overflowed". Note the argument depends on
+//!    `lxr_no_mature_evac`: `Block::clear_rc_table` bulk zeroes an RC table without consulting this
+//!    table, and its only caller is mature-evacuation sweeping.
+//!
+//!    ⚠ **This invariant is now load-bearing in a way it was not before.** A map entry was dropped
+//!    when it drained; a side-metadata slot is not, so a stale non-zero excess would persist at
+//!    that address indefinitely. The invariant says that cannot happen, and `dec` zeroing the
+//!    excess before the RC field leaves `MAX` is what enforces it.
 //! 2. **`inc` and `dec` never run concurrently with each other.** `ProcessIncs` is STW,
 //!    `ProcessDecs` is concurrent, and since the `decs -> sweep -> cc` reorder `CycleCollector` is
 //!    a single packet ordered after sweeping, which is itself ordered after decs. What keeps the
@@ -51,45 +69,51 @@
 //!    worker parks only after `poll_schedulable_work` finds every bucket and every other worker's
 //!    queue empty. Concurrent work therefore holds the next GC off by occupying a worker.
 //!
-//!    *This justification changed on 2026-08-24.* It previously rested on the
-//!    `decide_cycle_collection` condvar, which has since been removed. The condvar was never the
-//!    binding constraint — it was released from `on_lazy_sweeping_finished`, i.e. inside the last
-//!    packet's `drop`, and so was always already granted by the time `ScheduleCollection` ran.
-//!    Nothing enforces this invariant; it is relied upon by the gap between
-//!    `RefCountHelper::{inc,dec}` returning `Err(MAX_REF_COUNT)` and this map being consulted, and
-//!    by the `*_exclusive` methods below, which additionally require that **no** other thread is
-//!    doing RC work at all.
-//! 3. **Every mutation of an entry's value happens while at least a shard read lock is held.**
-//!    This is what lets `remove_if` decide atomically whether a slot is still empty: its predicate
-//!    runs under the shard write lock, which excludes every `fetch_add`/CAS below.
+//!    Nothing enforces this; it is relied upon by the gap between `RefCountHelper::{inc,dec}`
+//!    returning `Err(MAX_REF_COUNT)` and this table being consulted, and by the `*_exclusive`
+//!    methods below, which additionally require that **no** other thread is doing RC work at all.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "s_rc_stats")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
-
-use crate::util::rc::{RefCountHelper, MAX_REF_COUNT, RC_DEATH_TRANSIENT};
+use crate::util::rc::{RefCountHelper, MAX_REF_COUNT, OVERFLOW_RC_TABLE, RC_DEATH_TRANSIENT};
 use crate::util::ObjectReference;
 use crate::vm::VMBinding;
 
 const MAX_RC_USIZE: usize = MAX_REF_COUNT as usize;
 
-/// Initial slot count, split across DashMap's shards (`available_parallelism() * 4`, rounded up to
-/// a power of two), so this is a per-shard hint rather than a global bound. The map grows if it is
-/// wrong.
-const DEFAULT_CAPACITY: usize = 1 << 12;
+/// The excess is a `u32` (`log_num_of_bits: 5`). The largest true count observed is ~14.7M on
+/// `biojava` (`FINDINGS.md` 20), four orders of magnitude below the wrap point, but a wrap would be
+/// silent and catastrophic, so it is asserted rather than assumed.
+type Excess = u32;
 
 pub struct RefCountWithOverflow<VM: VMBinding> {
-    entries: DashMap<ObjectReference, AtomicUsize>,
+    /// Objects whose excess is currently non-zero, maintained on the 0 <-> non-zero transitions
+    /// because a side table cannot be counted the way `DashMap::len` could.
+    ///
+    /// **Gated on `s_rc_stats`, and the field itself is absent without it.** This is
+    /// instrumentation, and a publication build must not carry it at all: the transitions sit on
+    /// the saturated RC path, which is 99% of `biojava`'s increment traffic (`FINDINGS.md` 20), so
+    /// "only two atomics per overflow episode" is an argument about the workloads measured so far
+    /// rather than a guarantee. `EVALUATION_PLAN.md` 6 rule 4, `ARTIFACT.md` 7.
+    #[cfg(feature = "s_rc_stats")]
+    overflowed: AtomicUsize,
     rc: RefCountHelper<VM>,
 }
 
 impl<VM: VMBinding> RefCountWithOverflow<VM> {
     pub fn new() -> Self {
         Self {
-            entries: DashMap::with_capacity(DEFAULT_CAPACITY),
+            #[cfg(feature = "s_rc_stats")]
+            overflowed: AtomicUsize::new(0),
             rc: RefCountHelper::NEW,
         }
+    }
+
+    #[inline]
+    fn excess(&self, o: ObjectReference) -> Excess {
+        OVERFLOW_RC_TABLE.load_atomic::<Excess>(o.to_raw_address(), Ordering::Relaxed)
     }
 
     pub fn inc(&self, o: ObjectReference) -> usize {
@@ -99,26 +123,31 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
         match self.rc.inc(o) {
             Ok(prev) => {
                 // Fast: the count was below MAX_REF_COUNT and the side-metadata CAS
-                // completed the operation. The overflow map was never consulted.
+                // completed the operation. The overflow table was never consulted.
                 #[cfg(feature = "lxr_rc_path_stats")]
                 super::rc_path_stats::inc_fast();
                 prev as usize
             }
 
             Err(MAX_REF_COUNT) => {
-                // Slow: the count is saturated. Counted here, before the map is touched, so that
-                // the hit and insert cases below share this single increment.
                 #[cfg(feature = "lxr_rc_path_stats")]
                 super::rc_path_stats::inc_slow();
 
-                if let Some(e) = self.entries.get(&o) {
-                    return e.fetch_add(1, Ordering::Relaxed);
+                // ONE atomic on an address computed from `o`. The old implementation probed the
+                // map with `get`, then fell through to `entry` on a miss, paying a second hash and
+                // probe under the shard write lock. Both cases are this single instruction now,
+                // because excess 0 and "no entry" are the same state.
+                let prev: Excess = OVERFLOW_RC_TABLE.fetch_add_atomic::<Excess>(
+                    o.to_raw_address(),
+                    1,
+                    Ordering::Relaxed,
+                );
+                debug_assert!(prev != Excess::MAX, "overflow excess wrapped for {:?}", o);
+                #[cfg(feature = "s_rc_stats")]
+                if prev == 0 {
+                    self.overflowed.fetch_add(1, Ordering::Relaxed);
                 }
-
-                self.entries
-                    .entry(o)
-                    .or_insert_with(|| AtomicUsize::new(MAX_RC_USIZE))
-                    .fetch_add(1, Ordering::Relaxed)
+                MAX_RC_USIZE + prev as usize
             }
 
             Err(other) => {
@@ -131,57 +160,47 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
         // As in `inc`: one `Result` per logical dec regardless of internal CAS retries.
         match self.rc.dec(o) {
             Ok(prev_rc) => {
-                // Fast: the count was neither 0 nor MAX_REF_COUNT, so the side-metadata
-                // CAS completed the operation without touching the overflow map.
                 #[cfg(feature = "lxr_rc_path_stats")]
                 super::rc_path_stats::dec_fast();
                 prev_rc as usize
             }
 
             Err(MAX_REF_COUNT) => {
-                // Slow: the count is saturated. Counted once here, which covers both outcomes
-                // below -- the entry was decremented, or there was none and the RC table itself
-                // is stepped down. That fallback re-enters `RefCountHelper`, not this method,
-                // so it cannot count a second time.
+                // Counted once here, covering both outcomes below -- the excess was decremented,
+                // or it was already zero and the RC table itself is stepped down. That fallback
+                // re-enters `RefCountHelper`, not this method, so it cannot count a second time.
                 #[cfg(feature = "lxr_rc_path_stats")]
                 super::rc_path_stats::dec_slow();
 
-                let mut prev: Option<usize> = None;
+                let addr = o.to_raw_address();
 
-                if let Some(e) = self.entries.get(&o) {
-                    let mut cur = e.load(Ordering::Relaxed);
-
-                    while cur > MAX_RC_USIZE {
-                        match e.compare_exchange_weak(
-                            cur,
-                            cur - 1,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => {
-                                prev = Some(cur);
-                                break;
+                // A plain `fetch_sub` would underflow when the excess is already 0, which is the
+                // legitimate "true count is exactly MAX_REF_COUNT" case, so the decrement keeps the
+                // CAS retry loop the map version had. `inc` needs no equivalent because increasing
+                // has no boundary to respect.
+                let mut cur: Excess = self.excess(o);
+                while cur > 0 {
+                    match OVERFLOW_RC_TABLE.compare_exchange_atomic::<Excess>(
+                        addr,
+                        cur,
+                        cur - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            #[cfg(feature = "s_rc_stats")]
+                            if cur == 1 {
+                                self.overflowed.fetch_sub(1, Ordering::Relaxed);
                             }
-                            Err(observed) => cur = observed,
+                            return MAX_RC_USIZE + cur as usize;
                         }
+                        Err(observed) => cur = observed,
                     }
                 }
 
-                match prev {
-                    Some(cur) => {
-                        if cur == MAX_RC_USIZE + 1 {
-
-                            let _ = self
-                                .entries
-                                .remove(&o);
-                        }
-                        cur
-                    }
-
-                    // No live entry: the real RC was exactly MAX_REF_COUNT, so step the table down
-                    // from MAX to MAX - 1.
-                    None => self.rc.dec_unconditionally(o) as usize,
-                }
+                // Excess zero: the real RC was exactly MAX_REF_COUNT, so step the table down from
+                // MAX to MAX - 1. `dec` guards MAX as sticky, hence the unconditional variant.
+                self.rc.dec_unconditionally(o) as usize
             }
 
             Err(other) => {
@@ -193,12 +212,8 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
     /// Single-writer [`Self::inc`].
     ///
     /// Identical in behaviour and return value, but reaches the RC table through
-    /// [`RefCountHelper::inc_exclusive`] and mutates the map slot with a plain load/store instead
-    /// of a `fetch_add`.  Both replacements drop an atomic read-modify-write: the table access
-    /// stops being a CAS retry loop, and the slot update stops being a `lock xadd`.
-    ///
-    /// The DashMap shard locking is unchanged — the map's *structure* is still shared, so insert
-    /// and remove still take the shard write lock.  Only the value RMW is relaxed.
+    /// [`RefCountHelper::inc_exclusive`] and updates the excess with a plain load/store instead of
+    /// a `fetch_add`. Both replacements drop an atomic read-modify-write.
     ///
     /// # Safety
     ///
@@ -209,44 +224,37 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
         let prev = unsafe { self.rc.inc_exclusive(o) };
 
         if prev != MAX_REF_COUNT {
-            // Fast: the count was below MAX_REF_COUNT and the table store completed the
-            // operation. The overflow map was never consulted. `prev != MAX` is the exclusive
-            // spelling of `inc`'s `Ok(prev)`.
             #[cfg(feature = "lxr_rc_path_stats")]
             super::rc_path_stats::inc_fast();
             return prev as usize;
         }
 
-        // Slow: saturated. Counted before the map is touched so the hit and insert cases share it.
         #[cfg(feature = "lxr_rc_path_stats")]
         super::rc_path_stats::inc_slow();
 
-        // ONE lookup, not two. `inc` probes with `get` first so the common hit takes only a
-        // shard *read* lock, paying a second hash+probe when it has to fall through to `entry`.
-        // With no contention a read lock and a write lock cost the same single atomic on the lock
-        // word, so that trade stops paying: take the write lock once and handle both cases under
-        // it.
-        match self.entries.entry(o) {
-            Entry::Occupied(mut e) => {
-                let cur = e.get().load(Ordering::Relaxed);
-                e.get_mut().store(cur + 1, Ordering::Relaxed);
-                cur
-            }
-            Entry::Vacant(e) => {
-                // First overflow for this address: the table is saturated, so the real count is
-                // MAX_REF_COUNT and this inc takes it to MAX + 1.
-                e.insert(AtomicUsize::new(MAX_RC_USIZE + 1));
-                MAX_RC_USIZE
-            }
+        let addr = o.to_raw_address();
+        let cur: Excess = self.excess(o);
+        debug_assert!(cur != Excess::MAX, "overflow excess wrapped for {:?}", o);
+        OVERFLOW_RC_TABLE.store_atomic::<Excess>(addr, cur + 1, Ordering::Relaxed);
+        #[cfg(feature = "s_rc_stats")]
+        if cur == 0 {
+            self.overflowed.fetch_add(1, Ordering::Relaxed);
         }
+        MAX_RC_USIZE + cur as usize
     }
 
     /// Single-writer [`Self::dec`].
     ///
     /// Identical in behaviour and return value, but reaches the RC table through
     /// [`RefCountHelper::dec_exclusive`] / [`RefCountHelper::dec_unconditionally_exclusive`], and
-    /// walks the map slot down with a load/compare/store instead of a `compare_exchange_weak`
-    /// retry loop.  Under exclusive access the CAS can never fail, so the loop is dead weight.
+    /// walks the excess down with a load/compare/store instead of a `compare_exchange` retry loop.
+    /// Under exclusive access the CAS can never fail, so the loop is dead weight.
+    ///
+    /// The old map version carried a `debug_assert!(cur > MAX_RC_USIZE)` here, guarding against a
+    /// transient `MAX_REF_COUNT` slot left behind by the concurrent `dec` between its CAS and its
+    /// `remove`. **That state cannot exist under the excess encoding** -- there is no insertion or
+    /// removal to be caught between -- so the assertion is not merely unnecessary, it is
+    /// unexpressible. Excess 0 is the ordinary "not overflowed" case, handled below.
     ///
     /// # Safety
     ///
@@ -259,71 +267,29 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
             // 0, so reproduce the panic rather than silently returning it as a count.
             debug_assert!(prev != 0, "unexpected RC decrement error: {:?}", prev);
 
-            // Fast: the count was neither 0 nor MAX_REF_COUNT, so the table store completed the
-            // operation without touching the overflow map.
             #[cfg(feature = "lxr_rc_path_stats")]
             super::rc_path_stats::dec_fast();
             return prev as usize;
         }
 
-        // Slow: saturated. Counted once here, covering both outcomes below.
         #[cfg(feature = "lxr_rc_path_stats")]
         super::rc_path_stats::dec_slow();
 
-        // ONE lookup and one lock acquisition, where `dec` needs two: it decrements under a shard
-        // read lock, drops that guard, then re-hashes and re-probes to `remove` under the write
-        // lock, because DashMap's shard lock is not reentrant. Holding the write lock across both
-        // steps is only sound because nothing else can be touching the map.
-        //
-        // That fusion also removes the transient `MAX_REF_COUNT` slot the module header describes:
-        // on this path the decrement to MAX and the removal are a single step, so no other thread
-        // can observe the in-between state. The concurrent `dec` above can still produce one, but
-        // it cannot survive into this method -- see the assertion below, which enforces that
-        // rather than tolerating it.
-        match self.entries.entry(o) {
-            Entry::Occupied(mut e) => {
-                let cur = e.get().load(Ordering::Relaxed);
+        let addr = o.to_raw_address();
+        let cur: Excess = self.excess(o);
 
-                // An occupied slot must be strictly above MAX_REF_COUNT here, so unlike `dec`
-                // there is no "treat MAX as absent" fallback -- reaching that state means an
-                // assumption this method rests on has already broken.
-                //
-                // A slot at exactly MAX_REF_COUNT is the transient state the concurrent `dec`
-                // passes through between its CAS (`MAX + 1 -> MAX`) and its `remove`, both in one
-                // thread's straight-line code with no early return between them.  It therefore
-                // cannot outlive the decrement phase, and that phase fully drains before
-                // `CycleCollector` is scheduled.  `inc` never publishes one either: its
-                // `or_insert_with` holds the shard write guard across both the insert and the
-                // `fetch_add`.
-                //
-                // If this fires, that ordering no longer holds -- most likely decrement work has
-                // been allowed to overlap cycle collection.  Do **not** repair it by restoring a
-                // fallback: the exclusivity this whole method assumes would already have been
-                // violated, so the RC table is suspect too, not just this slot.
-                debug_assert!(
-                    cur > MAX_RC_USIZE,
-                    "overflow slot for {:?} holds {}, expected > MAX_REF_COUNT ({}): a transient \
-                     slot outlived the decrement phase, so RC work is no longer exclusive to the \
-                     cycle collector",
-                    o,
-                    cur,
-                    MAX_RC_USIZE
-                );
-
-                if cur == MAX_RC_USIZE + 1 {
-                    // Would land on MAX_REF_COUNT, i.e. "no longer overflowed". Drop the slot
-                    // instead of storing the sentinel.
-                    e.remove();
-                } else {
-                    e.get_mut().store(cur - 1, Ordering::Relaxed);
-                }
-                cur
+        if cur > 0 {
+            OVERFLOW_RC_TABLE.store_atomic::<Excess>(addr, cur - 1, Ordering::Relaxed);
+            #[cfg(feature = "s_rc_stats")]
+            if cur == 1 {
+                self.overflowed.fetch_sub(1, Ordering::Relaxed);
             }
-
-            // No entry: the real RC was exactly MAX_REF_COUNT, so step the table down from MAX to
-            // MAX - 1. `dec_exclusive` will not do this -- it guards MAX as sticky -- so this
+            MAX_RC_USIZE + cur as usize
+        } else {
+            // Excess zero: the real RC was exactly MAX_REF_COUNT, so step the table down from MAX
+            // to MAX - 1. `dec_exclusive` will not do this -- it guards MAX as sticky -- so this
             // needs the unconditional variant, exactly as `dec` needs `dec_unconditionally`.
-            Entry::Vacant(_) => unsafe { self.rc.dec_unconditionally_exclusive(o) as usize },
+            unsafe { self.rc.dec_unconditionally_exclusive(o) as usize }
         }
     }
 
@@ -338,30 +304,26 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
             return table_rc;
         }
 
-        // Slow: the count is saturated, so the map must be consulted to tell MAX_REF_COUNT from
-        // anything above it. Counted before the lookup, so the hit and the miss share it. A slot
-        // still holding MAX_REF_COUNT returns the same answer as a miss.
+        // Slow: saturated, so the excess must be added to tell MAX_REF_COUNT from anything above
+        // it. An excess of 0 returns `table_rc` unchanged, which is what a map miss used to do.
         #[cfg(feature = "lxr_rc_path_stats")]
         super::rc_path_stats::get_slow();
 
-        self.entries
-            .get(&o)
-            .map(|e| e.load(Ordering::Relaxed))
-            .unwrap_or(table_rc)
+        MAX_RC_USIZE + self.excess(o) as usize
     }
 
     pub fn is_alive(&self, o: ObjectReference) -> bool {
         self.rc.count(o) as usize > RC_DEATH_TRANSIENT
     }
 
-    /// Slots currently held: objects that are currently overflowed, plus any slot transiently left
-    /// at `MAX_REF_COUNT` by `dec` (see the encoding note above).
+    /// Objects whose excess is currently non-zero, i.e. currently overflowed.
+    ///
+    /// **Only exists under `s_rc_stats`**, along with the counter behind it; its one caller
+    /// (`ProcessIncs`'s `inc.overflow_peak` flush) is gated the same way. The old `capacity()` had
+    /// no meaning for a side table and is gone -- its only caller was a commented-out `println` in
+    /// `gc_work.rs`.
+    #[cfg(feature = "s_rc_stats")]
     pub fn num_entries(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Slots the map has room for before it grows, summed across shards.
-    pub fn capacity(&self) -> usize {
-        self.entries.capacity()
+        self.overflowed.load(Ordering::Relaxed)
     }
 }

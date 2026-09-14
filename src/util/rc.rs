@@ -84,6 +84,11 @@ pub const RC_STRADDLE_LINES: SideMetadataSpec =
     crate::util::metadata::side_metadata::spec_defs::RC_STRADDLE_LINES;
 
 pub const RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::RC_TABLE;
+/// Exact counts for objects whose `RC_TABLE` entry has saturated at `MAX_REF_COUNT`.
+/// See the spec's own comment in `spec_defs.rs` for the encoding; 0 means "exactly
+/// `MAX_REF_COUNT`", which is also the zero-initialised state.
+pub const OVERFLOW_RC_TABLE: SideMetadataSpec =
+    crate::util::metadata::side_metadata::spec_defs::OVERFLOW_RC_TABLE;
 
 pub const STRONG_RC_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::STRONG_RC_TABLE;
 pub const OBJ_COLOR_TABLE: SideMetadataSpec = crate::util::metadata::side_metadata::spec_defs::OBJ_COLOR_TABLE;

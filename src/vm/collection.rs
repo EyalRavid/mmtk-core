@@ -117,6 +117,22 @@ pub trait Collection<VM: VMBinding> {
         vec![]
     }
 
+    /// The head of `java.lang.ref.Finalizer.unfinalized`, or `None` when the VM has no
+    /// finalization (or the Finalizer class is not yet initialized).
+    ///
+    /// This static field is the only reference into the unfinalized chain from outside it. The
+    /// cycle collector subtracts that one edge, seeds the head as a candidate, and lets ordinary
+    /// trial deletion walk the chain -- so every `Finalizer.referent` edge is subtracted exactly
+    /// once, by `mark`, instead of once by hand and once by the traversal.
+    ///
+    /// NOT the first pair from [`Self::finalizer_candidates`]: that walk skips finalizers already
+    /// handed to Java, so its first entry need not be the head.
+    ///
+    /// STOP-THE-WORLD ONLY.
+    fn finalizer_list_head() -> Option<ObjectReference> {
+        None
+    }
+
     /// Hand these `Finalizer` objects to the VM's pending-reference list, so the VM's own
     /// finalizer thread runs `finalize()` on their referents -- outside any GC pause.
     ///

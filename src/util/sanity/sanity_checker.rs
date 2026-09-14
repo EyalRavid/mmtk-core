@@ -157,8 +157,15 @@ impl<P: Plan> SanityPrepare<P> {
     }
 
     fn update_mark_state() {
+        // Wraps at 15, NOT 255, because `SANITY_MARK_BITS` is a 4-bit side-metadata spec -- see
+        // its comment in `spec_defs.rs` for why it was narrowed and why 4 bits is sufficient.
+        //
+        // This bound is NOT cosmetic. A `MARK_STATE` of 16 or more truncates to a different value
+        // when stored into 4 bits, so `attempt_mark`'s stored epoch would never equal the epoch
+        // every reader compares against: every object would read as unmarked, every object would
+        // accumulate dead cycles, and sanity would assert on a healthy heap.
         let mut mark_state = MARK_STATE.load(Ordering::SeqCst);
-        if mark_state == 0 || mark_state == 255 {
+        if mark_state == 0 || mark_state == 15 {
             mark_state = 1;
         } else {
             mark_state += 1;

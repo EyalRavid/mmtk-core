@@ -63,10 +63,59 @@ define_side_metadata_specs!(
     SFT_DENSE_CHUNK_MAP_INDEX   = (global: true, log_num_of_bits: 3, log_bytes_in_region: LOG_BYTES_IN_CHUNK),
     // Reference counts
     RC_TABLE = (global: true, log_num_of_bits: crate::util::rc::LOG_REF_COUNT_BITS, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
+    // Exact reference counts for objects whose `RC_TABLE` entry has SATURATED at `MAX_REF_COUNT`.
+    //
+    // WHY THIS EXISTS.  The fork has no mark-and-sweep, so it cannot let a saturated count stick
+    // the way the baseline does -- nothing would ever recover the object.  It must therefore track
+    // the exact count of every saturated object, and `FINDINGS.md` 20 measures what that costs:
+    // 99.1% of `biojava`'s increments reach the overflow structure, and today that structure is a
+    // `DashMap` (hash + shard RwLock + probe + fetch_add per operation).
+    //
+    // WHY 32 BITS.  The true counts are large -- at least 2.58M observed on `biojava`, and only 43
+    // objects are ever saturated.  16 bits (65_535) does not reach; 32 bits does.
+    //
+    // WHY A SEPARATE SPARSE TABLE RATHER THAN A WIDER `RC_TABLE`.  `RC_TABLE` is DENSE -- every
+    // object has an entry -- so widening it to 32 bits costs heap/4 of committed memory.  This
+    // table is written only for objects that actually saturate, and side metadata is demand-zero
+    // mmapped (`memory.rs::dzmmap`, no MAP_POPULATE; the explicit zeroing is
+    // `cfg(not(target_os = "linux"))`) at 4 KiB pages (`MmapStrategy::SIDE_METADATA` is
+    // `HugePageSupport::No`).  So an untouched page costs address space and NO RSS: 43 scattered
+    // objects commit at most 43 pages, ~172 KiB, against heap/4 for the dense alternative.
+    //
+    // ENCODING, chosen to mirror the `DashMap` it replaces exactly:
+    //     consulted ONLY when `RC_TABLE[o] == MAX_REF_COUNT`
+    //     0      the true count is EXACTLY `MAX_REF_COUNT`   (the map's "no live entry" case)
+    //     n > 0  the true count is `n`, and `n > MAX_REF_COUNT`
+    // Zero is therefore the correct initial state and needs no explicit initialisation -- it is
+    // what demand-zero mmap already gives.  An increment from the 0 state stores
+    // `MAX_REF_COUNT + 1`, mirroring `or_insert_with(MAX_RC_USIZE)` followed by `fetch_add(1)`;
+    // a decrement that reaches `MAX_REF_COUNT` stores 0, mirroring `entries.remove`.
+    //
+    // ⚠ BUDGET.  At 1/4 of the address space this is the LARGEST global spec in the system, and
+    // the global budget (< 1/2, `LOG_GLOBAL_SIDE_METADATA_WORST_CASE_RATIO`) is NOT enforced
+    // anywhere -- `LOG_MAX_GLOBAL_SIDE_METADATA_SIZE` has exactly one use, computing where LOCAL
+    // metadata starts.  With this spec the global total is 0.484 of 0.500.  Gating the
+    // `SANITY_*`/`GRAPH_*` declarations behind their features frees 0.102 and takes it to 0.383.
+    OVERFLOW_RC_TABLE = (global: true, log_num_of_bits: 5, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
     // Record defrag state for immix blocks
     IX_BLOCK_DEFRAG = (global: true, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
     // Mark table for sanity GC
-    SANITY_MARK_BITS = (global: true, log_num_of_bits: 3, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
+    // 4 bits, NOT 8. This holds the sanity mark EPOCH (`sanity_checker::MARK_STATE`), so its
+    // width sets how many sanity GCs pass before a stale mark aliases a current one. 8 bits cost
+    // 1/16 of the address space and pushed the global budget to 0.5000305 -- over the hard 1/2
+    // limit by 0.0000305, which is the entire size of `IX_BLOCK_DEFRAG`. At 4 bits it costs 1/32
+    // and the total is 0.4687805.
+    //
+    // WHY 4 BITS IS ENOUGH, and what it is coupled to: the epoch now wraps every 15 sanity GCs,
+    // so an object last marked exactly 15 epochs ago reads as current. That can never mask a
+    // leak, because the only consumer of the comparison is the `SANITY_DEAD_CYCLE_COUNT` check,
+    // which asserts at **5** consecutive unmarked cycles -- and an object must pass distances
+    // 1..14 to reach 15, so the assert has already fired long before the wrap can alias.
+    //
+    // THIS COUPLES TWO OTHERWISE UNRELATED CONSTANTS. If that 5-cycle threshold is ever raised
+    // above 15, or `MARK_STATE`'s wrap in `SanityPrepare::update_mark_state` stops matching this
+    // width, sanity starts lying. Both are commented in kind.
+    SANITY_MARK_BITS = (global: true, log_num_of_bits: 2, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
     //Cycle collection colors table
     OBJ_COLOR_TABLE = (global: true, log_num_of_bits: 1, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
 
@@ -77,6 +126,31 @@ define_side_metadata_specs!(
     SANITY_DEAD_CYCLE_COUNT = (global: true, log_num_of_bits: 2, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
 
     GRAPH_REPORT_MARK = (global: true, log_num_of_bits: 0, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
+);
+
+/// **The global side-metadata budget, enforced.**
+///
+/// Global specs are laid out sequentially from `GLOBAL_SIDE_METADATA_BASE_ADDRESS`, and
+/// `LOCAL_SIDE_METADATA_BASE_ADDRESS` begins immediately after the region reserved for them
+/// (`GLOBAL_BASE + 2^LOG_MAX_GLOBAL_SIDE_METADATA_SIZE`). If the global specs ever sum past that
+/// point, the last of them silently overlaps LOCAL metadata: two unrelated specs writing the same
+/// addresses, which is heap corruption with no error anywhere.
+///
+/// Until 2026-09-14 nothing checked this. `LOG_MAX_GLOBAL_SIDE_METADATA_SIZE` had exactly one use
+/// in the tree -- computing where local metadata starts -- and the constants file still carries a
+/// `TODO - we should check this limit somewhere` for the local equivalent.
+///
+/// This matters now because `OVERFLOW_RC_TABLE` is 1/4 of the address space, the largest global
+/// spec in the system: the total goes from 0.234 to 0.484 of a 0.500 budget, leaving 3.1%.
+/// Gating the `SANITY_*` / `GRAPH_*` declarations behind their features would free 0.102.
+const _: () = assert!(
+    LAST_GLOBAL_SIDE_METADATA_SPEC
+        .upper_bound_address_for_contiguous()
+        .as_usize()
+        <= crate::util::metadata::side_metadata::constants::LOCAL_SIDE_METADATA_BASE_ADDRESS
+            .as_usize(),
+    "global side metadata specs exceed LOG_MAX_GLOBAL_SIDE_METADATA_SIZE and would overlap local \
+     side metadata -- remove a spec, narrow one, or cfg-gate the ones whose features are off"
 );
 
 // This defines all LOCAL side metadata used by mmtk-core.
