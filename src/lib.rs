@@ -400,6 +400,34 @@ struct Counters {
     pub survival_triggerd: AtomicUsize,
     pub overflow_triggerd: AtomicUsize,
     pub rc_during_satb: AtomicUsize,
+    // ---- cycle-collector and barrier instrumentation, gated on `s_rc_stats` -----------------
+    //
+    // The fields are UNCONDITIONAL and always printed; only the increments are feature-gated, the
+    // same shape `yield_nanos` uses. `running-parser` is schema-agnostic, so the columns appear in
+    // `parsed.csv` on every run and read 0 when the feature is off -- which `scripts/lxr/load.py`
+    // then classifies as feature-gated zeros rather than as missing data.
+    //
+    // These replace `CycleCollectorStats::log_to_file`, which appended
+    // `cycle_collector_stats.csv` to the JVM's working directory: unattributed under running-ng,
+    // invisible to the parser, and with no per-benchmark or per-invocation identity.
+    // `EVALUATION_PLAN.md` E2(a).
+    pub cc_raw_candidates: AtomicUsize,
+    pub cc_candidates_after_filter: AtomicUsize,
+    pub cc_objects_in_mark: AtomicUsize,
+    pub cc_objects_in_scan: AtomicUsize,
+    pub cc_objects_in_scan_black: AtomicUsize,
+    pub cc_objects_in_collect: AtomicUsize,
+    /// High-water mark, not a sum: `fetch_max`, like `max_reserved_pages`.
+    pub cc_satb_map_peak: AtomicUsize,
+    pub cc_satb_reads: AtomicUsize,
+    // ---- write-barrier instrumentation ------------------------------------------------------
+    //
+    // These are the two numbers that decide whether the barrier's SATB path is worth restructuring
+    // (`~/mmtk/OPTIMIZATION_AUDIT.md` B.2). Accumulated NON-ATOMICALLY per mutator and flushed at
+    // the barrier's existing flush points, so the mutator hot path gains no atomic and
+    // `time.other` is not contaminated -- `EVALUATION_PLAN.md` §6 rule 5.
+    pub barrier_slow_in_cc: AtomicUsize,
+    pub barrier_satb_inserts: AtomicUsize,
 }
 
 macro_rules! counter_print_keys_and_values {
@@ -433,6 +461,16 @@ impl Counters {
         "survival_triggerd": self.survival_triggerd.load(Ordering::SeqCst),
         "overflow_triggerd": self.overflow_triggerd.load(Ordering::SeqCst),
         "rc_during_satb": self.rc_during_satb.load(Ordering::SeqCst),
+        "cc.raw_candidates": self.cc_raw_candidates.load(Ordering::SeqCst),
+        "cc.candidates_after_filter": self.cc_candidates_after_filter.load(Ordering::SeqCst),
+        "cc.objects_in_mark": self.cc_objects_in_mark.load(Ordering::SeqCst),
+        "cc.objects_in_scan": self.cc_objects_in_scan.load(Ordering::SeqCst),
+        "cc.objects_in_scan_black": self.cc_objects_in_scan_black.load(Ordering::SeqCst),
+        "cc.objects_in_collect": self.cc_objects_in_collect.load(Ordering::SeqCst),
+        "cc.satb_map_peak": self.cc_satb_map_peak.load(Ordering::SeqCst),
+        "cc.satb_reads": self.cc_satb_reads.load(Ordering::SeqCst),
+        "barrier.slow_in_cc": self.barrier_slow_in_cc.load(Ordering::SeqCst),
+        "barrier.satb_inserts": self.barrier_satb_inserts.load(Ordering::SeqCst),
     }
 }
 

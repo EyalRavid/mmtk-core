@@ -42,6 +42,17 @@ pub struct LXRFieldBarrierSemantics<VM: VMBinding> {
     lxr: &'static LXR<VM>,
     #[cfg(feature = "lxr_precise_incs_counter")]
     stat: crate::LocalRCStat,
+    /// Barrier slow paths taken while the cycle collector is running, and SATB inserts performed.
+    ///
+    /// PLAIN `usize`, deliberately: these live in the per-mutator barrier struct and are
+    /// accumulated with no atomic at all, then folded into `Counters` at the barrier's existing
+    /// flush points. An atomic here would sit on the mutator's hot path and contaminate
+    /// `time.other`, which is the very quantity these counters exist to explain
+    /// (`EVALUATION_PLAN.md` §6 rule 5). `~/mmtk/OPTIMIZATION_AUDIT.md` B.2.
+    #[cfg(feature = "s_rc_stats")]
+    slow_in_cc: usize,
+    #[cfg(feature = "s_rc_stats")]
+    satb_inserts: usize,
 }
 
 impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
@@ -59,6 +70,10 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             lxr: mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap(),
             #[cfg(feature = "lxr_precise_incs_counter")]
             stat: crate::LocalRCStat::default(),
+            #[cfg(feature = "s_rc_stats")]
+            slow_in_cc: 0,
+            #[cfg(feature = "s_rc_stats")]
+            satb_inserts: 0,
         }
     }
 
@@ -182,12 +197,18 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         }
         //self.lxr.satb_map.insert(slot, old);
         if (self.lxr.in_cycle_collection.load(Ordering::SeqCst) == true) {
+            #[cfg(feature = "s_rc_stats")]
+            { self.slow_in_cc += 1; }
             if let Some(obj) = _src {
                 if OBJ_COLOR_TABLE.load_atomic::<u8>(obj.to_raw_address(),Ordering::SeqCst) >= BLACK_IN_STACK {
+                    #[cfg(feature = "s_rc_stats")]
+                    { self.satb_inserts += 1; }
                     self.lxr.satb_map.insert(slot, old);
                 }
          }
             else {
+                #[cfg(feature = "s_rc_stats")]
+                { self.satb_inserts += 1; }
                 self.lxr.satb_map.insert(slot, old);
             }
         }
@@ -258,6 +279,23 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         }
     }
 
+    /// Fold the per-mutator counters into `Counters`. Called from `flush`, i.e. at the same points
+    /// the barrier already drains its inc/dec buffers -- a handful of atomics per flush rather
+    /// than one per barrier hit.
+    #[cfg(feature = "s_rc_stats")]
+    #[cold]
+    fn flush_barrier_stats(&mut self) {
+        if self.slow_in_cc != 0 || self.satb_inserts != 0 {
+            let c = crate::counters();
+            c.barrier_slow_in_cc
+                .fetch_add(self.slow_in_cc, Ordering::Relaxed);
+            c.barrier_satb_inserts
+                .fetch_add(self.satb_inserts, Ordering::Relaxed);
+            self.slow_in_cc = 0;
+            self.satb_inserts = 0;
+        }
+    }
+
     #[cold]
     fn flush_weak_refs(&mut self) {
         if !self.refs.is_empty() {
@@ -274,6 +312,8 @@ impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
 
     #[cold]
     fn flush(&mut self) {
+        #[cfg(feature = "s_rc_stats")]
+        self.flush_barrier_stats();
         self.flush_weak_refs();
         self.flush_incs();
         self.flush_decs_and_satb();

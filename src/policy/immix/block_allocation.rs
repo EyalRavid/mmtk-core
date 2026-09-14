@@ -84,14 +84,20 @@ impl<VM: VMBinding> BlockAllocation<VM> {
         {
             block.initialize_field_unlog_table_as_unlogged::<VM>();
         }
-        // Initialize mark table
+        // MARK TABLE: deliberately not initialized.
+        //
+        // This used to clear the block's mark table on every clean block -- `bzero` of 256 B of
+        // side metadata per 32 KiB block, plus the two atomic loads in
+        // `cm_in_progress_or_final_mark()` to choose between two branches of which one is
+        // unreachable.  The source carried `// TODO: Performance? Is this necessary?`; with no
+        // tracing mark-and-sweep the answer is no.
+        //
+        // Nothing in this fork reads `LOCAL_MARK_BIT_SPEC`: `is_live` answers from the RC count,
+        // `SweepDeadCycles` is scheduled only from `Pause::Full`/`FinalMark`, the concurrent-mark
+        // paths never run, and `is_reachable` no longer consults it either (see B.4).  Not
+        // touching these pages also means they are never faulted in -- `heap/128` of RSS that is
+        // now never allocated.  `~/mmtk/OPTIMIZATION_AUDIT.md` B.1.
         if self.space().rc_enabled {
-            if self.cm_in_progress_or_final_mark() {
-                block.initialize_mark_table_as_marked::<VM>();
-            } else {
-                // TODO: Performance? Is this necessary?
-                block.clear_mark_table::<VM>();
-            }
             if !copy {
                 self.num_nursery_blocks.fetch_add(1, Ordering::Relaxed);
                 block.clear_field_unlog_table::<VM>();

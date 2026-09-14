@@ -171,11 +171,22 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
 
     fn is_reachable(&self, object: ObjectReference) -> bool {
         if self.rc_enabled {
+            // LIVENESS IS THE REFERENCE COUNT.  This used to read
+            // `self.is_marked(x) && self.rc.count(x) > 0`, which was correct only while a tracing
+            // mark-and-sweep ran: with no tracing nothing ever sets a mark bit, so the `is_marked`
+            // conjunct made the whole predicate a constant `false` for every object.
+            //
+            // It was harmless only because nothing calls it today -- every RC scan passes
+            // `RefScanPolicy::Follow`, which disables reference discovery
+            // (`util/address.rs`), so the binding's `discover_reference` is never entered.
+            // The moment weak/soft/phantom processing is turned on, that caller returns and a
+            // constant-false reachability test makes it discover EVERY reference, including
+            // plainly live ones.  See `~/mmtk/OPTIMIZATION_AUDIT.md` B.4.
             if object_forwarding::is_forwarded::<VM>(object) {
                 let forwarded = object_forwarding::read_forwarding_pointer::<VM>(object);
-                return self.is_marked(forwarded) && self.rc.count(forwarded) > 0;
+                return self.rc.count(forwarded) > 0;
             }
-            return self.is_marked(object) && self.rc.count(object) > 0;
+            return self.rc.count(object) > 0;
         } else {
             self.is_live(object)
         }
@@ -1529,11 +1540,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         crate::plan::lxr::SURVIVAL_RATIO_PREDICTOR
             .reused_alloc_vol
             .fetch_add(num_lines << Line::LOG_BYTES, Ordering::SeqCst);
-        if self.block_allocation.cm_in_progress_or_final_mark() {
-            Line::initialize_mark_table_as_marked::<VM>(start..end);
-        } else {
-            // Line::clear_mark_table::<VM>(start..end);
-        }
+        // Mark-table maintenance removed: nothing in this fork reads the Immix mark bit, and
+        // `cm_in_progress_or_final_mark()` is unreachable-true here (no `InitialMark`/`FinalMark`
+        // pause is ever scheduled).  `OPTIMIZATION_AUDIT.md` B.1.
         // if !_copy {
         //     println!("reuse {:?} copy={}", start..end, copy);
         // }

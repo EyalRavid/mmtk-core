@@ -201,6 +201,9 @@ impl Line {
         }
     }
 
+    /// Unused in this fork — see `Block::initialize_mark_table_as_marked` and
+    /// `~/mmtk/OPTIMIZATION_AUDIT.md` B.1. Kept as the baseline's allocate-black mechanism.
+    #[allow(dead_code)]
     pub(super) fn initialize_mark_table_as_marked<VM: VMBinding>(lines: Range<Line>) {
         let meta = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
         let start: *mut u8 = address_to_meta_address(&meta, lines.start.start()).to_mut_ptr();

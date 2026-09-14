@@ -92,39 +92,32 @@ struct CycleCollectorStats {
 
 #[cfg(feature = "s_rc_stats")]
 impl CycleCollectorStats {
-    const LOG_FILE: &'static str = "cycle_collector_stats.csv";
-
-    fn log_to_file(&self) {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-
-        let needs_header = !std::path::Path::new(Self::LOG_FILE).exists()
-            || std::fs::metadata(Self::LOG_FILE).map(|m| m.len() == 0).unwrap_or(true);
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(Self::LOG_FILE)
-            .expect("failed to open cycle collector stats file");
-
-        if needs_header {
-            writeln!(file,
-                "raw_cycle_candidates,candidates_after_filter,\
-                 objects_in_mark,objects_in_scan,objects_in_scan_black,\
-                 objects_in_collect,satb_map_size,satb_reads"
-            ).unwrap();
-        }
-
-        writeln!(file, "{},{},{},{},{},{},{},{}",
-            self.raw_cycle_candidates,
-            self.candidates_after_filter,
-            self.objects_in_mark.get(),
-            self.objects_in_scan.get(),
-            self.objects_in_scan_black.get(),
-            self.objects_in_collect.get(),
-            self.satb_map_size,
-            self.satb_reads.get(),
-        ).unwrap();
+    /// Publish this cycle collection's counts into the global `Counters`.
+    ///
+    /// Replaces the old CSV sink, which appended `cycle_collector_stats.csv` to the JVM's working
+    /// directory. Under running-ng that file landed unattributed -- not per benchmark, not per
+    /// invocation -- and `running-parser` never saw it. `Counters` is reset at `harness_begin`
+    /// and printed at `harness_end` into the MMTk statistics block, so these flow through the
+    /// schema-agnostic parser, `load.py`, CI computation and `compare` with no change anywhere
+    /// downstream. `EVALUATION_PLAN.md` E2(a).
+    ///
+    /// Called once per `do_work`, so the atomics run a handful of times per GC rather than once
+    /// per object: the per-object accumulation is the non-atomic `Cell`s above.
+    fn flush_to_counters(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = crate::counters();
+        c.cc_raw_candidates.fetch_add(self.raw_cycle_candidates, Relaxed);
+        c.cc_candidates_after_filter
+            .fetch_add(self.candidates_after_filter, Relaxed);
+        c.cc_objects_in_mark.fetch_add(self.objects_in_mark.get(), Relaxed);
+        c.cc_objects_in_scan.fetch_add(self.objects_in_scan.get(), Relaxed);
+        c.cc_objects_in_scan_black
+            .fetch_add(self.objects_in_scan_black.get(), Relaxed);
+        c.cc_objects_in_collect
+            .fetch_add(self.objects_in_collect.get(), Relaxed);
+        c.cc_satb_reads.fetch_add(self.satb_reads.get(), Relaxed);
+        // A level, not a sum: the peak SATB map size across the run.
+        c.cc_satb_map_peak.fetch_max(self.satb_map_size, Relaxed);
     }
 }
 
@@ -348,7 +341,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
         #[cfg(feature = "s_rc_stats")]
         {
             self.stats.satb_map_size = lxr.satb_map.len();
-            self.stats.log_to_file();
+            self.stats.flush_to_counters();
         }
     }
 
@@ -624,7 +617,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
         #[cfg(feature = "s_rc_stats")]
         {
             self.stats.satb_map_size = lxr.satb_map.len();
-            self.stats.log_to_file();
+            self.stats.flush_to_counters();
         }
     }
 

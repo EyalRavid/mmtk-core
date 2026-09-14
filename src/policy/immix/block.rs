@@ -552,12 +552,24 @@ impl Block {
     }
 
     #[allow(unused)]
+    /// Unused in this fork: nothing reads `LOCAL_MARK_BIT_SPEC` any more, so the mark table is no
+    /// longer initialized on the clean-block or line-reuse paths (`OPTIMIZATION_AUDIT.md` B.1).
+    /// Kept rather than deleted because it is the baseline's allocate-black mechanism and would be
+    /// needed again by anything that reintroduces tracing; `#[allow(dead_code)]` rather than a
+    /// `cfg` so it keeps compiling and cannot rot.
+    #[allow(dead_code)]
     pub(super) fn clear_mark_table<VM: VMBinding>(&self) {
         VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
             .extract_side_spec()
             .bzero_metadata(self.start(), Self::BYTES);
     }
 
+    /// Unused in this fork: nothing reads `LOCAL_MARK_BIT_SPEC` any more, so the mark table is no
+    /// longer initialized on the clean-block or line-reuse paths (`OPTIMIZATION_AUDIT.md` B.1).
+    /// Kept rather than deleted because it is the baseline's allocate-black mechanism and would be
+    /// needed again by anything that reintroduces tracing; `#[allow(dead_code)]` rather than a
+    /// `cfg` so it keeps compiling and cannot rot.
+    #[allow(dead_code)]
     pub(super) fn initialize_mark_table_as_marked<VM: VMBinding>(&self) {
         let meta = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
         let start: *mut u8 = address_to_meta_address(&meta, self.start()).to_mut_ptr();
