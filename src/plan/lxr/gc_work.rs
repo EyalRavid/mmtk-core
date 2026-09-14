@@ -644,15 +644,27 @@ impl<VM: VMBinding> CycleCollector<VM>{
         }
         else{
             debug_assert!(self.get_slot_logging_state(slot) != Self::UNLOGGED_VALUE);
-            let satb_child = loop {
+            // The increment is INSIDE the loop, at the return.
+            //
+            // It used to sit after the loop, where it was unreachable: the loop `return`s out of
+            // the function on success and has no `break`, so control never reached the line below
+            // it. `cc.satb_reads` therefore read 0 no matter how much this path ran -- confirmed on
+            // `pmd` and `biojava` (`~/prod-ae/bundle/FINDINGS.md` 19), where it was 0 beside a
+            // non-zero `barrier.satb_inserts`, i.e. entries were being written and never counted
+            // as read.
+            //
+            // NOTE this counts SUCCESSFUL READS, one per call, which is what the name says. It does
+            // NOT count spin iterations, so it still cannot answer
+            // `~/mmtk/CYCLE_COLLECTOR_PERF_REVIEW.md` 4(a)'s question -- whether this spin ever
+            // actually spins. That needs a separate counter incremented in the failure arm.
+            loop {
                 if let Some(m) = lxr.satb_map.get(&slot).map(|v| *v) {
+                    #[cfg(feature = "s_rc_stats")]
+                    { self.stats.satb_reads.set(self.stats.satb_reads.get() + 1); }
                     return m;
                 }
                 std::hint::spin_loop();
-            };
-            #[cfg(feature = "s_rc_stats")]
-            { self.stats.satb_reads.set(self.stats.satb_reads.get() + 1); }
-            return satb_child;
+            }
         }
     }
 

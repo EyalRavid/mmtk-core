@@ -65,6 +65,35 @@ pub struct ProcessIncs<VM: VMBinding, const KIND: EdgeKind> {
     inc_objs: usize,
     #[cfg(feature = "measure_rc_rate")]
     copy_objs: usize,
+    /// Target-RC histogram, accumulated NON-atomically per packet and flushed once at the end
+    /// of `do_work` -- the same shape `CycleCollectorStats` and the barrier counters use, so the
+    /// atomics run once per packet rather than once per edge.  See `crate::Counters`.
+    #[cfg(feature = "s_rc_stats")]
+    tgt_rc2: usize,
+    #[cfg(feature = "s_rc_stats")]
+    tgt_rc3: usize,
+    #[cfg(feature = "s_rc_stats")]
+    tgt_rc4p: usize,
+    #[cfg(feature = "s_rc_stats")]
+    tgt_sat: usize,
+    /// Would a WIDER RC field remove this traffic?  Bucketed on the TRUE count returned by
+    /// `rc_with_overflow::inc` -- on the slow path that return value is the overflow map's own
+    /// entry, which IS the real reference count.
+    ///
+    /// `Cell` rather than plain fields because `ProcessIncs::inc` takes `&self`.  Accumulated
+    /// per packet and flushed once in `do_work`, so the atomics run once per packet rather than
+    /// once per increment.  An earlier version of this did two contended `fetch_add`s on a global
+    /// inside `overflow_rc_cache` itself -- roughly 131 million of them on `biojava` -- which cost
+    /// more than the `DashMap` operation it was trying to measure and made the run's timings
+    /// unusable.  `EVALUATION_PLAN.md` 6 rule 4.
+    #[cfg(feature = "s_rc_stats")]
+    slow_lt16b: std::cell::Cell<usize>,
+    #[cfg(feature = "s_rc_stats")]
+    slow_ge16b: std::cell::Cell<usize>,
+    #[cfg(feature = "s_rc_stats")]
+    true_max: std::cell::Cell<usize>,
+    #[cfg(feature = "s_rc_stats")]
+    fast: std::cell::Cell<usize>,
 }
 
 unsafe impl<VM: VMBinding, const KIND: EdgeKind> Send for ProcessIncs<VM, KIND> {}
@@ -105,6 +134,47 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             inc_objs: 0,
             #[cfg(feature = "measure_rc_rate")]
             copy_objs: 0,
+            #[cfg(feature = "s_rc_stats")]
+            tgt_rc2: 0,
+            #[cfg(feature = "s_rc_stats")]
+            tgt_rc3: 0,
+            #[cfg(feature = "s_rc_stats")]
+            tgt_rc4p: 0,
+            #[cfg(feature = "s_rc_stats")]
+            tgt_sat: 0,
+            #[cfg(feature = "s_rc_stats")]
+            slow_lt16b: std::cell::Cell::new(0),
+            #[cfg(feature = "s_rc_stats")]
+            slow_ge16b: std::cell::Cell::new(0),
+            #[cfg(feature = "s_rc_stats")]
+            true_max: std::cell::Cell::new(0),
+            #[cfg(feature = "s_rc_stats")]
+            fast: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Record one increment's TRUE previous count.  Only increments that took the slow path are
+    /// bucketed: `prev >= MAX_REF_COUNT` is exactly the condition under which
+    /// `rc_with_overflow::inc` entered the overflow map.
+    ///
+    /// ⚠ SCOPE: this covers the two `ProcessIncs` increment sites only. The `CycleCollector`'s
+    /// `inc_exclusive` is a different packet and is NOT counted here, so these do not sum to
+    /// `rc_path.inc.slow`.
+    #[cfg(feature = "s_rc_stats")]
+    #[inline]
+    fn record_inc(&self, prev: usize) {
+        if prev < crate::util::rc::MAX_REF_COUNT as usize {
+            self.fast.set(self.fast.get() + 1);
+        }
+        if prev >= crate::util::rc::MAX_REF_COUNT as usize {
+            if prev > self.true_max.get() {
+                self.true_max.set(prev);
+            }
+            if prev >= u16::MAX as usize {
+                self.slow_ge16b.set(self.slow_ge16b.get() + 1);
+            } else {
+                self.slow_lt16b.set(self.slow_lt16b.get() + 1);
+            }
         }
     }
 
@@ -305,7 +375,25 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 } else {
                     //this is assert may not be true
                     //debug_assert!(rc != crate::util::rc::MAX_REF_COUNT);
+                    // Bucket the target's RC *before* the increment.  `rc` is the raw fork
+                    // value, which carries the +1 bias, so `rc >= 4` is three or more real
+                    // references -- exactly where the baseline's 2-bit sticky counter has
+                    // saturated and stops doing any atomic at all.
+                    #[cfg(feature = "s_rc_stats")]
+                    {
+                        if rc == crate::util::rc::MAX_REF_COUNT as usize {
+                            self.tgt_sat += 1;
+                        } else if rc >= 4 {
+                            self.tgt_rc4p += 1;
+                        } else if rc == 3 {
+                            self.tgt_rc3 += 1;
+                        } else {
+                            self.tgt_rc2 += 1;
+                        }
+                    }
                     let result = self.lxr.rc_with_overflow.inc(target);
+                    #[cfg(feature = "s_rc_stats")]
+                    self.record_inc(result);
                     //this is assert may not be true
                     //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
                     debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(target));
@@ -357,7 +445,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     fn inc(&self, o: ObjectReference) -> bool {
         //this asseretion might not be true on multiple threads.
         //debug_assert!(self.rc.count(o) != RC_DEATH_TRANSIENT, "RC=1 is reserved for death processing");
-        if self.lxr.rc_with_overflow.inc(o) == RC_NURSERY_OR_DEAD as usize {
+        let prev0 = self.lxr.rc_with_overflow.inc(o);
+        #[cfg(feature = "s_rc_stats")]
+        self.record_inc(prev0);
+        if prev0 == RC_NURSERY_OR_DEAD as usize {
             // First promotion: establish the +1 bias (0 → 1 → RC_DEATH_THRESHOLD)
             #[cfg(feature = "graph_project")]
             {
@@ -365,7 +456,9 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 reporter.add_allocated(o.to_raw_address().as_usize());
             }
             self.rc.strong_rc_inc(o);
-            self.lxr.rc_with_overflow.inc(o);
+            let prev1 = self.lxr.rc_with_overflow.inc(o);
+            #[cfg(feature = "s_rc_stats")]
+            self.record_inc(prev1);
             return true;
         }
         //debug_assert!(
@@ -853,6 +946,28 @@ impl<VM: VMBinding, const KIND: EdgeKind> GCWork<VM> for ProcessIncs<VM, KIND> {
             INC_PACKETS.fetch_add(1, Ordering::SeqCst);
             INC_OBJS.fetch_add(self.inc_objs, Ordering::SeqCst);
             COPY_OBJS.fetch_add(self.copy_objs, Ordering::SeqCst);
+        }
+        #[cfg(feature = "s_rc_stats")]
+        if self.tgt_rc2 | self.tgt_rc3 | self.tgt_rc4p | self.tgt_sat != 0 {
+            let c = crate::counters();
+            c.inc_tgt_rc2.fetch_add(self.tgt_rc2, Ordering::Relaxed);
+            c.inc_tgt_rc3.fetch_add(self.tgt_rc3, Ordering::Relaxed);
+            c.inc_tgt_rc4p.fetch_add(self.tgt_rc4p, Ordering::Relaxed);
+            c.inc_tgt_sat.fetch_add(self.tgt_sat, Ordering::Relaxed);
+            c.inc_overflow_peak
+                .fetch_max(self.lxr.rc_with_overflow.num_entries(), Ordering::Relaxed);
+            c.inc_slow_lt16b.fetch_add(self.slow_lt16b.get(), Ordering::Relaxed);
+            c.inc_slow_ge16b.fetch_add(self.slow_ge16b.get(), Ordering::Relaxed);
+            c.rc_true_max.fetch_max(self.true_max.get(), Ordering::Relaxed);
+            c.inc_fast.fetch_add(self.fast.get(), Ordering::Relaxed);
+            self.fast.set(0);
+            self.slow_lt16b.set(0);
+            self.slow_ge16b.set(0);
+            self.true_max.set(0);
+            self.tgt_rc2 = 0;
+            self.tgt_rc3 = 0;
+            self.tgt_rc4p = 0;
+            self.tgt_sat = 0;
         }
     }
 }

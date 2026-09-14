@@ -419,6 +419,55 @@ struct Counters {
     pub cc_objects_in_collect: AtomicUsize,
     /// High-water mark, not a sum: `fetch_max`, like `max_reserved_pages`.
     pub cc_satb_map_peak: AtomicUsize,
+
+    /// Distribution of a target's RC at INCREMENT time, bucketed by what the BASELINE would
+    /// have done with it.  Gated on `s_rc_stats`; see `plan/lxr/rc.rs::scan_nursery_object`.
+    ///
+    /// The two collectors encode RC differently, which is why the boundary is at 4 and not 3:
+    /// the fork carries a +1 bias (`RC_DEATH_THRESHOLD = 2` is one real reference) and the
+    /// baseline does not (`9988d781` has no bias constants and `inc` is a single increment).
+    /// So `real_refs = fork_rc - 1`, and the baseline's saturation at `MAX_REF_COUNT = 3` real
+    /// references corresponds to **fork raw RC >= 4**.
+    ///
+    /// `inc.tgt_rc4p` is therefore the count of increments the baseline would have performed
+    /// NO ATOMIC for at all -- it loads, compares against its sticky max, and does nothing.
+    /// The fork must do a real CAS there, because with no mark-and-sweep to rescue a stuck
+    /// count it cannot afford to stop counting.  `inc.tgt_sat` is the far end of the same
+    /// trade: the fork's own saturation, where it goes to the overflow DashMap instead.
+    pub inc_tgt_rc2: AtomicUsize,
+    pub inc_tgt_rc3: AtomicUsize,
+    pub inc_tgt_rc4p: AtomicUsize,
+    pub inc_tgt_sat: AtomicUsize,
+    /// Peak number of DISTINCT objects held in the overflow map -- `entries.len()`, sampled with
+    /// `fetch_max`.  This is the plausibility check on `inc.tgt_sat`: a high saturated-INCREMENT
+    /// rate is ordinary edge skew if only a few hundred objects are saturated, and is a defect if
+    /// the population is enormous.
+    pub inc_overflow_peak: AtomicUsize,
+
+    /// **Would a WIDER RC field remove this traffic?**  Measured on the overflow map's own
+    /// values, which ARE the true reference count: the map is seeded at `MAX_RC_USIZE` and
+    /// `fetch_add`ed, so the value it returns is the count before the operation.
+    ///
+    /// Every operation counted here is slow TODAY, at 8 bits.  The split says what would happen
+    /// at 16 bits (`MAX = 65_535`):
+    ///   `inc.slow_lt16b`  true count below 65_535 -- at 16 bits this would never have saturated,
+    ///                     so the map would not be entered and the operation would be a plain CAS.
+    ///   `inc.slow_ge16b`  true count at or above 65_535 -- still saturated at 16 bits, still slow.
+    ///
+    /// ⚠ INCREMENTS ONLY, and only the two `ProcessIncs` sites. The `CycleCollector`'s
+    /// `inc_exclusive` is a different packet and is not counted, so these do not sum to
+    /// `rc_path.inc.slow`. There is deliberately no `dec` equivalent: slow decrements are split
+    /// between `ProcessDecs` (`dec`) and the cycle collector (`dec_exclusive`), and instrumenting
+    /// only the first measured 0.5% of them.
+    ///
+    /// `rc.true_max` is the largest true count ever observed.  Below 65_535 it means 16 bits
+    /// removes overflow traffic ENTIRELY on this workload.
+    pub rc_true_max: AtomicUsize,
+    /// Increments at the `ProcessIncs` sites that took the FAST path (RC table, no map).
+    /// The denominator for `inc.slow_*`: without it those are counts with no scale.
+    pub inc_fast: AtomicUsize,
+    pub inc_slow_lt16b: AtomicUsize,
+    pub inc_slow_ge16b: AtomicUsize,
     pub cc_satb_reads: AtomicUsize,
     // ---- write-barrier instrumentation ------------------------------------------------------
     //
@@ -468,6 +517,15 @@ impl Counters {
         "cc.objects_in_scan_black": self.cc_objects_in_scan_black.load(Ordering::SeqCst),
         "cc.objects_in_collect": self.cc_objects_in_collect.load(Ordering::SeqCst),
         "cc.satb_map_peak": self.cc_satb_map_peak.load(Ordering::SeqCst),
+        "inc.tgt_rc2": self.inc_tgt_rc2.load(Ordering::SeqCst),
+        "inc.tgt_rc3": self.inc_tgt_rc3.load(Ordering::SeqCst),
+        "inc.tgt_rc4p": self.inc_tgt_rc4p.load(Ordering::SeqCst),
+        "inc.tgt_sat": self.inc_tgt_sat.load(Ordering::SeqCst),
+        "inc.overflow_peak": self.inc_overflow_peak.load(Ordering::SeqCst),
+        "rc.true_max": self.rc_true_max.load(Ordering::SeqCst),
+        "inc.fast": self.inc_fast.load(Ordering::SeqCst),
+        "inc.slow_lt16b": self.inc_slow_lt16b.load(Ordering::SeqCst),
+        "inc.slow_ge16b": self.inc_slow_ge16b.load(Ordering::SeqCst),
         "cc.satb_reads": self.cc_satb_reads.load(Ordering::SeqCst),
         "barrier.slow_in_cc": self.barrier_slow_in_cc.load(Ordering::SeqCst),
         "barrier.satb_inserts": self.barrier_satb_inserts.load(Ordering::SeqCst),
@@ -485,6 +543,20 @@ const fn create_counters() -> Counters {
 fn reset_counters() {
     let mut new_counters = create_counters();
     let global = unsafe { &mut *addr_of_mut!(COUNTERS) };
+    // `full_rc` is CARRIED ACROSS THE RESET, and every other counter is not.
+    //
+    // `Pause::FullRC` is selected only for a user-triggered collection OUTSIDE the harness
+    // (`plan/lxr/global.rs`, the `!inside_harness()` gate), and `harness_begin` runs its own
+    // collection at `mmtk.rs:337` BEFORE calling this at `:343`. So every `FullRC` that will ever
+    // happen has already happened by the time this runs, and zeroing it here made the counter
+    // structurally unobservable: it read 0.00 on every benchmark of the first run to carry it
+    // (`~/prod-ae/bundle/FINDINGS.md` 18.5), which was misread as the escalation never firing.
+    //
+    // Carried forward, it accumulates over the PROCESS rather than over the harness window, so at
+    // `harness_end` it reads the number of DaCapo iteration boundaries so far. That is a different
+    // scope from its neighbours in this struct -- deliberately, because it is the only way this
+    // event can be counted at all -- and `ARTIFACT.md` 6.1 says so.
+    new_counters.full_rc = AtomicUsize::new(global.full_rc.load(Ordering::Relaxed));
     std::mem::swap(global, &mut new_counters);
 }
 
