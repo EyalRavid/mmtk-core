@@ -1,7 +1,6 @@
 //! Read/Write barrier implementations.
 
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 
 use atomic::Ordering;
 use atomic_traits::fetch::Or;
@@ -10,8 +9,6 @@ use super::LXR;
 use crate::plan::barriers::BarrierSemantics;
 use crate::plan::barriers::LOGGED_VALUE;
 use crate::plan::barriers::UNLOGGED_VALUE;
-use crate::plan::immix::Pause;
-use crate::plan::lxr::cm::ProcessModBufSATB;
 use crate::plan::lxr::rc::ProcessDecs;
 use crate::plan::lxr::rc::ProcessIncs;
 use crate::plan::lxr::rc::EDGE_KIND_MATURE;
@@ -34,11 +31,59 @@ pub const TAKERATE_MEASUREMENT: bool = crate::args::TAKERATE_MEASUREMENT;
 pub static FAST_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub static SLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// The LXR field write barrier.
+///
+/// # The concurrent-marking / SATB half was removed on 2026-09-15, because it cannot run
+///
+/// This barrier used to carry a second job beside reference counting: capturing the pre-write
+/// value for a concurrent mark closure (SATB). **None of that machinery was reachable in this
+/// fork**, so it was deleted. The proof, which is short and worth keeping because nothing else
+/// in the tree states it:
+///
+/// * `LXR::select_collection_kind` is the function that can return `Pause::InitialMark`. It has
+///   exactly one call site, `global.rs:272`, and that line is **commented out**. The pause is
+///   chosen instead by the override just below it: `Pause::FullRC` for a user-triggered GC
+///   outside the harness, `Pause::RefCount` otherwise.
+/// * So `InitialMark`, `FinalMark` and `Full` are never selected. Nothing reaches
+///   `set_concurrent_marking_state(true)`, so `LXR::cm_in_progress()` is permanently false, and
+///   the binding's `CONCURRENT_MARKING_ACTIVE` stays 0 -- which is what gates
+///   `MMTkFieldBarrierSetRuntime::load_reference` in `mmtkFieldBarrier.cpp`, so the VM never even
+///   calls into the read barrier.
+/// * Therefore `cm_in_progress() || current_pause() == Some(Pause::FinalMark)` -- the old
+///   `should_create_satb_packets()` -- was permanently false.
+///
+/// Note `LXR::cm_enabled()` is nevertheless **true** (`global.rs:1520`,
+/// `!cfg!(feature = "lxr_no_cm")`), so none of this was compiled out. It was live code that
+/// evaluated to "do nothing" on every flush.
+///
+/// ## What was removed
+///
+/// * `refs: VectorQueue<ObjectReference>` -- one per mutator, fed only by `load_reference`, so
+///   always empty.
+/// * `load_reference` -- the override is gone; `BarrierSemantics`' default no-op (`barriers.rs`)
+///   is now used, which is what it already did at run time.
+/// * `flush_weak_refs` -- called on every `flush()` to discover an empty queue.
+/// * `should_create_satb_packets`, and with it the `Arc` + `ProcessModBufSATB` arm of what is now
+///   `flush_decs`.
+///
+/// `ProcessModBufSATB` (`cm.rs`) and `ProcessDecs::new_arc` (`rc.rs`) are left in place: they are
+/// `pub`, this was their only caller, and they belong to the concurrent-marking module rather
+/// than here.
+///
+/// ## ⚠ If concurrent marking is ever turned back on, this must come back FIRST
+///
+/// Uncommenting `global.rs:272` alone is **not** enough, and the failure would be silent. The
+/// deleted `load_reference` called `LXR::is_marked`, which reads `LOCAL_MARK_BIT_SPEC` -- and
+/// `5286e80d` stopped maintaining that table entirely (`OPTIMIZATION_AUDIT.md` B.1: the
+/// clean-block and line-reuse paths no longer initialise it, on the grounds that nothing reads
+/// it). A revived mark closure would read uninitialised metadata. Restoring the SATB barrier
+/// therefore means restoring mark-table maintenance in the same commit.
+///
+/// Full account: `~/prod-ae/bundle/FINDINGS.md` §22.
 pub struct LXRFieldBarrierSemantics<VM: VMBinding> {
     mmtk: &'static MMTK<VM>,
     incs: VectorQueue<VM::VMSlot>,
     decs: VectorQueue<ObjectReference>,
-    refs: VectorQueue<ObjectReference>,
     lxr: &'static LXR<VM>,
     #[cfg(feature = "lxr_precise_incs_counter")]
     stat: crate::LocalRCStat,
@@ -66,7 +111,6 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             mmtk,
             incs: VectorQueue::default(),
             decs: VectorQueue::default(),
-            refs: VectorQueue::default(),
             lxr: mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap(),
             #[cfg(feature = "lxr_precise_incs_counter")]
             stat: crate::LocalRCStat::default(),
@@ -180,7 +224,7 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             if !cfg!(feature = "lxr_no_decs") || !self.lxr.is_marked(old) {
                 self.decs.push(old);
                 if self.decs.is_full() {
-                    self.flush_decs_and_satb();
+                    self.flush_decs();
                 }
             }
         }
@@ -235,11 +279,6 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         }
     }
 
-    fn should_create_satb_packets(&self) -> bool {
-        self.lxr.cm_enabled()
-            && (self.lxr.cm_in_progress() || self.lxr.current_pause() == Some(Pause::FinalMark))
-    }
-
     #[cold]
     fn flush_incs(&mut self) {
         if !self.incs.is_empty() {
@@ -254,23 +293,18 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         }
     }
 
+    /// Formerly `flush_decs_and_satb`. The SATB half is gone -- see the note on
+    /// `LXRFieldBarrierSemantics` -- so this only ever built the `ProcessDecs` packet.
     #[cold]
-    fn flush_decs_and_satb(&mut self) {
+    fn flush_decs(&mut self) {
         if !self.decs.is_empty() {
             if cfg!(feature = "decs_counter") {
                 self.lxr
                     .barrier_decs
                     .fetch_add(self.decs.len(), Ordering::SeqCst);
             }
-            let w = if self.should_create_satb_packets() {
-                let decs = Arc::new(self.decs.take());
-                self.mmtk.scheduler.work_buckets[WorkBucketStage::FinishConcurrentWork]
-                    .add(ProcessModBufSATB::new_arc(decs.clone()));
-                ProcessDecs::new_arc(decs, LazySweepingJobsCounter::new_decs())
-            } else {
-                let decs = self.decs.take();
-                ProcessDecs::new(decs, LazySweepingJobsCounter::new_decs())
-            };
+            let decs = self.decs.take();
+            let w = ProcessDecs::new(decs, LazySweepingJobsCounter::new_decs());
             if crate::args::LAZY_DECREMENTS {
                 self.mmtk.scheduler.postpone_prioritized(w);
             } else {
@@ -296,15 +330,6 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
         }
     }
 
-    #[cold]
-    fn flush_weak_refs(&mut self) {
-        if !self.refs.is_empty() {
-            debug_assert!(self.should_create_satb_packets());
-            let nodes = self.refs.take();
-            self.mmtk.scheduler.work_buckets[WorkBucketStage::FinishConcurrentWork]
-                .add(ProcessModBufSATB::new(nodes));
-        }
-    }
 }
 
 impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
@@ -314,9 +339,8 @@ impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
     fn flush(&mut self) {
         #[cfg(feature = "s_rc_stats")]
         self.flush_barrier_stats();
-        self.flush_weak_refs();
         self.flush_incs();
-        self.flush_decs_and_satb();
+        self.flush_decs();
         #[cfg(feature = "lxr_precise_incs_counter")]
         {
             crate::RC_STAT.merge(&mut self.stat);
@@ -350,16 +374,6 @@ impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
                 self.stat.los_ac_incs += slots;
                 self.stat.los_ac_calls += 1;
             }
-        }
-    }
-
-    fn load_reference(&mut self, o: ObjectReference) {
-        if !self.lxr.cm_in_progress() || self.lxr.is_marked(o) {
-            return;
-        }
-        self.refs.push(o);
-        if self.refs.is_full() {
-            self.flush_weak_refs();
         }
     }
 

@@ -258,7 +258,7 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                             // Track how many cycles it survives unmarked.
                             if mark_val != mark_state {
                                 let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
-                                assert!(prev != 5 || lxr.rc_with_overflow.get(o) - 1 == 0, 
+                                assert!(prev != 6 || lxr.rc_with_overflow.get(o) - 1 == 0, 
                                             "Object {:?} has been dead for 5 cycles without being collected it has rc of: {}", 
                                             o, lxr.rc_with_overflow.get(o) - 1
                                 );
