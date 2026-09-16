@@ -24,7 +24,7 @@ use crate::{
     vm::*,
     MMTK,
 };
-use crate::util::rc::CANDIDATES_STATUS;
+use crate::util::rc::cc;
 use atomic::Ordering;
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "measure_rc_rate")]
@@ -395,8 +395,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     #[cfg(feature = "s_rc_stats")]
                     self.record_inc(result);
                     //this is assert may not be true
-                    //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) != 0);
-                    debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(target.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(target));
+                    //debug_assert!(cc::strong_rc(target, Ordering::SeqCst) != 0);
+                    debug_assert!(cc::strong_rc(target, Ordering::SeqCst) as RcBits <= self.rc.count(target));
                     #[cfg(feature = "measure_rc_rate")]
                     {
                         self.inc_objs += 1;
@@ -455,15 +455,15 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 let mut reporter =  self.lxr.graph_reporter.lock().unwrap();
                 reporter.add_allocated(o.to_raw_address().as_usize());
             }
-            self.rc.strong_rc_inc(o);
+            cc::strong_rc_inc(o);
             let prev1 = self.lxr.rc_with_overflow.inc(o);
             #[cfg(feature = "s_rc_stats")]
             self.record_inc(prev1);
             return true;
         }
         //debug_assert!(
-        //    STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0
-        //        || CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0
+        //    cc::strong_rc(o, Ordering::SeqCst) != 0
+        //        || cc::tag(o, Ordering::SeqCst) != 0
         //);
         false
     }
@@ -528,10 +528,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             //debug_assert!(promoted == false);
             //Eyal added this if
             if !promoted && K == EDGE_KIND_ROOT{
-                self.rc.clone().strong_rc_inc(new);
+                cc::strong_rc_inc(new);
             }
             else if K == EDGE_KIND_MATURE && o != new && !promoted{
-                self.rc.clone().strong_rc_inc(new);
+                cc::strong_rc_inc(new);
             }
 
             if promoted && new == o {
@@ -546,7 +546,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
             //Eyal added this if
             else if K == EDGE_KIND_ROOT{
-                self.rc.strong_rc_inc(o);
+                cc::strong_rc_inc(o);
             } 
             return o;
         }
@@ -556,7 +556,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             let new = object_forwarding::spin_and_get_forwarded_object::<VM>(o, forwarding_status);
             //debug_assert!(self.rc.clone().count(o) != 0);
             if !self.inc(new) && (K == EDGE_KIND_ROOT || K == EDGE_KIND_MATURE){
-                self.rc.strong_rc_inc(new);
+                cc::strong_rc_inc(new);
             }
             new
         } else {
@@ -575,7 +575,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 }
                 if let Some(new) = new {
                     if !self.inc(new) && K == EDGE_KIND_ROOT{
-                        self.rc.strong_rc_inc(new);
+                        cc::strong_rc_inc(new);
                     }
                     self.promote(new, true, false, depth);
                     new
@@ -584,7 +584,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     // Object is not moved.
                     let promoted = self.inc(o);
                     if !promoted && K == EDGE_KIND_ROOT{
-                        self.rc.strong_rc_inc(o);
+                        cc::strong_rc_inc(o);
                     }
                     object_forwarding::clear_forwarding_bits::<VM>(o);
                     if promoted {
@@ -598,7 +598,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 // Object is not moved.
                 let promoted = self.inc(o);
                 if !promoted && K == EDGE_KIND_ROOT{
-                    self.rc.strong_rc_inc(o);
+                    cc::strong_rc_inc(o);
                 }
                 object_forwarding::clear_forwarding_bits::<VM>(o);
                 if promoted {
@@ -648,9 +648,9 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
         }
 
-        //debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0 || 
-        //             CANDIDATES_STATUS.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) != 0);
-        debug_assert!(STRONG_RC_TABLE.load_atomic::<u8>(new.to_raw_address(), Ordering::SeqCst) as RcBits <= self.rc.count(new));
+        //debug_assert!(cc::strong_rc(new, Ordering::SeqCst) != 0 || 
+        //             cc::tag(new, Ordering::SeqCst) != 0);
+        debug_assert!(cc::strong_rc(new, Ordering::SeqCst) as RcBits <= self.rc.count(new));
         // Put this into remset if this is a mature slot, or a weak root
         if K != EDGE_KIND_ROOT || add_root_to_remset {
             self.record_mature_evac_remset(s, new);
@@ -1241,8 +1241,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 dead = true;
                 is_los = self.process_dead_object(o, lxr);
                 self.rc.dec_unconditionally(o);
-                STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(), 0u8, Ordering::Relaxed);
-                CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(), 0u8, Ordering::SeqCst);
+                cc::set_strong_rc(o, 0u8, Ordering::Relaxed);
+                cc::set_tag(o, 0u8, Ordering::SeqCst);
                 if is_los {
                     lxr.los().rc_free(o);
                 }
@@ -1255,22 +1255,14 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     candidates.push(o);
                 }
 
-                let s_rc_prev_val = self.rc.strong_rc_dec(o);
+                let s_rc_prev_val = cc::strong_rc_dec(o);
                 if s_rc_prev_val == Ok(STRONG_RC_LAST_BEFORE_ZERO) {
                     // Strong RC dropped to 0 — this object is a new cycle candidate
                     
-                    CANDIDATES_STATUS.store_atomic::<u8>(
-                        o.to_raw_address(),
-                        (lxr.curr_vec.get() + 1) as u8,
-                        Ordering::SeqCst,
-                    );
+                    cc::set_tag(o, (lxr.curr_vec.get() + 1) as u8, Ordering::SeqCst);
                     if self.rc.count(o) == RC_NURSERY_OR_DEAD as RcBits{
                                            
-                        CANDIDATES_STATUS.store_atomic::<u8>(
-                            o.to_raw_address(),
-                            0,
-                            Ordering::Relaxed,
-                            );
+                        cc::set_tag(o, 0, Ordering::Relaxed);
                     }
                     else{
                         local_buffer.push(o);
@@ -1279,7 +1271,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
                     //debug_assert!(local_buffer.contains(&o));
                     debug_assert!(
-                        STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == 0
+                        cc::strong_rc(o, Ordering::SeqCst) == 0
                     );
                     #[cfg(feature = "sanity")]
                     {
@@ -1292,21 +1284,11 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                 else if s_rc_prev_val == Err(STRONG_RC_ALREADY_ZERO) {
                     // Strong RC was already 0 — re-add as candidate if not already tracked
                     let curr_vec_tag = (lxr.curr_vec.get() + 1) as u8;
-                    if CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::Relaxed)
-                        != curr_vec_tag
-                    {
-                        CANDIDATES_STATUS.store_atomic::<u8>(
-                            o.to_raw_address(),
-                            curr_vec_tag,
-                            Ordering::SeqCst,
-                        );
+                    if cc::tag(o, Ordering::Relaxed) != curr_vec_tag {
+                        cc::set_tag(o, curr_vec_tag, Ordering::SeqCst);
 
                         if self.rc.count(o) == RC_NURSERY_OR_DEAD as RcBits{                  
-                            CANDIDATES_STATUS.store_atomic::<u8>(
-                                o.to_raw_address(),
-                                0,
-                                Ordering::Relaxed,
-                                );
+                            cc::set_tag(o, 0, Ordering::Relaxed);
                         }
                         else{
                             local_buffer.push(o);
@@ -1318,7 +1300,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
                     let val: u8 = s_rc_prev_val.unwrap_or_else(|e| e);
                     debug_assert!(
                         val != 0
-                         || CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0 
+                         || cc::tag(o, Ordering::SeqCst) != 0 
                          || self.rc.count(o) == 0);
         
                 }

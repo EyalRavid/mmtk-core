@@ -94,8 +94,10 @@ define_side_metadata_specs!(
     // ⚠ BUDGET.  At 1/4 of the address space this is the LARGEST global spec in the system, and
     // the global budget (< 1/2, `LOG_GLOBAL_SIDE_METADATA_WORST_CASE_RATIO`) is NOT enforced
     // anywhere -- `LOG_MAX_GLOBAL_SIDE_METADATA_SIZE` has exactly one use, computing where LOCAL
-    // metadata starts.  With this spec the global total is 0.484 of 0.500.  Gating the
-    // `SANITY_*`/`GRAPH_*` declarations behind their features frees 0.102 and takes it to 0.383.
+    // metadata starts.  With this spec the global total is 0.4688 of 0.500 in a `sanity` build.
+    // The two `SANITY_*` specs below now narrow to 1 bit when the feature is off, which frees
+    // 0.0469 and takes a non-sanity build to 0.4219 -- see `SANITY_MARK_BITS` for why the width,
+    // and not the declaration, is the lever.
     OVERFLOW_RC_TABLE = (global: true, log_num_of_bits: 5, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
     // Record defrag state for immix blocks
     IX_BLOCK_DEFRAG = (global: true, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
@@ -114,16 +116,36 @@ define_side_metadata_specs!(
     //
     // THIS COUPLES TWO OTHERWISE UNRELATED CONSTANTS. If that 5-cycle threshold is ever raised
     // above 15, or `MARK_STATE`'s wrap in `SanityPrepare::update_mark_state` stops matching this
-    // width, sanity starts lying. Both are commented in kind.
-    SANITY_MARK_BITS = (global: true, log_num_of_bits: 2, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
+    // width, sanity starts lying. Both are commented in kind. The conditional width below does
+    // not weaken that: with `sanity` on it is still 4 bits, which is what the argument is about.
+    //
+    // WHY THE WIDTH IS CONDITIONAL -- it buys ADDRESS SPACE, not memory, and the two are
+    // separate. REGISTRATION is already conditional: `SideMetadataContext::new_global_specs`
+    // (`side_metadata/global.rs`) pushes this spec only under `#[cfg(feature = "sanity")]`, so a
+    // non-sanity build never maps a byte for it. DECLARATION is not: `define_side_metadata_specs!`
+    // has no attribute slot, and each spec is laid out with `layout_after` on the previous one, so
+    // removing the declaration would break the chain. A declared-but-unmapped spec therefore still
+    // reserves its full share of the budget the assert below enforces.
+    //
+    // At 4 bits it reserved 1/32 of the address space for a table a non-sanity build never
+    // touches. That is what made `lxr_rc_bits_16` fail to compile: a 16-bit `RC_TABLE` needs
+    // +0.0625 and only 0.0312 was left. `log_num_of_bits: 0` is 1 bit -- the floor; a zero-width
+    // spec is not expressible.
+    SANITY_MARK_BITS = (global: true, log_num_of_bits: if cfg!(feature = "sanity") { 2 } else { 0 }, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
     //Cycle collection colors table
     OBJ_COLOR_TABLE = (global: true, log_num_of_bits: 1, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
 
     CANDIDATES_STATUS = (global: true, log_num_of_bits: 1, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
     // Strong Reference count
     STRONG_RC_TABLE = (global: true, log_num_of_bits: crate::util::rc::LOG_STRONG_REF_COUNT_BITS, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
-    // Sanity: counts how many GC cycles pass before a dead object is collected (2 bits per object)
-    SANITY_DEAD_CYCLE_COUNT = (global: true, log_num_of_bits: 2, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
+    // Sanity: counts how many GC cycles pass before a dead object is collected.
+    // FOUR bits (`log_num_of_bits: 2` is the LOG), not two -- an earlier version of this comment
+    // said two. The field has to hold the threshold `SanityRelease` asserts at, currently 5.
+    //
+    // Conditional for the same reason as `SANITY_MARK_BITS` above: LXR registers it only under
+    // `#[cfg(feature = "sanity")]` (`plan/lxr/global.rs`), but the declaration is unconditional,
+    // so without the narrowing it reserves address space in every build.
+    SANITY_DEAD_CYCLE_COUNT = (global: true, log_num_of_bits: if cfg!(feature = "sanity") { 2 } else { 0 }, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
 
     GRAPH_REPORT_MARK = (global: true, log_num_of_bits: 0, log_bytes_in_region: crate::util::rc::LOG_MIN_OBJECT_SIZE),
 );
@@ -141,8 +163,32 @@ define_side_metadata_specs!(
 /// `TODO - we should check this limit somewhere` for the local equivalent.
 ///
 /// This matters now because `OVERFLOW_RC_TABLE` is 1/4 of the address space, the largest global
-/// spec in the system: the total goes from 0.234 to 0.484 of a 0.500 budget, leaving 3.1%.
-/// Gating the `SANITY_*` / `GRAPH_*` declarations behind their features would free 0.102.
+/// spec in the system: it took the total from 0.234 to 0.4688 of a 0.500 budget.
+///
+/// **What the assert measures is DECLARATION, not registration.** A spec that no build ever maps
+/// -- because the `#[cfg]` that would push it into a `SideMetadataContext` is off -- still gets an
+/// offset from `layout_after` and still counts here. That is why the two `SANITY_*` specs narrow
+/// their *width* on the feature rather than dropping their declaration: the macro has no attribute
+/// slot, and a missing const would break the `layout_after` chain.
+///
+/// Sizes are easiest to reason about in absolute terms rather than as fractions: a spec costs
+/// `2^(LOG_ARCH_ADDRESS_SPACE - log_bytes_in_region - 3 + log_num_of_bits)` bytes, so at the
+/// 16-byte object granularity one extra bit of width doubles it. Narrowing both `SANITY_*` specs
+/// from 4 bits to 1 frees `6 * 2^40`, i.e. `1.5 * 2^42`.
+///
+/// What that does and does not buy, **measured 2026-09-16, not computed**:
+///
+/// | change | costs | compiles? |
+/// |---|---|---|
+/// | `STRONG_RC_TABLE` 4 -> 8 bits (`OPTIMIZATION_AUDIT.md` B.3) | `1 * 2^42` | **yes** |
+/// | `RC_TABLE` 8 -> 16 bits (`lxr_rc_bits_16`) | `2 * 2^42` | **no, still over** |
+///
+/// So the M-G discriminator now builds and `lxr_rc_bits_16` does not. Closing the remaining
+/// `0.5 * 2^42` needs a different lever: give the macro a `#[cfg]` arm that emits an alias to the
+/// PREVIOUS spec when the feature is off. That costs literally nothing, because
+/// `layout_after(&ALIAS) == layout_after(&PREV)` -- at the price of a const that silently aliases
+/// another table, so an ungated access would read and write the wrong metadata instead of failing
+/// to compile.
 const _: () = assert!(
     LAST_GLOBAL_SIDE_METADATA_SPEC
         .upper_bound_address_for_contiguous()

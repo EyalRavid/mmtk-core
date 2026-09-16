@@ -115,6 +115,226 @@ pub const STRONG_RC_LAST_BEFORE_ZERO: u8 = 1;
 /// `strong_rc_dec` returned `Err(STRONG_RC_ALREADY_ZERO)`: strong RC was already 0.
 pub const STRONG_RC_ALREADY_ZERO: u8 = 0;
 
+/// Typed accessors for the three cycle-collector per-object fields.
+///
+/// `STRONG_RC_TABLE`, `OBJ_COLOR_TABLE` and `CANDIDATES_STATUS` are three separate side-metadata
+/// specs today, so every accessor here is a direct forward to its spec and compiles to exactly
+/// what the open-coded call site compiled to.  The point is the seam, not the indirection: every
+/// per-object read and write of these three fields goes through this module, so packing them into
+/// a single byte becomes a change to the bodies below rather than to ~100 scattered call sites.
+///
+/// Spec *registration* (`plan/lxr/global.rs`) still names the specs directly, and should -- that
+/// list declares which tables exist, which is not a per-object field access.
+///
+/// Every accessor takes its `Ordering` from the caller rather than fixing one here.  The existing
+/// sites disagree (`SeqCst` in some, `Relaxed` in others); normalising them would be a silent
+/// behaviour change, and keeping the argument keeps the disagreement visible -- which starts to
+/// matter as soon as the three fields share a byte and their orderings interact.
+pub mod cc {
+    use super::{CANDIDATES_STATUS, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, STRONG_RC_TABLE};
+    use crate::util::ObjectReference;
+    use atomic::Ordering;
+
+    /// Strong reference count of `o`.
+    #[inline(always)]
+    pub fn strong_rc(o: ObjectReference, order: Ordering) -> u8 {
+        STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), order)
+    }
+
+    /// Set the strong reference count of `o`.
+    ///
+    /// `STRONG_RC_TABLE` is sub-byte, so this takes `store_atomic`'s CAS-loop path.  Prefer
+    /// [`set_strong_rc_exclusive`] where the caller owns the table.
+    #[inline(always)]
+    pub fn set_strong_rc(o: ObjectReference, v: u8, order: Ordering) {
+        STRONG_RC_TABLE.store_atomic::<u8>(o.to_raw_address(), v, order)
+    }
+
+    /// Set the strong reference count of `o` with no atomic read-modify-write.
+    ///
+    /// # Safety
+    ///
+    /// As [`super::RefCountHelper::strong_rc_inc_exclusive`], whose doc comment carries the full
+    /// argument: because the table is sub-byte, the caller must be the only thread writing **any**
+    /// entry in the containing byte, not merely this one.
+    #[inline(always)]
+    pub unsafe fn set_strong_rc_exclusive(o: ObjectReference, v: u8, order: Ordering) {
+        unsafe { STRONG_RC_TABLE.store_atomic_exclusive::<u8>(o.to_raw_address(), v, order) }
+    }
+
+    /// Trial-deletion colour of `o`: one of `BLACK_OUT_OF_STACK`, `BLACK_IN_STACK`, `GREY`,
+    /// `WHITE`.
+    #[inline(always)]
+    pub fn colour(o: ObjectReference, order: Ordering) -> u8 {
+        OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), order)
+    }
+
+    /// Set the trial-deletion colour of `o` with no atomic read-modify-write.
+    ///
+    /// There is deliberately no plain-atomic counterpart: the colour is written only by
+    /// `CycleCollector`, which is a single work packet.  The mutator barrier *reads* it
+    /// (`plan/lxr/barrier.rs`), which is why the read above is a normal atomic load.
+    ///
+    /// # Safety
+    ///
+    /// As [`set_strong_rc_exclusive`].
+    #[inline(always)]
+    pub unsafe fn set_colour_exclusive(o: ObjectReference, v: u8, order: Ordering) {
+        unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(o.to_raw_address(), v, order) }
+    }
+
+    /// Candidate-pool tag of `o`: 0 for "not a candidate", else `pool index + 1`.
+    #[inline(always)]
+    pub fn tag(o: ObjectReference, order: Ordering) -> u8 {
+        CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), order)
+    }
+
+    /// Set the candidate-pool tag of `o`.
+    ///
+    /// Sub-byte, so this is `store_atomic`'s CAS loop.  `ProcessDecs` runs multi-threaded and
+    /// needs it; `CycleCollector` should use [`set_tag_exclusive`].
+    #[inline(always)]
+    pub fn set_tag(o: ObjectReference, v: u8, order: Ordering) {
+        CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(), v, order)
+    }
+
+    /// Set the candidate-pool tag of `o` with no atomic read-modify-write.
+    ///
+    /// # Safety
+    ///
+    /// As [`set_strong_rc_exclusive`], and note this table is also written by `ProcessDecs`
+    /// (`plan/lxr/rc.rs`) through [`set_tag`], so this is sound only while the decrement phase has
+    /// fully drained.
+    #[inline(always)]
+    pub unsafe fn set_tag_exclusive(o: ObjectReference, v: u8, order: Ordering) {
+        unsafe { CANDIDATES_STATUS.store_atomic_exclusive::<u8>(o.to_raw_address(), v, order) }
+    }
+
+    // --- read-modify-write -------------------------------------------------------------------
+    //
+    // Unlike the accessors above, these fix `Ordering::Relaxed` rather than taking it from the
+    // caller.  That is deliberate and not an oversight: the eight accessors take an `Ordering`
+    // because their call sites genuinely disagree and normalising them would be a silent
+    // behaviour change, whereas every call site of these four uses the same convention.  An
+    // argument nobody varies is false generality.
+
+    /// Increment the strong RC of `o`, saturating at `MAX_STRONG_REF_COUNT`.
+    ///
+    /// Returns the **previous** value.  `Err(MAX_STRONG_REF_COUNT)` means the count was already
+    /// saturated and nothing was written.
+    ///
+    /// `STRONG_RC_TABLE` is sub-byte, so `fetch_update_atomic` takes its `log_num_of_bits < 3`
+    /// path: a CAS loop on the containing byte with shift and mask, false-sharing with the
+    /// adjacent object's count.  That is `OPTIMIZATION_AUDIT.md` §B.3, and fusing the three CC
+    /// fields into one byte (§F.1) removes the false sharing because the byte then belongs to this
+    /// object alone.
+    #[inline(always)]
+    pub fn strong_rc_inc(o: ObjectReference) -> Result<u8, u8> {
+        let f = |x: u8| -> Option<u8> {
+            if x == MAX_STRONG_REF_COUNT {
+                None
+            } else {
+                Some(x + 1)
+            }
+        };
+        STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
+        //STRONG_RC_TABLE.fetch_add_atomic::<u8>(o.to_raw_address(), 1, Ordering::Relaxed)
+    }
+
+    /// Decrement the strong RC of `o`, refusing to go below zero.
+    ///
+    /// Returns the **previous** value.  `Ok(STRONG_RC_LAST_BEFORE_ZERO)` means the count just
+    /// reached 0 and the object is a new cycle candidate; `Err(STRONG_RC_ALREADY_ZERO)` means it
+    /// was already 0 and nothing was written.  `plan/lxr/rc.rs` branches on exactly those two.
+    ///
+    /// Note the guard is `x == 0` only: `MAX_STRONG_REF_COUNT` is **not** sticky on the way down
+    /// even though [`strong_rc_inc`] saturates at it.  That asymmetry is pre-existing; it is
+    /// recorded here rather than fixed so the two cannot silently disagree.
+    #[inline(always)]
+    pub fn strong_rc_dec(o: ObjectReference) -> Result<u8, u8> {
+        let f = |x: u8| -> Option<u8> {
+            if x == 0 {
+                None
+            } else {
+                Some(x - 1)
+            }
+        };
+        STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
+        //STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(), 1, Ordering::Relaxed)
+    }
+
+    /// Increment the strong RC of `o` with no atomic read-modify-write.
+    ///
+    /// The exclusive-access counterpart of [`strong_rc_inc`], returning the **previous** value
+    /// directly instead of a `Result`.  A returned `MAX_STRONG_REF_COUNT` means no change was made.
+    ///
+    /// # Safety
+    ///
+    /// As [`super::RefCountHelper::inc_exclusive`]: the caller must be the only thread writing this
+    /// entry for the duration of the call.
+    ///
+    /// **The contract here is stronger than that one.**  `STRONG_RC_TABLE` is 4 bits per entry
+    /// (`LOG_STRONG_REF_COUNT_BITS = 2`), so **two adjacent objects share a byte**, and one nibble
+    /// cannot be written without rewriting the other object's nibble along with it.
+    /// `SideMetadataSpec::store_atomic_exclusive` does that read-merge-write with no CAS, so a
+    /// concurrent write to the *neighbouring* object's strong count would be silently lost.  The
+    /// caller must therefore guarantee no other thread writes **any entry in the same byte** — in
+    /// practice, that nothing else writes `STRONG_RC_TABLE` at all.
+    ///
+    /// That is what this saves: [`set_strong_rc`] would take `store_atomic`'s `bits_num_log < 3`
+    /// path, a CAS loop on the containing byte, making [`strong_rc_inc`] (a CAS alone) *cheaper*
+    /// than a load-plus-CAS here.  With the exclusive store it is two plain `mov`s.
+    ///
+    /// In practice the contract holds for the cycle collector: as of the `decs -> sweep -> cc`
+    /// reorder the decrement phase (`plan/lxr/rc.rs`, `process_decs`) has fully drained before the
+    /// collector starts, the mutator barrier touches only the colour field and `satb_map`, and the
+    /// remaining strong-RC reads are either commented-out asserts or `sanity`-gated.
+    /// **Re-check that if the phase order changes again, or if decrement work is ever allowed to
+    /// overlap cycle collection.**
+    ///
+    /// Unlike `RC_TABLE`, `STRONG_RC_TABLE` is not consulted by any wide zero-test — the
+    /// allocator's hole finder (`RCArray::is_dead`, `Block::rc_dead`) reads `RC_TABLE` only — so
+    /// the spurious-zero hazard described on [`super::RefCountHelper::dec_exclusive`] does not
+    /// apply to this table.
+    #[inline(always)]
+    pub unsafe fn strong_rc_inc_exclusive(o: ObjectReference) -> u8 {
+        let addr = o.to_raw_address();
+        let old: u8 = STRONG_RC_TABLE.load_atomic(addr, Ordering::Relaxed);
+        if old == MAX_STRONG_REF_COUNT {
+            return old;
+        }
+        unsafe { STRONG_RC_TABLE.store_atomic_exclusive(addr, old + 1, Ordering::Relaxed) };
+        old
+    }
+
+    /// Decrement the strong RC of `o` with no atomic read-modify-write.
+    ///
+    /// The exclusive-access counterpart of [`strong_rc_dec`], returning the **previous** value
+    /// directly instead of a `Result`.  A returned `0` means no change was made, so the `Ok(1)`
+    /// test at a `strong_rc_dec` call site becomes a plain comparison against
+    /// `STRONG_RC_LAST_BEFORE_ZERO` here — the same value, unwrapped.
+    ///
+    /// Note the guard is `old == 0` only, matching [`strong_rc_dec`]; see that function for why
+    /// the saturation asymmetry is reproduced rather than fixed.
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`strong_rc_inc_exclusive`], and note that its contract is the **stronger**
+    /// one: because `STRONG_RC_TABLE` packs two objects per byte, the caller must be the only
+    /// thread writing the whole table, not just this entry.  See that function for the full
+    /// argument and for why the non-atomic accesses are the point rather than an oversight.
+    #[inline(always)]
+    pub unsafe fn strong_rc_dec_exclusive(o: ObjectReference) -> u8 {
+        let addr = o.to_raw_address();
+        let old: u8 = STRONG_RC_TABLE.load_atomic(addr, Ordering::Relaxed);
+        if old == 0 {
+            return old;
+        }
+        unsafe { STRONG_RC_TABLE.store_atomic_exclusive(addr, old - 1, Ordering::Relaxed) };
+        old
+    }
+}
+
 
 
 static INC_BUFFER_SIZE: AtomicUsize = AtomicUsize::new(0);
@@ -345,30 +565,6 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         }
     }
 
-    //Eyal added this func
-    pub fn strong_rc_inc(&self, o: ObjectReference) -> Result<u8, u8> {
-        let f = |x: u8| -> Option<u8> {
-            if x == MAX_STRONG_REF_COUNT {
-                None
-            } else {
-                Some(x + 1)
-            }
-        };
-        STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
-        //STRONG_RC_TABLE.fetch_add_atomic::<u8>(o.to_raw_address(), 1, Ordering::Relaxed)
-    }
-
-    pub fn strong_rc_dec(&self, o: ObjectReference) -> Result<u8, u8> {
-        let f = |x: u8| -> Option<u8> {
-            if x == 0 {
-                None
-            } else {
-                Some(x - 1)
-            }
-        };
-        STRONG_RC_TABLE.fetch_update_atomic(o.to_raw_address(), Ordering::Relaxed, Ordering::Relaxed, f)
-        //STRONG_RC_TABLE.fetch_sub_atomic::<u8>(o.to_raw_address(), 1, Ordering::Relaxed)
-    }
     /// Unconditional decrement with no atomic read-modify-write.
     ///
     /// The exclusive-access counterpart of [`Self::dec_unconditionally`].  Like it, this applies
@@ -477,74 +673,6 @@ impl<VM: VMBinding> RefCountHelper<VM> {
         old
     }
 
-    /// Increment the strong RC of `o` with no atomic read-modify-write.
-    ///
-    /// The exclusive-access counterpart of [`Self::strong_rc_inc`], returning the **previous**
-    /// value instead of a `Result`.  A returned `MAX_STRONG_REF_COUNT` means no change was made.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::inc_exclusive`]: the caller must be the only thread writing this entry for the
-    /// duration of the call.
-    ///
-    /// **The contract here is stronger than for [`Self::inc_exclusive`].**  `STRONG_RC_TABLE` is
-    /// 4 bits per entry (`LOG_STRONG_REF_COUNT_BITS = 2`), so **two adjacent objects share a
-    /// byte**, and one nibble cannot be written without rewriting the other object's nibble along
-    /// with it.  `SideMetadataSpec::store_atomic_exclusive` does that read-merge-write with no
-    /// CAS, so a concurrent write to the *neighbouring* object's strong count would be silently
-    /// lost.  The caller must therefore guarantee no other thread writes **any entry in the same
-    /// byte** — in practice, that nothing else writes `STRONG_RC_TABLE` at all.
-    ///
-    /// That is what this saves: `SideMetadataSpec::store_atomic` would take its `bits_num_log < 3`
-    /// path, a CAS loop on the containing byte, making [`Self::strong_rc_inc`] (a CAS alone)
-    /// *cheaper* than a load-plus-CAS here.  With the exclusive store it is two plain `mov`s.
-    ///
-    /// In practice the contract holds for the cycle collector: as of the `decs -> sweep -> cc`
-    /// reorder the decrement phase (`plan/lxr/rc.rs`, `process_decs`) has fully drained before the
-    /// collector starts, the mutator barrier touches only `OBJ_COLOR_TABLE` and `satb_map`, and
-    /// the remaining `STRONG_RC_TABLE` sites are either commented-out asserts or `sanity`-gated.
-    /// **Re-check that if the phase order changes again, or if decrement work is ever allowed to
-    /// overlap cycle collection.**
-    ///
-    /// Unlike `RC_TABLE`, `STRONG_RC_TABLE` is not consulted by any wide zero-test — the
-    /// allocator's hole finder (`RCArray::is_dead`, `Block::rc_dead`) reads `RC_TABLE` only — so
-    /// the spurious-zero hazard described on [`Self::dec_exclusive`] does not apply to this table.
-    pub unsafe fn strong_rc_inc_exclusive(&self, o: ObjectReference) -> u8 {
-        let addr = o.to_raw_address();
-        let old: u8 = STRONG_RC_TABLE.load_atomic(addr, Ordering::Relaxed);
-        if old == MAX_STRONG_REF_COUNT {
-            return old;
-        }
-        unsafe { STRONG_RC_TABLE.store_atomic_exclusive(addr, old + 1, Ordering::Relaxed) };
-        old
-    }
-
-    /// Decrement the strong RC of `o` with no atomic read-modify-write.
-    ///
-    /// The exclusive-access counterpart of [`Self::strong_rc_dec`], returning the **previous**
-    /// value instead of a `Result`.  A returned `0` means no change was made.
-    ///
-    /// Note the guard is `old == 0` only, matching `strong_rc_dec`.  `MAX_STRONG_REF_COUNT` is
-    /// **not** treated as sticky on the way down even though `strong_rc_inc` saturates at it —
-    /// that asymmetry is pre-existing and is reproduced here deliberately so this function and
-    /// `strong_rc_dec` cannot disagree.  If it is wrong, it is wrong in both and should be fixed
-    /// in both.
-    ///
-    /// # Safety
-    ///
-    /// Identical to [`Self::strong_rc_inc_exclusive`], and note that its contract is the
-    /// **stronger** one: because `STRONG_RC_TABLE` packs two objects per byte, the caller must be
-    /// the only thread writing the whole table, not just this entry.  See that function for the
-    /// full argument and for why the non-atomic accesses are the point rather than an oversight.
-    pub unsafe fn strong_rc_dec_exclusive(&self, o: ObjectReference) -> u8 {
-        let addr = o.to_raw_address();
-        let old: u8 = STRONG_RC_TABLE.load_atomic(addr, Ordering::Relaxed);
-        if old == 0 {
-            return old;
-        }
-        unsafe { STRONG_RC_TABLE.store_atomic_exclusive(addr, old - 1, Ordering::Relaxed) };
-        old
-    }
 }
 
 impl<VM: VMBinding> Clone for RefCountHelper<VM> {

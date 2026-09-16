@@ -19,7 +19,7 @@ use crate::scheduler::WorkBucketStage;
 use crate::util::address::CLDScanPolicy;
 use crate::util::address::RefScanPolicy;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
-use crate::util::rc::{OBJ_COLOR_TABLE, BLACK_IN_STACK};
+use crate::util::rc::{cc, BLACK_IN_STACK};
 use crate::util::*;
 use crate::vm::slot::MemorySlice;
 use crate::vm::slot::Slot;
@@ -244,7 +244,7 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             #[cfg(feature = "s_rc_stats")]
             { self.slow_in_cc += 1; }
             if let Some(obj) = _src {
-                if OBJ_COLOR_TABLE.load_atomic::<u8>(obj.to_raw_address(),Ordering::SeqCst) >= BLACK_IN_STACK {
+                if cc::colour(obj, Ordering::SeqCst) >= BLACK_IN_STACK {
                     #[cfg(feature = "s_rc_stats")]
                     { self.satb_inserts += 1; }
                     self.lxr.satb_map.insert(slot, old);

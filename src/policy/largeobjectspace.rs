@@ -23,7 +23,6 @@ use crossbeam::queue::SegQueue;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
-use crate::util::rc::STRONG_RC_TABLE;
 #[cfg(feature = "sanity")]
 use crate::util::sanity::sanity_checker::MARK_STATE;
 use crate::util::metadata::side_metadata::spec_defs::SANITY_MARK_BITS;
@@ -32,7 +31,7 @@ const PAGE_MASK: usize = !(BYTES_IN_PAGE - 1);
 const MARK_BIT: u8 = 0b01;
 const NURSERY_BIT: u8 = 0b10;
 const LOS_BIT_MASK: u8 = 0b11;
-use crate::util::rc::CANDIDATES_STATUS;
+use crate::util::rc::cc;
 /// This type implements a policy for large objects. Each instance corresponds
 /// to one Treadmill space.
 pub struct LargeObjectSpace<VM: VMBinding> {
@@ -609,8 +608,8 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         let mut mature_objects = self.rc_mature_objects.lock().unwrap();
         for (o, _size) in mature_objects.iter() {
             println!("this is a large object");
-            assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
-                    CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
+            assert!(cc::strong_rc(*o, Ordering::SeqCst) > 0 ||
+                    cc::tag(*o, Ordering::SeqCst) != 0);
             assert!(self.rc.count(*o) > 0);
             let mark_state = MARK_STATE.load(Ordering::SeqCst);
             let mark_val = SANITY_MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);

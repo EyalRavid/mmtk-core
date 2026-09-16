@@ -15,7 +15,7 @@ use crate::{scheduler::*, ObjectQueue};
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU8, Ordering};
-use crate::util::rc::{CANDIDATES_STATUS, MAX_REF_COUNT, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, RC_TABLE, STRONG_RC_TABLE};
+use crate::util::rc::{cc, MAX_REF_COUNT, MAX_STRONG_REF_COUNT, OBJ_COLOR_TABLE, RC_TABLE};
 use crate::util::heap::chunk_map::ChunkState;
 use crate::util::linear_scan::Region;
 use crate::util::rc;
@@ -229,8 +229,8 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                  assert!(real_rc != 1 ||
                     is_straddle_filler(&lxr.rc, obj.to_raw_address()));
                 assert!(real_rc == 0 || 
-                    CANDIDATES_STATUS.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
-                    STRONG_RC_TABLE.load_atomic::<u8>(obj.to_raw_address(), Ordering::SeqCst) != 0 ||
+                    cc::tag(*obj, Ordering::SeqCst) != 0 ||
+                    cc::strong_rc(*obj, Ordering::SeqCst) != 0 ||
                     is_straddle_filler(&lxr.rc, obj.to_raw_address()),
                     "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
 
@@ -250,8 +250,8 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                 
                             //let size = <P::VM as VMBinding>::VMObjectModel::get_current_size(o);
                             cursor = cursor +  rc::MIN_OBJECT_SIZE;
-                            assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
-                                    CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
+                            assert!(cc::strong_rc(o, Ordering::SeqCst) > 0 ||
+                                    cc::tag(o, Ordering::SeqCst) != 0);
                             assert!(cursor <= limit);
                             assert!(lxr.rc_with_overflow.get(o) != 1);
                             // If the object is alive but not marked by sanity tracing, it is "dead" from sanity's perspective.
@@ -287,8 +287,8 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                 let mark_state = MARK_STATE.load(Ordering::SeqCst);
                 let mark_val = MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
                 //assert!(mark_val == mark_state);
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) > 0 ||
-                        CANDIDATES_STATUS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) != 0);
+                assert!(cc::strong_rc(o, Ordering::SeqCst) > 0 ||
+                        cc::tag(o, Ordering::SeqCst) != 0);
                 true
             };
 
@@ -457,11 +457,11 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                 .get_plan()
                 .downcast_ref::<crate::plan::lxr::LXR<VM>>()
             {
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0 
-                            || CANDIDATES_STATUS.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0, 
+                assert!(cc::strong_rc(object, Ordering::SeqCst) != 0 
+                            || cc::tag(object, Ordering::SeqCst) != 0, 
                             "{:?} has zero strong rc count and {} rc", object, lxr.rc_with_overflow.get(object) - 1
                 );
-                assert!(STRONG_RC_TABLE.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) as usize <= lxr.rc_with_overflow.get(object) - 1);
+                assert!(cc::strong_rc(object, Ordering::SeqCst) as usize <= lxr.rc_with_overflow.get(object) - 1);
                 assert!(
                     unsafe { object.to_raw_address().load::<usize>() } != 0xdead,
                     "{:?} -> {:?} is killed by decs",
