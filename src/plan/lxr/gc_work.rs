@@ -418,7 +418,27 @@ impl<VM: VMBinding> CycleCollector<VM>{
             // already handed to Java, so its first report need not be the head. Cutting the edge
             // into a non-head node would leave the real head rooted and the nodes in front of the
             // cut unreachable from the seed.
-            if let Some(head) = <VM::VMCollection as Collection<VM>>::finalizer_list_head() {
+            if let Some((head, mirror)) =
+                <VM::VMCollection as Collection<VM>>::finalizer_take_list_head()
+            {
+                // The static is ALREADY cleared by the upcall -- the pointer is gone from the
+                // heap, not just from the count below. That is the fix: `Finalizer.unfinalized`
+                // lives in the `Finalizer` class mirror, an ordinary object whose static fields
+                // `InstanceMirrorKlass::oop_iterate` walks unconditionally, so while the pointer
+                // was still there `mark` would find it whenever it greyed the mirror and subtract
+                // the same edge the hand-decrement below had already taken off. Step 3B restores
+                // both the count and the pointer.
+                //
+                // DIAGNOSTIC (log only): `mirror` owns the static, and this state is what decides
+                // whether trial deletion walks it.
+                gc_log!([2]
+                    "    - finalizers: mirror={:?} rc={} s_rc={} tag={} colour={}",
+                    mirror,
+                    lxr.rc.count(mirror),
+                    cc::strong_rc(mirror, Ordering::SeqCst),
+                    cc::tag(mirror, Ordering::SeqCst),
+                    cc::colour(mirror, Ordering::SeqCst),
+                );
                 // Already at real rc 0: nothing to subtract, and decrementing would underflow.
                 if lxr.rc.count(head) > 1 {
                     // SAFETY: single-threaded CycleCollector -- see the impl header.
@@ -437,6 +457,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         };
                         buf.push(head);
                     }
+                } else {
+                    // Not cutting after all, so the pointer goes back now: nothing later will do
+                    // it, and mutators must not resume to a nulled `unfinalized`.
+                    <VM::VMCollection as Collection<VM>>::finalizer_restore_list_head(head);
                 }
             }
             gc_log!([2]
@@ -569,6 +593,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 // `scan_black` asserts `count > 1` on entry, so the edge goes back first.
                 // SAFETY: single-threaded CycleCollector -- see the impl header.
                 unsafe { lxr.rc_with_overflow.inc_exclusive(head) };
+                // And the POINTER goes back with it, undoing step 3A's clear. It must be back
+                // before `collect_whites` runs and before the pause ends -- mutators resuming to
+                // a nulled `unfinalized` would lose every pending finalizer.
+                <VM::VMCollection as Collection<VM>>::finalizer_restore_list_head(head);
                 if !is_black(head) {
                     self.scan_black(head, lxr, nested_stack);
                 }

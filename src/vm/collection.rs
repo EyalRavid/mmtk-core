@@ -117,21 +117,39 @@ pub trait Collection<VM: VMBinding> {
         vec![]
     }
 
-    /// The head of `java.lang.ref.Finalizer.unfinalized`, or `None` when the VM has no
-    /// finalization (or the Finalizer class is not yet initialized).
+    /// Take the head of `java.lang.ref.Finalizer.unfinalized`: return `(head, mirror)` **and
+    /// clear the static**, or `None` when the VM has no finalization (or the chain is empty, or
+    /// the Finalizer class is not yet initialized). `mirror` is the object that owns the static,
+    /// returned for diagnostics only.
     ///
     /// This static field is the only reference into the unfinalized chain from outside it. The
     /// cycle collector subtracts that one edge, seeds the head as a candidate, and lets ordinary
     /// trial deletion walk the chain -- so every `Finalizer.referent` edge is subtracted exactly
     /// once, by `mark`, instead of once by hand and once by the traversal.
     ///
+    /// **The implementation must remove the edge from the HEAP, not merely report it**, and the
+    /// store must bypass the write barrier. Adjusting the reference count while leaving the
+    /// pointer in place is not a cut: the static lives in the `Finalizer` class mirror, an
+    /// ordinary object whose fields the trial-deletion walk iterates, so the walk finds the
+    /// pointer and subtracts the same edge a second time. Measured on `jython`: that drove the
+    /// head one below the trial-deletion floor, `scan_black` rebuilt its strong count from the
+    /// transient value as zero, and the head was left live and permanently unfileable as a
+    /// candidate.
+    ///
     /// NOT the first pair from [`Self::finalizer_candidates`]: that walk skips finalizers already
     /// handed to Java, so its first entry need not be the head.
     ///
-    /// STOP-THE-WORLD ONLY.
-    fn finalizer_list_head() -> Option<ObjectReference> {
+    /// STOP-THE-WORLD ONLY, and the caller MUST pair it with
+    /// [`Self::finalizer_restore_list_head`] before the pause ends.
+    fn finalizer_take_list_head() -> Option<(ObjectReference, ObjectReference)> {
         None
     }
+
+    /// Put the head back into `java.lang.ref.Finalizer.unfinalized`, undoing
+    /// [`Self::finalizer_take_list_head`]. Must bypass the write barrier, for the same reason.
+    ///
+    /// STOP-THE-WORLD ONLY.
+    fn finalizer_restore_list_head(_head: ObjectReference) {}
 
     /// Hand these `Finalizer` objects to the VM's pending-reference list, so the VM's own
     /// finalizer thread runs `finalize()` on their referents -- outside any GC pause.
