@@ -277,12 +277,17 @@ impl<VM: VMBinding> CycleCollector<VM>{
         dfs_stack: &mut Vec<ObjectReference>,
         cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
     ) {
+        // One object's children, collected before any of them is decremented -- see `mark`.
+        // Owned here rather than per candidate: `pmd` marks ~123 k candidates per GC, and this
+        // keeps its capacity across all of them.
+        let mut children = Vec::<ObjectReference>::with_capacity(64);
+
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
             if self.should_mark(*cand, vec_index) {
                 cc::set_tag(*cand, 0, Ordering::Relaxed);
                 debug_assert!(self.rc.count(*cand) > 0);
-                self.mark(*cand, lxr, dfs_stack, cand_buffer);
+                self.mark(*cand, lxr, dfs_stack, &mut children, cand_buffer);
             } else {
                 if cc::strong_rc(*cand, Ordering::Relaxed) > 0 {
                     cc::set_tag(*cand, 0, Ordering::Relaxed);
@@ -749,10 +754,21 @@ impl<VM: VMBinding> CycleCollector<VM>{
     }
 
     /// Trial deletion: decrements RC of children for each GREY candidate via DFS.
-    /// If an SATB-logged slot is found, reverts all decrements.
+    ///
+    /// **Decrements are applied on commit, not while walking.**  The field walk only collects the
+    /// object's children; the writes happen afterwards, once it is known whether a logged slot
+    /// turned up.  On the logged path nothing has been decremented, so there is nothing to revert.
+    ///
+    /// That replaces an unwind loop that popped `num_of_childs` entries off `dfs_stack` and assumed
+    /// they were exactly the children it had just pushed -- true only while one thread owns the
+    /// stack, and false as soon as it can be split.  It also makes this phase **dec-only**, which
+    /// is what keeps `OVERFLOW_RC_TABLE` invariant 2 ("inc and dec never run concurrently") true
+    /// with several workers marking.
+    ///
     /// `dfs_stack` is scratch owned by `do_work` and reused across every candidate.  It is drained
     /// to empty before returning, so it needs no clearing on entry; the debug assertions hold that
     /// invariant in place.
+    /// `children` is scratch owned by `mark_buffer`, cleared once per object.
     /// `cand_buffer` is the shared producer handle owned by `do_work`; see its comment there for
     /// why one handle covers every phase.
     fn mark(
@@ -760,6 +776,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
         o: ObjectReference,
         lxr: &LXR<VM>,
         dfs_stack: &mut Vec<ObjectReference>,
+        children: &mut Vec<ObjectReference>,
         cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
     ) {
         debug_assert!(dfs_stack.is_empty());
@@ -768,7 +785,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
         while let Some(curr) = dfs_stack.pop() {
             debug_assert!(self.rc.count(curr) > 0);
             let mut is_logged = false;
-            let mut num_of_childs = 0;
+            children.clear();
 
             if is_black(curr)
                 && cc::strong_rc(curr, Ordering::Relaxed) == 0
@@ -798,33 +815,24 @@ impl<VM: VMBinding> CycleCollector<VM>{
                     // These are exactly the slots `iterate_fields` would visit, in the same order:
                     // under `CLDScanPolicy::Ignore`, `ObjArrayKlass::oop_iterate` skips `do_klass`
                     // and walks `array.data(T_OBJECT)`, which is the same base and length that
-                    // `obj_array_data` describes.  The per-field work below is unchanged, so the
-                    // children pushed, `num_of_childs`, and therefore the revert set the caller
-                    // acts on are all identical to the generic path -- this changes only *when the
-                    // loop stops*, never what it decides.
+                    // `obj_array_data` describes.  So the collected set is identical to the generic
+                    // path's -- this changes only *when the loop stops*, never what it decides.
                     let data = VM::VMScanning::obj_array_data(curr);
                     for i in 0..data.len() {
                         let slot = data.get(i);
                         // Load the value *before* testing this slot's unlog bit, exactly as the
                         // generic visitor does.  A mutator that writes and logs between the two is
                         // caught by the test; one that did so between a test and a *later* load
-                        // would not be, and the collector would then decrement the new referent
-                        // while the restore path increments the old one -- leaving the new one
-                        // permanently short.  These two lines must not be reordered.
+                        // would not be, and the collector would then collect and decrement the NEW
+                        // referent while `scan` reads the old one back out of `satb_map` -- leaving
+                        // the new one permanently short.  These two lines must not be reordered.
                         let child = slot.load();
                         if self.get_slot_logging_state(slot) == Self::LOGGED_VALUE {
                             is_logged = true;
                             break;
                         }
                         if let Some(x) = child {
-                            let prev = lxr.rc_with_overflow.dec(x);
-                            debug_assert!(prev != 1);
-                            debug_assert!(prev != 0);
-                            let _ = cc::strong_rc_dec(x);
-                            dfs_stack.push(x);
-                            #[cfg(feature = "s_rc_stats")]
-                            { self.stats.pushes.set(self.stats.pushes.get() + 1); }
-                            num_of_childs += 1;
+                            children.push(x);
                         }
                     }
                 } else {
@@ -835,14 +843,7 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         }
                         else if let Some(x) = child{
                             if !is_logged{
-                                let prev = lxr.rc_with_overflow.dec(x);
-                                debug_assert!(prev != 1);
-                                debug_assert!(prev != 0);
-                                let _ = cc::strong_rc_dec(x);
-                                dfs_stack.push(x);
-                                #[cfg(feature = "s_rc_stats")]
-                                { self.stats.pushes.set(self.stats.pushes.get() + 1); }
-                                num_of_childs += 1;
+                                children.push(x);
                             }
 
                         }
@@ -851,31 +852,46 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 }
                 #[cfg(feature = "s_rc_stats")]
                 { self.stats.objects_in_mark.set(self.stats.objects_in_mark.get() + 1); }
-                if is_logged{
+                if !is_logged {
+                    // Commit: subtract each collected edge exactly once, then hand the children to
+                    // the walk.
+                    for &x in children.iter() {
+                        let prev = lxr.rc_with_overflow.dec(x);
+                        debug_assert!(prev != 1);
+                        debug_assert!(prev != 0);
+                        let _ = cc::strong_rc_dec(x);
+                        dfs_stack.push(x);
+                        #[cfg(feature = "s_rc_stats")]
+                        { self.stats.pushes.set(self.stats.pushes.get() + 1); }
+                    }
+                } else {
                     #[cfg(feature = "s_rc_stats")]
                     { self.stats.mark_logged.set(self.stats.mark_logged.get() + 1); }
                     cc::set_colour(curr, BLACK_IN_STACK, Ordering::Relaxed);
-                    for _ in 0..num_of_childs{
-                        if let Some(curr_child) = dfs_stack.pop(){
-                            let _ = lxr.rc_with_overflow.inc(curr_child);
-                            //let _ = cc::strong_rc_inc(curr_child); 
-                           
-
-                            cand_buffer.push(curr_child);
-                        
-                            cc::set_tag(curr_child, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
-                                if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
-                                let _ = cc::strong_rc_dec(curr_child);
-                                }
-                            }
-                            else{
-                                panic!("num_of_childs is greater than the actual number of childs");
-                            }
-
+                    // Nothing was decremented, so there is nothing to revert -- but the NET effect
+                    // of the old walk-then-revert has to be reproduced exactly, and it is
+                    // asymmetric on purpose:
+                    //
+                    //   rc         unchanged   (walk decremented, revert incremented)
+                    //   strong_rc  -1          (walk decremented; the revert's `strong_rc_inc` is
+                    //                           commented out, so it was never restored)
+                    //   strong_rc  -2 in total when the child is not black (the second decrement
+                    //                           below, which the revert applied as an extra)
+                    //
+                    // Do NOT "correct" this while reading it: `strong_rc` is a sinking heuristic,
+                    // not a reference count, and making it accurate stops cyclic garbage being
+                    // collected at all (`sanity_checker.rs` fires; `FINDINGS.md` 26.5).
+                    for &x in children.iter() {
+                        let _ = cc::strong_rc_dec(x);
+                        cand_buffer.push(x);
+                        cc::set_tag(x, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
+                        if !is_black(x) { // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
+                            let _ = cc::strong_rc_dec(x);
+                        }
                     }
 
                     cand_buffer.push(curr);
-                
+
                     cc::set_tag(curr, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                 }
             } else if is_black(curr) {
