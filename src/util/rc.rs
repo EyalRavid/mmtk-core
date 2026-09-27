@@ -169,15 +169,56 @@ pub mod cc {
         OBJ_COLOR_TABLE.load_atomic::<u8>(o.to_raw_address(), order)
     }
 
-    /// Set the trial-deletion colour of `o` with no atomic read-modify-write.
+    /// Set the trial-deletion colour of `o`.
     ///
-    /// There is deliberately no plain-atomic counterpart: the colour is written only by
-    /// `CycleCollector`, which is a single work packet.  The mutator barrier *reads* it
-    /// (`plan/lxr/barrier.rs`), which is why the read above is a normal atomic load.
+    /// Sub-byte (2 bits, four objects per byte), so this is `store_atomic`'s CAS loop.  Needed by
+    /// `mark`, which is being prepared for parallel execution; the phases that are still
+    /// single-threaded should use [`set_colour_exclusive`].
+    #[inline(always)]
+    pub fn set_colour(o: ObjectReference, v: u8, order: Ordering) {
+        OBJ_COLOR_TABLE.store_atomic::<u8>(o.to_raw_address(), v, order)
+    }
+
+    /// Paint `o` GREY if and only if it is currently black.  Returns true iff this thread did it.
+    ///
+    /// The mutual exclusion parallel mark rests on: exactly one thread can win a given
+    /// black -> GREY transition, so exactly one walks the object's fields and its out-edges are
+    /// subtracted once.
+    ///
+    /// `fetch_update_atomic` rather than `compare_exchange_atomic`, for two reasons.  `is_black`
+    /// covers both `BLACK_OUT_OF_STACK` and `BLACK_IN_STACK`, so there is no single expected value
+    /// to compare against; and the spec is sub-byte, so a write to a *neighbouring* object's colour
+    /// fails the CAS spuriously -- `fetch_update_atomic` retries internally, a hand-rolled
+    /// `compare_exchange_atomic` would lose the claim.
+    ///
+    /// **`SeqCst` on success is load-bearing.**  It is half of a StoreLoad handshake with the
+    /// mutator write barrier, which loads `in_cycle_collection` and then this colour to decide
+    /// whether to log a slot into `satb_map` (`plan/lxr/barrier.rs`).  If the barrier misses the
+    /// paint it skips the insert, and `scan`'s `get_child` then spins forever on an entry that will
+    /// never arrive.  `CYCLE_COLLECTOR_PERF_REVIEW.md` F3(a) was withdrawn for exactly this.
+    #[inline(always)]
+    pub fn try_claim_grey(o: ObjectReference) -> bool {
+        OBJ_COLOR_TABLE
+            .fetch_update_atomic::<u8, _>(
+                o.to_raw_address(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |c| {
+                    if c <= super::BLACK_IN_STACK {
+                        Some(super::GREY)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
+    }
+
+    /// Set the trial-deletion colour of `o` with no atomic read-modify-write.
     ///
     /// # Safety
     ///
-    /// As [`set_strong_rc_exclusive`].
+    /// As [`set_strong_rc_exclusive`].  Prefer [`set_colour`] on any path that may become parallel.
     #[inline(always)]
     pub unsafe fn set_colour_exclusive(o: ObjectReference, v: u8, order: Ordering) {
         unsafe { OBJ_COLOR_TABLE.store_atomic_exclusive::<u8>(o.to_raw_address(), v, order) }

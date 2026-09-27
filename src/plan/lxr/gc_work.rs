@@ -88,6 +88,13 @@ struct CycleCollectorStats {
     objects_in_collect: std::cell::Cell<usize>,
     satb_map_size: usize,
     satb_reads: std::cell::Cell<usize>,
+    // Parallel-mark baseline; see `Counters` for what each one is for.
+    mark_packets: std::cell::Cell<usize>,
+    claim_attempts: std::cell::Cell<usize>,
+    claim_wins: std::cell::Cell<usize>,
+    pushes: std::cell::Cell<usize>,
+    mark_logged: std::cell::Cell<usize>,
+    peak_stack: usize,
 }
 
 #[cfg(feature = "s_rc_stats")]
@@ -118,6 +125,13 @@ impl CycleCollectorStats {
         c.cc_satb_reads.fetch_add(self.satb_reads.get(), Relaxed);
         // A level, not a sum: the peak SATB map size across the run.
         c.cc_satb_map_peak.fetch_max(self.satb_map_size, Relaxed);
+        c.cc_mark_packets.fetch_add(self.mark_packets.get(), Relaxed);
+        c.cc_claim_attempts.fetch_add(self.claim_attempts.get(), Relaxed);
+        c.cc_claim_wins.fetch_add(self.claim_wins.get(), Relaxed);
+        c.cc_pushes.fetch_add(self.pushes.get(), Relaxed);
+        c.cc_mark_logged.fetch_add(self.mark_logged.get(), Relaxed);
+        // Also a level.
+        c.cc_peak_stack.fetch_max(self.peak_stack, Relaxed);
     }
 }
 
@@ -136,6 +150,8 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         lxr.satb_map.clear();
         lxr.in_cycle_collection.store(true, Ordering::SeqCst);
+        #[cfg(feature = "s_rc_stats")]
+        { self.stats.mark_packets.set(self.stats.mark_packets.get() + 1); }
         //println!("size of rc cache: {}, num of entreies: {}", lxr.rc_with_overflow.capacity(), lxr.rc_with_overflow.num_entries());
 
         // The two scratch DFS stacks, reused by every traversal below.
@@ -191,10 +207,17 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 
 /// # A note on the `*_exclusive` RC calls below
 ///
-/// The RC traversal in `mark`, `scan`, `scan_black`, `collect_whites` and `collect_blacks` uses the
+/// The RC traversal in `scan`, `scan_black`, `collect_whites` and `collect_blacks` uses the
 /// `*_exclusive` variants of the reference-count helpers, which skip the atomic read-modify-write
 /// (a CAS retry loop) that the ordinary `inc`/`dec` need.  Every one of them carries the same
 /// safety obligation: **this thread must be the only one performing RC work**.
+///
+/// ⚠ **`mark` and `mark_buffer` are the exception: they use the ATOMIC variants.**  They are being
+/// prepared for parallel execution (`~/mmtk/CYCLE_COLLECTOR_PARALLEL_PLAN.md`), where the obligation
+/// below cannot hold for them, and an object's grey claim goes through `cc::try_claim_grey` so that
+/// exactly one thread walks its fields.  The conversion is behaviour-preserving while the packet is
+/// still single-threaded.  The four phases above remain exclusive because they run after mark has
+/// joined, and the split must not change that.
 ///
 /// That holds because `CycleCollector` is a single `GCWork` packet, so it runs on exactly one GC
 /// worker, and the concurrent chain is ordered `decs -> sweep -> cc`, so `ProcessDecs` has fully
@@ -219,9 +242,9 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 ///   because decrements have fully drained first.  It is the one that breaks first if the
 ///   `decs -> sweep -> cc` order is relaxed.
 ///
-/// **If any of that changes -- the packet is split across workers, cycle collection is moved off
-/// the GC worker pool, or decrement work is allowed to overlap it -- every `unsafe` block in this
-/// impl becomes unsound and must go back to the atomic variants.**
+/// **If any of that changes -- the remaining phases are split across workers, cycle collection is
+/// moved off the GC worker pool, or decrement work is allowed to overlap it -- every `unsafe` block
+/// in this impl becomes unsound and must go back to the atomic variants**, as `mark` already has.
 impl<VM: VMBinding> CycleCollector<VM>{
     
     pub const UNLOGGED_VALUE: u8 = 0b1;
@@ -257,14 +280,12 @@ impl<VM: VMBinding> CycleCollector<VM>{
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
             if self.should_mark(*cand, vec_index) {
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
-                unsafe { cc::set_tag_exclusive(*cand, 0, Ordering::Relaxed) };
+                cc::set_tag(*cand, 0, Ordering::Relaxed);
                 debug_assert!(self.rc.count(*cand) > 0);
                 self.mark(*cand, lxr, dfs_stack, cand_buffer);
             } else {
                 if cc::strong_rc(*cand, Ordering::Relaxed) > 0 {
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
-                    unsafe { cc::set_tag_exclusive(*cand, 0, Ordering::Relaxed) };
+                    cc::set_tag(*cand, 0, Ordering::Relaxed);
                 }
                 it.swap_remove_current();
             }
@@ -341,6 +362,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
         #[cfg(feature = "s_rc_stats")]
         {
             self.stats.satb_map_size = lxr.satb_map.len();
+            // Capacity, not length: the stacks are reused for the whole collection, so this is the
+            // high-water mark to within a doubling, read once here at no per-object cost.
+            self.stats.peak_stack = dfs_stack.capacity().max(nested_stack.capacity());
             self.stats.flush_to_counters();
         }
     }
@@ -670,6 +694,9 @@ impl<VM: VMBinding> CycleCollector<VM>{
         #[cfg(feature = "s_rc_stats")]
         {
             self.stats.satb_map_size = lxr.satb_map.len();
+            // Capacity, not length: the stacks are reused for the whole collection, so this is the
+            // high-water mark to within a doubling, read once here at no per-object cost.
+            self.stats.peak_stack = dfs_stack.capacity().max(nested_stack.capacity());
             self.stats.flush_to_counters();
         }
     }
@@ -747,8 +774,16 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 && cc::strong_rc(curr, Ordering::Relaxed) == 0
                 && cc::tag(curr, Ordering::Relaxed) == 0
             {
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
-                unsafe { cc::set_colour_exclusive(curr, GREY, Ordering::SeqCst) };
+                #[cfg(feature = "s_rc_stats")]
+                { self.stats.claim_attempts.set(self.stats.claim_attempts.get() + 1); }
+                // Claim the object before walking it.  Losing means another worker greyed it and is
+                // walking it, so this thread must not: that is what keeps each object's out-edges
+                // subtracted exactly once.  Cannot fail while mark is single-threaded.
+                if !cc::try_claim_grey(curr) {
+                    continue;
+                }
+                #[cfg(feature = "s_rc_stats")]
+                { self.stats.claim_wins.set(self.stats.claim_wins.get() + 1); }
                 if VM::VMScanning::is_obj_array(curr) {
                     // An object array's references are one contiguous, indexable run of slots, so
                     // this walk can be written directly -- and, unlike `iterate_fields`, *stopped*
@@ -782,13 +817,13 @@ impl<VM: VMBinding> CycleCollector<VM>{
                             break;
                         }
                         if let Some(x) = child {
-                            // SAFETY: single-threaded CycleCollector -- see the impl header.
-                            let prev = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
+                            let prev = lxr.rc_with_overflow.dec(x);
                             debug_assert!(prev != 1);
                             debug_assert!(prev != 0);
-                            // SAFETY: as above.
-                            unsafe { cc::strong_rc_dec_exclusive(x) };
+                            let _ = cc::strong_rc_dec(x);
                             dfs_stack.push(x);
+                            #[cfg(feature = "s_rc_stats")]
+                            { self.stats.pushes.set(self.stats.pushes.get() + 1); }
                             num_of_childs += 1;
                         }
                     }
@@ -800,13 +835,13 @@ impl<VM: VMBinding> CycleCollector<VM>{
                         }
                         else if let Some(x) = child{
                             if !is_logged{
-                                // SAFETY: single-threaded CycleCollector -- see the impl header.
-                                let prev = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
+                                let prev = lxr.rc_with_overflow.dec(x);
                                 debug_assert!(prev != 1);
                                 debug_assert!(prev != 0);
-                                // SAFETY: as above.
-                                unsafe { cc::strong_rc_dec_exclusive(x) };
+                                let _ = cc::strong_rc_dec(x);
                                 dfs_stack.push(x);
+                                #[cfg(feature = "s_rc_stats")]
+                                { self.stats.pushes.set(self.stats.pushes.get() + 1); }
                                 num_of_childs += 1;
                             }
 
@@ -817,22 +852,20 @@ impl<VM: VMBinding> CycleCollector<VM>{
                 #[cfg(feature = "s_rc_stats")]
                 { self.stats.objects_in_mark.set(self.stats.objects_in_mark.get() + 1); }
                 if is_logged{
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
-                    unsafe { cc::set_colour_exclusive(curr, BLACK_IN_STACK, Ordering::Relaxed) };
+                    #[cfg(feature = "s_rc_stats")]
+                    { self.stats.mark_logged.set(self.stats.mark_logged.get() + 1); }
+                    cc::set_colour(curr, BLACK_IN_STACK, Ordering::Relaxed);
                     for _ in 0..num_of_childs{
                         if let Some(curr_child) = dfs_stack.pop(){
-                            // SAFETY: single-threaded CycleCollector -- see the impl header.
-                            let _ = unsafe { lxr.rc_with_overflow.inc_exclusive(curr_child) };
+                            let _ = lxr.rc_with_overflow.inc(curr_child);
                             //let _ = cc::strong_rc_inc(curr_child); 
                            
 
                             cand_buffer.push(curr_child);
                         
-                            // SAFETY: single-threaded CycleCollector -- see the impl header.
-                            unsafe { cc::set_tag_exclusive(curr_child, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
+                            cc::set_tag(curr_child, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                                 if !is_black(curr_child){ // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
-                                // SAFETY: as above.
-                                let _ = unsafe { cc::strong_rc_dec_exclusive(curr_child) };
+                                let _ = cc::strong_rc_dec(curr_child);
                                 }
                             }
                             else{
@@ -843,12 +876,10 @@ impl<VM: VMBinding> CycleCollector<VM>{
 
                     cand_buffer.push(curr);
                 
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
-                    unsafe { cc::set_tag_exclusive(curr, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
+                    cc::set_tag(curr, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed);
                 }
             } else if is_black(curr) {
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
-                unsafe { cc::set_colour_exclusive(curr, BLACK_IN_STACK, Ordering::Relaxed) };
+                cc::set_colour(curr, BLACK_IN_STACK, Ordering::Relaxed);
             }
         }
     }

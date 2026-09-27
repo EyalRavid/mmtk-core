@@ -477,6 +477,28 @@ struct Counters {
     // `time.other` is not contaminated -- `EVALUATION_PLAN.md` §6 rule 5.
     pub barrier_slow_in_cc: AtomicUsize,
     pub barrier_satb_inserts: AtomicUsize,
+
+    // ---- parallel-mark baseline (`~/mmtk/CYCLE_COLLECTOR_PARALLEL_PLAN.md` stage 0) -----------
+    //
+    // Same shape as the block above: unconditional fields and keys, `s_rc_stats`-gated increments.
+    // All six fire with the collector still single-threaded, which is the point -- they are the
+    // sequential baseline the parallel arms get read against.
+    //
+    // Not added yet because nothing can increment them at this stage: `cc.claim_retries` (needs the
+    // claim CAS), `cc.splits` and `cc.claimed_with_tag_set` (need the split).
+    /// Mark packets per collection: 1 today, N once mark is split.
+    pub cc_mark_packets: AtomicUsize,
+    /// Objects reaching the black -> GREY transition with all three filters passed. Equal to
+    /// `cc_claim_wins` until the claim becomes a CAS that can lose; the gap is duplicate traversal.
+    pub cc_claim_attempts: AtomicUsize,
+    pub cc_claim_wins: AtomicUsize,
+    /// Edges pushed onto the mark DFS stack -- the denominator for every per-edge term, and what a
+    /// split threshold has to be chosen against. `CYCLE_COLLECTOR_PERF_REVIEW.md` 6.
+    pub cc_pushes: AtomicUsize,
+    /// Peak DFS stack capacity, in entries. A level, not a sum.
+    pub cc_peak_stack: AtomicUsize,
+    /// Expanded objects that hit an SATB-logged slot and took mark's abort path.
+    pub cc_mark_logged: AtomicUsize,
 }
 
 macro_rules! counter_print_keys_and_values {
@@ -529,6 +551,12 @@ impl Counters {
         "cc.satb_reads": self.cc_satb_reads.load(Ordering::SeqCst),
         "barrier.slow_in_cc": self.barrier_slow_in_cc.load(Ordering::SeqCst),
         "barrier.satb_inserts": self.barrier_satb_inserts.load(Ordering::SeqCst),
+        "cc.mark_packets": self.cc_mark_packets.load(Ordering::SeqCst),
+        "cc.claim_attempts": self.cc_claim_attempts.load(Ordering::SeqCst),
+        "cc.claim_wins": self.cc_claim_wins.load(Ordering::SeqCst),
+        "cc.pushes": self.cc_pushes.load(Ordering::SeqCst),
+        "cc.peak_stack": self.cc_peak_stack.load(Ordering::SeqCst),
+        "cc.mark_logged": self.cc_mark_logged.load(Ordering::SeqCst),
     }
 }
 
