@@ -146,6 +146,15 @@ impl<T> FinalBuffers<T> {
         self.buffers
     }
 
+    /// Rebuild from vectors previously taken apart by [`into_vecs`](Self::into_vecs).
+    ///
+    /// The mark phase splits a frame into its inner vectors, hands one to each worker, and each
+    /// prunes its own with `swap_remove_current`; this puts the survivors back together for the
+    /// sequential scan and collect phases.
+    pub fn from_vecs(buffers: Vec<Vec<T>>) -> Self {
+        Self { buffers }
+    }
+
     pub fn into_iter(self) -> impl Iterator<Item = T> {
         self.buffers.into_iter().flatten()
     }

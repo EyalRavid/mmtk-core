@@ -7,6 +7,8 @@ use crate::plan::global::CommonPlan;
 use crate::plan::global::{BasePlan, CreateGeneralPlanArgs, CreateSpecificPlanArgs};
 use crate::plan::immix::Pause;
 use crate::plan::lxr::gc_work::{CycleCollector, FastRCPrepare};
+#[cfg(not(feature = "lxr_stw"))]
+use crate::plan::lxr::gc_work::{CycleMark, CycleScanCollect};
 use crate::plan::AllocationSemantics;
 use crate::plan::MutatorContext;
 use crate::plan::Plan;
@@ -128,6 +130,12 @@ pub struct LXR<VM: VMBinding> {
     pub num_of_scanned_s_rc_candidates: Mutex<u64>,
     #[cfg(feature = "sanity")]
     pub rc_sanity_objects: Mutex<Vec<(ObjectReference, usize)>>,
+    /// Candidate buffers that survived the mark phase, on their way to scan/collect.
+    ///
+    /// The mark packets prune their own buffers with `swap_remove_current` and deposit the
+    /// survivors here; `on_lazy_mark_finished` drains it into the scan/collect packet.  It exists
+    /// because the counter token that joins the two phases carries no data.
+    pub mark_survivors: Mutex<Vec<Vec<ObjectReference>>>,
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
     pub in_cycle_collection: AtomicBool,
     pub rc_with_overflow: RefCountWithOverflow<VM>,
@@ -718,6 +726,7 @@ impl<VM: VMBinding> LXR<VM> {
             num_of_scanned_s_rc_candidates: Mutex::new(0),
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),
+            mark_survivors: Mutex::new(Vec::new()),
             satb_map: DashMap::with_capacity(SATB_DEFAULT_SIZE),
             in_cycle_collection: AtomicBool::new(false),
             #[cfg(feature = "graph_project")]
@@ -1386,8 +1395,43 @@ impl<VM: VMBinding> LXR<VM> {
         // (see `schedule_rc_collection`), so there is nothing to schedule here and `c` is
         // simply dropped -- which is also what the pre-reorder code did in the other callback.
         #[cfg(not(feature = "lxr_stw"))]
+        self.schedule_cycle_mark(c);
+    }
+
+    /// Set the cycle-collection phase up and hand the candidate pool to the mark packets.
+    ///
+    /// Both stores must happen HERE, before any mark packet can run: a mark packet that greys an
+    /// object while `in_cycle_collection` is still false leaves the mutator barrier not logging,
+    /// and `scan`'s `get_child` then spins forever on a `satb_map` entry that never arrives.
+    /// `CycleScanCollect` stores `false` again once scanning is done.
+    #[cfg(not(feature = "lxr_stw"))]
+    fn schedule_cycle_mark(&self, c: LazySweepingJobsCounter) {
+        self.satb_map.clear();
+        self.in_cycle_collection.store(true, Ordering::SeqCst);
+
+        // The pool filled two GCs ago, and the tag that matches it. Snapshotted rather than read
+        // from `curr_vec` later: that field is a `Cell`, and the packets may run on other workers.
+        let curr_vec = self.curr_vec.get();
+        let vec_index = ((curr_vec + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
+        let buffers = unsafe { self.s_cycle_candidates_mut() }
+            .into_final_buffers()
+            .into_vecs();
+
+        // One packet for now, holding every buffer, so this step changes no behaviour. Splitting
+        // it is the next step.
+        self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained].add(
+            CycleMark::<VM>::new(buffers, vec_index, curr_vec, c.clone_with_mark()),
+        );
+    }
+
+    /// Fires when the last mark packet finishes. Scanning and collecting are single-threaded, so
+    /// they go in one packet, and it must not start before mark is complete -- which is what the
+    /// mark counter this hangs off guarantees.
+    #[cfg(not(feature = "lxr_stw"))]
+    fn on_lazy_mark_finished(&self, c: LazySweepingJobsCounter) {
+        let buffers = std::mem::take(&mut *self.mark_survivors.lock().unwrap());
         self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained]
-            .add(CycleCollector::<VM>::new(c));
+            .add(CycleScanCollect::<VM>::new(buffers, self.curr_vec.get(), c));
     }
 
     fn on_lazy_sweeping_finished(&self) {
@@ -1537,6 +1581,16 @@ impl<VM: VMBinding> LXR<VM> {
             lxr.on_lazy_cc_finished(c);
         }));
 
+        // Only the concurrent path has a mark phase; with `lxr_stw` cycle collection runs inside
+        // the pause and `clone_with_mark` is never called, so the callback is never needed.
+        #[cfg(not(feature = "lxr_stw"))]
+        {
+            lazy_sweeping_jobs.end_of_mark = Some(Box::new(move |c| {
+                let lxr = unsafe { &*(lxr_ptr as *const Self) };
+                lxr.on_lazy_mark_finished(c);
+            }));
+        }
+
         lazy_sweeping_jobs.end_of_lazy = Some(Box::new(move || {
             let lxr = unsafe { &*(lxr_ptr as *const Self) };
             lxr.on_lazy_sweeping_finished();
@@ -1678,6 +1732,15 @@ impl<VM: VMBinding> LXR<VM> {
 
     /// Optional: read-only view (not strictly necessary)
     #[inline]
+    /// The candidate pool at `index`.
+    ///
+    /// # Safety
+    /// As [`Self::curr_s_cycle_candidates`].  For packets that snapshotted `curr_vec` instead of
+    /// reading the `Cell` -- the tag they write and the pool they push into must agree.
+    pub unsafe fn s_cycle_candidates_at(&self, index: u8) -> &BufferPool<ObjectReference> {
+        &(&*self.s_cycle_candidates.get())[index as usize]
+    }
+
     pub unsafe fn curr_s_cycle_candidates(&self) -> &BufferPool<ObjectReference> {
         & (&*self.s_cycle_candidates.get())[self.curr_vec.get() as usize]
     }
