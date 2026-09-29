@@ -214,6 +214,37 @@ pub mod cc {
             .is_ok()
     }
 
+    /// Move `o` from `BLACK_OUT_OF_STACK` to `BLACK_IN_STACK`, or leave it alone.
+    ///
+    /// The counterpart of [`try_claim_grey`] for the path that does *not* claim an object: `mark`
+    /// marks what it could not claim as in-stack.  A plain [`set_colour`] there is a blind store
+    /// over a colour that was read earlier, and the read-to-write gap is enough for another packet
+    /// to win [`try_claim_grey`].  The store then clobbers that `GREY` back to black, resurrecting
+    /// an object mid-walk: the claimer keeps subtracting its out-edges while a third packet is free
+    /// to claim and subtract them again, and `scan` later sees black instead of `GREY` and never
+    /// classifies it, so `scan_black` never restores what was taken.
+    ///
+    /// `GREY` and `WHITE` therefore have to be left untouched, and `BLACK_IN_STACK` is already the
+    /// target -- so the only transition is from `BLACK_OUT_OF_STACK`, and it has to be atomic.
+    /// `fetch_update_atomic` for the same sub-byte reason as [`try_claim_grey`].
+    #[inline(always)]
+    pub fn try_mark_in_stack(o: ObjectReference) -> bool {
+        OBJ_COLOR_TABLE
+            .fetch_update_atomic::<u8, _>(
+                o.to_raw_address(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |c| {
+                    if c == super::BLACK_OUT_OF_STACK {
+                        Some(super::BLACK_IN_STACK)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
+    }
+
     /// Set the trial-deletion colour of `o` with no atomic read-modify-write.
     ///
     /// # Safety

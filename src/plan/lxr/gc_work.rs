@@ -810,7 +810,6 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 } else {
                     #[cfg(feature = "s_rc_stats")]
                     { self.stats.mark_logged.set(self.stats.mark_logged.get() + 1); }
-                    cc::set_colour(curr, BLACK_IN_STACK, Ordering::Relaxed);
                     // Nothing was decremented, so there is nothing to revert -- but the NET effect
                     // of the old walk-then-revert has to be reproduced exactly, and it is
                     // asymmetric on purpose:
@@ -836,9 +835,30 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     cand_buffer.push(curr);
 
                     cc::set_tag(curr, (curr_vec + 1) as u8, Ordering::Relaxed);
+
+                    // Restore the colour LAST, and only here.  Deferring `curr` means its
+                    // out-edges are never subtracted, and BLACK_IN_STACK is what tells `scan`
+                    // (GREY only) and `scan_black` (`!is_black`) to leave it alone.  Written any
+                    // earlier, `curr` is BLACK with `tag == 0` and `strong_rc == 0` for the whole
+                    // loop above -- claimable again -- and a second mark packet re-greys it.  It
+                    // then re-enters `scan` with its out-edges un-subtracted: RC > 1 has
+                    // `scan_black` increment edges nothing decremented, and RC == 1 paints it
+                    // WHITE, so `collect_whites` frees it and death-processes children whose RC
+                    // then falls below the `real_refs + 1` floor.
+                    //
+                    // SeqCst, not Relaxed: the store must not become visible before the tag above,
+                    // or the window reopens between the two.  While the colour is GREY,
+                    // `try_claim_grey`'s CAS cannot succeed whatever a racing packet read for the
+                    // tag, which is what actually closes it.
+                    cc::set_colour(curr, BLACK_IN_STACK, Ordering::SeqCst);
                 }
             } else if is_black(curr) {
-                cc::set_colour(curr, BLACK_IN_STACK, Ordering::Relaxed);
+                // Could not be claimed -- tagged, still strongly referenced, or claimed by
+                // someone else -- so just record it as in-stack.  CAS, not a store: `is_black`
+                // was read at the top of the guard and another packet can win `try_claim_grey`
+                // before we get here, which a store would clobber back to black.  See
+                // `cc::try_mark_in_stack`.
+                let _ = cc::try_mark_in_stack(curr);
             }
         }
     }
@@ -1130,12 +1150,14 @@ impl<VM: VMBinding> CycleCollector<VM> {
 /// mark counter stays non-zero while any mark packet is outstanding; when the last one drops,
 /// `end_of_mark` fires and `LXR::on_lazy_mark_finished` schedules `CycleScanCollect`.
 ///
-/// One packet today.  Splitting it is what the `try_claim_grey` claim and the commit-ordered
-/// decrements of `mark` were put in place for.
+/// Several run at once, one per candidate buffer.  That is what the `try_claim_grey` claim and the
+/// commit-ordered decrements of `mark` were put in place for: the claim is what keeps an object's
+/// out-edges subtracted exactly once when two packets reach it from different candidates.
 pub struct CycleMark<VM: VMBinding> {
     t: CycleTraversal<VM>,
-    /// Candidate buffers this packet marks.  Taken in `do_work`, pruned, and deposited in
-    /// `lxr.mark_survivors` for the scan phase.
+    /// Candidate buffers this packet marks -- one, as scheduled.  Taken in `do_work`, pruned, and
+    /// deposited in `lxr.mark_survivors`, where every packet's survivors are concatenated for the
+    /// scan phase.
     buffers: Vec<Vec<ObjectReference>>,
     /// Tag of the pool the buffers were drained from; `should_mark` matches on it.
     vec_index: u8,

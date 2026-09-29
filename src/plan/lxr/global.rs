@@ -1417,11 +1417,28 @@ impl<VM: VMBinding> LXR<VM> {
             .into_final_buffers()
             .into_vecs();
 
-        // One packet for now, holding every buffer, so this step changes no behaviour. Splitting
-        // it is the next step.
-        self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained].add(
-            CycleMark::<VM>::new(buffers, vec_index, curr_vec, c.clone_with_mark()),
-        );
+        // One packet per candidate buffer. `pmd` gets ~60, `jython` one.
+        //
+        // `guard` keeps the mark counter above zero for the whole loop. `bucket.add` makes a
+        // packet stealable at once, so without it the first packet could finish and fire
+        // `end_of_mark` -- starting the scan -- while later packets were still being added. Same
+        // reason `Drop` mints the next phase's token before decrementing its own.
+        //
+        // It also covers an empty pool: the loop runs zero times, `guard` drops, and the scan
+        // packet is scheduled with nothing to scan. Without it nothing would ever increment the
+        // mark counter, `end_of_mark` would never fire, and `in_cycle_collection` would stay set
+        // until the next collection.
+        let bucket = &self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained];
+        let guard = c.clone_with_mark();
+        for buf in buffers {
+            bucket.add(CycleMark::<VM>::new(
+                vec![buf],
+                vec_index,
+                curr_vec,
+                c.clone_with_mark(),
+            ));
+        }
+        drop(guard);
     }
 
     /// Fires when the last mark packet finishes. Scanning and collecting are single-threaded, so
