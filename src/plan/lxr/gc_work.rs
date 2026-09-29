@@ -1,6 +1,6 @@
 use super::cm::LXRWeakRefProcessEdges;
 use super::{barrier, LXR};
-use crate::scheduler::{gc_work::*, GCWork, GCWorker};
+use crate::scheduler::{gc_work::*, GCWork, GCWorker, WorkBucketStage};
 use crate::util::ObjectReference;
 use crate::{vm::*, Plan, MMTK};
 use crate::util::rc::{cc, MAX_STRONG_REF_COUNT, BLACK_OUT_OF_STACK, BLACK_IN_STACK, GREY, WHITE, STRONG_RC_LAST_BEFORE_ZERO};
@@ -270,10 +270,33 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 /// **If any of that changes -- the remaining phases are split across workers, cycle collection is
 /// moved off the GC worker pool, or decrement work is allowed to overlap it -- every `unsafe` block
 /// in this impl becomes unsound and must go back to the atomic variants**, as `mark` already has.
+/// What `mark` needs in order to hand part of its DFS stack to another worker.
+///
+/// `Copy`, so it threads down `mark_buffer` -> `mark` -> `mark_from_stack` without reborrowing.
+/// `None` means "do not spill", which is how the `Pause::FullRC` path opts out: `CycleCollector`
+/// runs mark, scan and collect in one packet using the `*_exclusive` metadata stores, so it must
+/// not create packets that would still be running during its own scan -- see the impl header.
+#[derive(Clone, Copy)]
+struct Spill<'a> {
+    /// Borrowed from the spilling packet, so every packet it mints is counted in the same
+    /// generation's mark counter and `end_of_mark` cannot fire while any of them is outstanding.
+    c: &'a LazySweepingJobsCounter,
+    vec_index: u8,
+    curr_vec: u8,
+}
+
 impl<VM: VMBinding> CycleTraversal<VM>{
     
     pub const UNLOGGED_VALUE: u8 = 0b1;
     pub const LOGGED_VALUE: u8 = 0b0;
+
+    /// Hand work off once the DFS stack passes twice this, in chunks of this size.
+    ///
+    /// Mirrors `ProcessDecs::CAPACITY` (`crate::args::BUFFER_SIZE`, 1024), which is the same
+    /// mechanism: a bounded buffer that becomes a new packet instead of growing.  The high-water
+    /// mark is `2 *` so that crossing the line exports one chunk and leaves a full chunk to work
+    /// on, rather than exporting on every push from then on.
+    const SPLIT_THRESHOLD: usize = 2048;
 
     const UNLOG_BITS: SideMetadataSpec = *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
         .as_spec()
@@ -300,20 +323,26 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         candidates: &mut FinalBuffers<ObjectReference>,
         vec_index: u8,
         curr_vec: u8,
-        dfs_stack: &mut Vec<ObjectReference>,
+        work: &mut Vec<ObjectReference>,
         cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+        spill: Option<Spill<'_>>,
     ) {
-        // One object's children, collected before any of them is decremented -- see `mark`.
-        // Owned here rather than per candidate: `pmd` marks ~123 k candidates per GC, and this
-        // keeps its capacity across all of them.
-        let mut children = Vec::<ObjectReference>::with_capacity(64);
-
+        // Filter first, walk second.
+        //
+        // `should_mark` + `set_tag(cand, 0)` is the *candidate* claim, and it applies only to
+        // objects that came out of a pool.  Doing it for the whole buffer up front leaves a plain
+        // list of objects to walk, which is exactly the shape a spilled chunk has -- so both enter
+        // the traversal the same way and there is one loop rather than one per candidate.
+        //
+        // The pruning is not just bookkeeping: what survives here is what `CycleScanCollect` will
+        // scan, so rejects must leave the buffer.
+        work.reserve(candidates.len());
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
             if self.should_mark(*cand, vec_index) {
                 cc::set_tag(*cand, 0, Ordering::Relaxed);
                 debug_assert!(self.rc.count(*cand) > 0);
-                self.mark(*cand, lxr, curr_vec, dfs_stack, &mut children, cand_buffer);
+                work.push(*cand);
             } else {
                 if cc::strong_rc(*cand, Ordering::Relaxed) > 0 {
                     cc::set_tag(*cand, 0, Ordering::Relaxed);
@@ -321,6 +350,12 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 it.swap_remove_current();
             }
         }
+
+        // One object's children, collected before any of them is decremented -- see
+        // `mark_from_stack`.  Owned here rather than per object: `pmd` marks ~123 k candidates per
+        // GC, and this keeps its capacity across all of them.
+        let mut children = Vec::<ObjectReference>::with_capacity(64);
+        self.mark_from_stack(lxr, curr_vec, work, &mut children, cand_buffer, spill);
     }
 
     /// Cycle collection over **all three** candidate pools, phase-major:
@@ -500,7 +535,10 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             let mut cand_buffer = unsafe { lxr.curr_s_cycle_candidates() }.local_buffer();
             // Read after the `set` above and passed by value, so the handle and the tag `mark`
             // writes provably come from the same rotation step.
-            self.mark_buffer(lxr, candidates, *vec_index, lxr.curr_vec.get(), dfs_stack, &mut cand_buffer);
+            // `None`: a FullRC collection must not spill.  Its scan and collect run in this same
+            // packet with the `*_exclusive` stores, so a spilled packet still marking during them
+            // would break the one-thread contract the impl header sets out.
+            self.mark_buffer(lxr, candidates, *vec_index, lxr.curr_vec.get(), dfs_stack, &mut cand_buffer, None);
         }
 
         lxr.curr_vec.set(entry_vec);
@@ -710,22 +748,51 @@ impl<VM: VMBinding> CycleTraversal<VM>{
     /// `children` is scratch owned by `mark_buffer`, cleared once per object.
     /// `cand_buffer` is the shared producer handle owned by `do_work`; see its comment there for
     /// why one handle covers every phase.
-    fn mark(
+    /// The marking loop, over everything in `work` and everything it discovers.
+    ///
+    /// Two buffers, as in `ProcessDecs`: `work` is drained, `new_work` is filled with the children
+    /// found along the way, and a `new_work` that reaches [`Self::SPLIT_THRESHOLD`] becomes another
+    /// packet instead of growing.  When `work` runs dry the two swap, so whatever was not exported
+    /// is processed here.  Filled chunks leave, the partial remainder stays -- exactly
+    /// `ProcessDecs`, which exports `new_decs` on overflow and drains the leftover locally.
+    ///
+    /// Two buffers rather than one stack with a `drain(..n)`: taking a chunk out of the middle of a
+    /// single vector copies it out *and* shifts everything after it down, thousands of times per
+    /// GC.  Handing over a whole buffer is a pointer swap.
+    ///
+    /// Order is breadth-first by chunk rather than depth-first.  Trial deletion is indifferent --
+    /// it needs each object visited once and each out-edge subtracted once, neither of which is
+    /// order-dependent.
+    ///
+    /// `work` is drained to empty before returning, so `all_buff_gc` can reuse one buffer across
+    /// its three rounds and hand the same one to `scan`.
+    ///
+    /// `curr_vec` is the pool `cand_buffer` was acquired from, passed rather than read from
+    /// `lxr.curr_vec`: the tag written below and the pool pushed into must come from the same
+    /// value, and in the concurrent path several workers share that `Cell`.
+    fn mark_from_stack(
         &self,
-        o: ObjectReference,
         lxr: &LXR<VM>,
-        // The pool `cand_buffer` was acquired from, passed rather than read from `lxr.curr_vec`:
-        // the tag written below and the pool pushed into must come from the same value, and in the
-        // concurrent path several workers share that `Cell`.
         curr_vec: u8,
-        dfs_stack: &mut Vec<ObjectReference>,
+        work: &mut Vec<ObjectReference>,
         children: &mut Vec<ObjectReference>,
         cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+        spill: Option<Spill<'_>>,
     ) {
-        debug_assert!(dfs_stack.is_empty());
-        dfs_stack.push(o);
-        debug_assert!(self.rc.count(o) > 0);
-        while let Some(curr) = dfs_stack.pop() {
+        #[cfg(feature = "lxr_stw")]
+        let _ = spill;
+        let mut new_work = Vec::<ObjectReference>::with_capacity(Self::SPLIT_THRESHOLD);
+        loop {
+            let curr = match work.pop() {
+                Some(o) => o,
+                None => {
+                    if new_work.is_empty() {
+                        break;
+                    }
+                    std::mem::swap(work, &mut new_work);
+                    continue;
+                }
+            };
             debug_assert!(self.rc.count(curr) > 0);
             let mut is_logged = false;
             children.clear();
@@ -803,9 +870,36 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                         debug_assert!(prev != 1);
                         debug_assert!(prev != 0);
                         let _ = cc::strong_rc_dec(x);
-                        dfs_stack.push(x);
+                        new_work.push(x);
                         #[cfg(feature = "s_rc_stats")]
                         { self.stats.pushes.set(self.stats.pushes.get() + 1); }
+
+                        // A full buffer becomes a packet; the swap above never sees it.
+                        //
+                        // `x` was decremented on the line above before it was pushed, so a chunk is
+                        // complete the moment it leaves: the receiving packet pops it and applies
+                        // the same guard and `try_claim_grey` this one would have.
+                        //
+                        // `None` on the `Pause::FullRC` path, where `new_work` simply grows -- the
+                        // same single unbounded stack the loop had before spilling existed.
+                        #[cfg(not(feature = "lxr_stw"))]
+                        if let Some(sp) = spill {
+                            if new_work.len() >= Self::SPLIT_THRESHOLD {
+                                let chunk = std::mem::replace(
+                                    &mut new_work,
+                                    Vec::with_capacity(Self::SPLIT_THRESHOLD),
+                                );
+                                GCWorker::<VM>::current().add_work_prioritized(
+                                    WorkBucketStage::Unconstrained,
+                                    CycleMark::<VM>::spilled(
+                                        chunk,
+                                        sp.vec_index,
+                                        sp.curr_vec,
+                                        sp.c.clone_with_mark(),
+                                    ),
+                                );
+                            }
+                        }
                     }
                 } else {
                     #[cfg(feature = "s_rc_stats")]
@@ -1159,6 +1253,11 @@ pub struct CycleMark<VM: VMBinding> {
     /// deposited in `lxr.mark_survivors`, where every packet's survivors are concatenated for the
     /// scan phase.
     buffers: Vec<Vec<ObjectReference>>,
+    /// DFS work handed over by another packet's spill; empty in a seed packet.
+    ///
+    /// Resumed through `mark_from_stack`, NOT `mark_buffer`: these are objects found mid-traversal,
+    /// already decremented by their parent, and must skip the candidate filter.
+    stack: Vec<ObjectReference>,
     /// Tag of the pool the buffers were drained from; `should_mark` matches on it.
     vec_index: u8,
     /// `curr_vec` as it stood at fan-out -- the pool this packet's own candidates go INTO.
@@ -1177,9 +1276,33 @@ impl<VM: VMBinding> CycleMark<VM> {
         Self {
             t: CycleTraversal::new(),
             buffers,
+            stack: Vec::new(),
             vec_index,
             curr_vec,
             #[cfg(not(feature = "lxr_stw"))]
+            _c: c,
+        }
+    }
+
+    /// A packet for one chunk spilled out of another packet's DFS stack.
+    ///
+    /// No candidate buffers, so it deposits nothing in `mark_survivors` and never runs the
+    /// candidate filter.  `vec_index` is carried anyway rather than defaulted: 0 is the tag for
+    /// "not a candidate", so a defaulted one would make `should_mark` match non-candidates if this
+    /// packet ever gained buffers.
+    #[cfg(not(feature = "lxr_stw"))]
+    pub fn spilled(
+        stack: Vec<ObjectReference>,
+        vec_index: u8,
+        curr_vec: u8,
+        c: LazySweepingJobsCounter,
+    ) -> Self {
+        Self {
+            t: CycleTraversal::new(),
+            buffers: Vec::new(),
+            stack,
+            vec_index,
+            curr_vec,
             _c: c,
         }
     }
@@ -1191,9 +1314,10 @@ impl<VM: VMBinding> GCWork<VM> for CycleMark<VM> {
         #[cfg(feature = "s_rc_stats")]
         { self.t.stats.mark_packets.set(self.t.stats.mark_packets.get() + 1); }
 
-        // One stack, not two: `mark` has no nested traversal.  `children` is `mark`'s per-object
-        // collect buffer -- see `mark_buffer`.
-        let mut dfs_stack = Vec::<ObjectReference>::with_capacity(4096);
+        // Whatever was spilled to us, if anything.  `mark_buffer` appends this packet's own
+        // candidates to it and runs one traversal over the lot, so a seed packet and a spill packet
+        // take the same path -- a seed packet just starts from an empty `work`.
+        let mut work = std::mem::take(&mut self.stack);
         let mut candidates = FinalBuffers::from_vecs(std::mem::take(&mut self.buffers));
 
         #[cfg(feature = "graph_project")]
@@ -1209,19 +1333,33 @@ impl<VM: VMBinding> GCWork<VM> for CycleMark<VM> {
         // The pool named by the SNAPSHOT, so the handle and the tag `mark` writes cannot disagree.
         let mut cand_buffer = unsafe { lxr.s_cycle_candidates_at(self.curr_vec) }.local_buffer();
 
+        // Spilling is on for this packet, and only this packet type -- `CycleCollector` passes
+        // `None`.  Borrowing our own token means a chunk we hand off is counted in the same
+        // generation, and our token stays alive until `do_work` returns, so the mark counter cannot
+        // reach zero while we are still splitting.
+        #[cfg(not(feature = "lxr_stw"))]
+        let spill = Some(Spill {
+            c: &self._c,
+            vec_index: self.vec_index,
+            curr_vec: self.curr_vec,
+        });
+        #[cfg(feature = "lxr_stw")]
+        let spill: Option<Spill<'_>> = None;
+
         self.t.mark_buffer(
             lxr,
             &mut candidates,
             self.vec_index,
             self.curr_vec,
-            &mut dfs_stack,
+            &mut work,
             &mut cand_buffer,
+            spill,
         );
 
         #[cfg(feature = "s_rc_stats")]
         {
             self.t.stats.candidates_after_filter = candidates.len();
-            self.t.stats.peak_stack = dfs_stack.capacity();
+            self.t.stats.peak_stack = work.capacity();
             self.t.stats.flush_to_counters();
         }
 
