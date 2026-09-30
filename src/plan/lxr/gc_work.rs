@@ -1372,20 +1372,54 @@ impl<VM: VMBinding> GCWork<VM> for CycleMark<VM> {
     }
 }
 
-/// Scan and collect, after every mark packet has finished.
+/// Scan, after every mark packet has finished.
 ///
-/// Single-threaded by design -- `scan`, `scan_black`, `collect_whites` and `collect_blacks` all use
-/// the `*_exclusive` metadata stores, whose contract is that one thread does all the RC work.  The
-/// mark counter is what guarantees this starts only once mark is complete.
-pub struct CycleScanCollect<VM: VMBinding> {
+/// **Single-threaded, and out of scope for parallelisation** --
+/// `CYCLE_COLLECTOR_PARALLEL_COLLECT_PLAN.md` §10.  `scan` and `scan_black` keep every
+/// `*_exclusive` store, which is sound because the mark counter guarantees this starts only after
+/// mark is complete and the scan counter guarantees collect starts only after this.
+///
+/// It nonetheless has a counter and a callback of its own, like the other three phases, so that the
+/// day scan is parallelised the join already exists.
+pub struct CycleScan<VM: VMBinding> {
+    t: CycleTraversal<VM>,
+    /// The surviving candidates from mark.  Scan neither adds nor removes any, so these are handed
+    /// on to collect unchanged.
+    buffers: Vec<Vec<ObjectReference>>,
+    #[cfg(not(feature = "lxr_stw"))]
+    _c: LazySweepingJobsCounter,
+}
+
+impl<VM: VMBinding> CycleScan<VM> {
+    pub fn new(
+        buffers: Vec<Vec<ObjectReference>>,
+        #[cfg(not(feature = "lxr_stw"))] c: LazySweepingJobsCounter,
+    ) -> Self {
+        Self {
+            t: CycleTraversal::new(),
+            buffers,
+            #[cfg(not(feature = "lxr_stw"))]
+            _c: c,
+        }
+    }
+}
+
+/// Collect, after scan has finished.
+///
+/// One packet today; `collect_whites` and `collect_blacks` still use the `*_exclusive` stores and
+/// still read `lxr.curr_vec` directly, both of which are sound only while that is true.  Stage C3
+/// of the plan converts them; **do not schedule more than one of these before it has.**
+pub struct CycleCollect<VM: VMBinding> {
     t: CycleTraversal<VM>,
     buffers: Vec<Vec<ObjectReference>>,
+    /// The pool this packet's `LocalBuffer` is taken from -- `collect_blacks` produces candidates
+    /// for the next GC.
     curr_vec: u8,
     #[cfg(not(feature = "lxr_stw"))]
     _c: LazySweepingJobsCounter,
 }
 
-impl<VM: VMBinding> CycleScanCollect<VM> {
+impl<VM: VMBinding> CycleCollect<VM> {
     pub fn new(
         buffers: Vec<Vec<ObjectReference>>,
         curr_vec: u8,
@@ -1401,25 +1435,53 @@ impl<VM: VMBinding> CycleScanCollect<VM> {
     }
 }
 
-impl<VM: VMBinding> GCWork<VM> for CycleScanCollect<VM> {
+impl<VM: VMBinding> GCWork<VM> for CycleScan<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         let mut candidates = FinalBuffers::from_vecs(std::mem::take(&mut self.buffers));
 
-        // Two stacks: `scan` nests into `scan_black` and `collect_whites` into `collect_blacks`.
+        // Two stacks: `scan` nests into `scan_black`.
+        //
+        // No `LocalBuffer`: `scan` and `scan_black` produce no candidates, so this phase needs no
+        // producer handle.  Only collect does.
         let mut dfs_stack = Vec::<ObjectReference>::with_capacity(4096);
         let mut nested_stack = Vec::<ObjectReference>::with_capacity(4096);
-        let mut cand_buffer = unsafe { lxr.s_cycle_candidates_at(self.curr_vec) }.local_buffer();
 
-        // Scan phase: classify GREY objects as WHITE (garbage) or restore to BLACK
+        // Classify GREY objects as WHITE (garbage) or restore them to BLACK.
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
             self.t.scan(*cand, lxr, &mut dfs_stack, &mut nested_stack);
         }
 
+        // Stays here, as the last thing scanning does: collect runs with the barrier off.
         lxr.in_cycle_collection.store(false, Ordering::Relaxed);
 
-        // Collect phase: free WHITE objects and handle remaining BLACK_IN_STACK
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.t.stats.peak_stack = dfs_stack.capacity().max(nested_stack.capacity());
+            self.t.stats.flush_to_counters();
+        }
+
+        // Hand the candidates on, BEFORE `_c` drops: that drop is what fires `end_of_scan`, which
+        // reads them.  Scan removed none of them.
+        lxr.scan_survivors
+            .lock()
+            .unwrap()
+            .extend(candidates.into_vecs());
+    }
+}
+
+impl<VM: VMBinding> GCWork<VM> for CycleCollect<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        let mut candidates = FinalBuffers::from_vecs(std::mem::take(&mut self.buffers));
+
+        // Two stacks: `collect_whites` nests into `collect_blacks`.
+        let mut dfs_stack = Vec::<ObjectReference>::with_capacity(4096);
+        let mut nested_stack = Vec::<ObjectReference>::with_capacity(4096);
+        let mut cand_buffer = unsafe { lxr.s_cycle_candidates_at(self.curr_vec) }.local_buffer();
+
+        // Free WHITE objects and handle the remaining BLACK_IN_STACK ones.
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
             debug_assert!(cc::colour(*cand, Ordering::SeqCst) != GREY);
@@ -1428,17 +1490,12 @@ impl<VM: VMBinding> GCWork<VM> for CycleScanCollect<VM> {
 
         #[cfg(feature = "s_rc_stats")]
         {
+            // A peak reading, so it belongs after collecting.  `fetch_max` in `flush_to_counters`,
+            // so several packets taking it is correct.
             self.t.stats.satb_map_size = lxr.satb_map.len();
             self.t.stats.peak_stack = dfs_stack.capacity().max(nested_stack.capacity());
             self.t.stats.flush_to_counters();
         }
-
-        // End of the whole cycle-collection segment, which is what `scripts/lxr/window.py` reads
-        // this line as -- so it belongs here, not at the end of mark.
-        gc_log!([2]
-            " - lazy cc finished since-gc-start={:.3}ms",
-            crate::gc_start_time_ms(),
-        );
     }
 }
 

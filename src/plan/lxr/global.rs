@@ -8,7 +8,7 @@ use crate::plan::global::{BasePlan, CreateGeneralPlanArgs, CreateSpecificPlanArg
 use crate::plan::immix::Pause;
 use crate::plan::lxr::gc_work::{CycleCollector, FastRCPrepare};
 #[cfg(not(feature = "lxr_stw"))]
-use crate::plan::lxr::gc_work::{CycleMark, CycleScanCollect};
+use crate::plan::lxr::gc_work::{CycleCollect, CycleMark, CycleScan};
 use crate::plan::AllocationSemantics;
 use crate::plan::MutatorContext;
 use crate::plan::Plan;
@@ -136,6 +136,10 @@ pub struct LXR<VM: VMBinding> {
     /// survivors here; `on_lazy_mark_finished` drains it into the scan/collect packet.  It exists
     /// because the counter token that joins the two phases carries no data.
     pub mark_survivors: Mutex<Vec<Vec<ObjectReference>>>,
+    /// The same, one phase later: `CycleScan` parks the candidates here and
+    /// `on_lazy_scan_finished` drains them into the collect packets.  Scan adds and removes no
+    /// candidates, so what arrives is exactly what mark left.
+    pub scan_survivors: Mutex<Vec<Vec<ObjectReference>>>,
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
     pub in_cycle_collection: AtomicBool,
     pub rc_with_overflow: RefCountWithOverflow<VM>,
@@ -727,6 +731,7 @@ impl<VM: VMBinding> LXR<VM> {
             #[cfg(feature = "sanity")]
             rc_sanity_objects: Mutex::new(Vec::new()),
             mark_survivors: Mutex::new(Vec::new()),
+            scan_survivors: Mutex::new(Vec::new()),
             satb_map: DashMap::with_capacity(SATB_DEFAULT_SIZE),
             in_cycle_collection: AtomicBool::new(false),
             #[cfg(feature = "graph_project")]
@@ -1403,7 +1408,7 @@ impl<VM: VMBinding> LXR<VM> {
     /// Both stores must happen HERE, before any mark packet can run: a mark packet that greys an
     /// object while `in_cycle_collection` is still false leaves the mutator barrier not logging,
     /// and `scan`'s `get_child` then spins forever on a `satb_map` entry that never arrives.
-    /// `CycleScanCollect` stores `false` again once scanning is done.
+    /// `CycleScan` stores `false` again once scanning is done.
     #[cfg(not(feature = "lxr_stw"))]
     fn schedule_cycle_mark(&self, c: LazySweepingJobsCounter) {
         self.satb_map.clear();
@@ -1448,7 +1453,39 @@ impl<VM: VMBinding> LXR<VM> {
     fn on_lazy_mark_finished(&self, c: LazySweepingJobsCounter) {
         let buffers = std::mem::take(&mut *self.mark_survivors.lock().unwrap());
         self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained]
-            .add(CycleScanCollect::<VM>::new(buffers, self.curr_vec.get(), c));
+            .add(CycleScan::<VM>::new(buffers, c.clone_with_scan()));
+    }
+
+    /// Fires when scanning finishes.  Collecting is single-threaded for now, so this schedules one
+    /// packet -- but it takes the guard token it will need when that becomes a loop (stage C4):
+    /// `add` makes a packet stealable at once, so without it the first packet could finish and fire
+    /// `end_of_collect` while later ones were still being added.
+    ///
+    /// `curr_vec` is read here rather than carried from the mark fan-out.  It cannot have moved:
+    /// only `schedule_collection` writes it, and the generation's whole lazy chain completes before
+    /// the next GC starts (`all_finished`).
+    #[cfg(not(feature = "lxr_stw"))]
+    fn on_lazy_scan_finished(&self, c: LazySweepingJobsCounter) {
+        let buffers = std::mem::take(&mut *self.scan_survivors.lock().unwrap());
+        let curr_vec = self.curr_vec.get();
+        let bucket = &self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained];
+        let guard = c.clone_with_collect();
+        bucket.add(CycleCollect::<VM>::new(buffers, curr_vec, c.clone_with_collect()));
+        drop(guard);
+    }
+
+    /// Fires when the last collect packet finishes.  Schedules nothing -- it closes the
+    /// cycle-collection segment.
+    ///
+    /// The log line must be HERE and nowhere earlier: `scripts/lxr/window.py` pairs on it to bound
+    /// the cycle-collection window, so emitting it at the end of scan would silently shrink every
+    /// `cc_mean_ms` in the evaluation.
+    #[cfg(not(feature = "lxr_stw"))]
+    fn on_lazy_collect_finished(&self, _c: LazySweepingJobsCounter) {
+        gc_log!([2]
+            " - lazy cc finished since-gc-start={:.3}ms",
+            crate::gc_start_time_ms(),
+        );
     }
 
     fn on_lazy_sweeping_finished(&self) {
@@ -1605,6 +1642,14 @@ impl<VM: VMBinding> LXR<VM> {
             lazy_sweeping_jobs.end_of_mark = Some(Box::new(move |c| {
                 let lxr = unsafe { &*(lxr_ptr as *const Self) };
                 lxr.on_lazy_mark_finished(c);
+            }));
+            lazy_sweeping_jobs.end_of_scan = Some(Box::new(move |c| {
+                let lxr = unsafe { &*(lxr_ptr as *const Self) };
+                lxr.on_lazy_scan_finished(c);
+            }));
+            lazy_sweeping_jobs.end_of_collect = Some(Box::new(move |c| {
+                let lxr = unsafe { &*(lxr_ptr as *const Self) };
+                lxr.on_lazy_collect_finished(c);
             }));
         }
 

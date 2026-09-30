@@ -120,6 +120,23 @@ pub struct LazySweepingJobsCounter {
     /// with no mark phase, and the token it is handed comes from a plain `clone`, so its drop must
     /// leave the mark counter alone -- which is exactly what this flag buys.
     counted_in_mark: bool,
+    /// This token's generation's **scan** counter.  Carried by every token, as `mark_counter` is,
+    /// and for the same reason: the fan-out that creates the scan packet holds only the token
+    /// `end_of_mark` handed it.
+    ///
+    /// Scan is one packet today, so this counter never exceeds 1.  It exists anyway so that all
+    /// four phases share one shape and a parallel scan needs no new plumbing --
+    /// `CYCLE_COLLECTOR_PARALLEL_COLLECT_PLAN.md` §6.
+    scan_counter: Arc<AtomicUsize>,
+    /// Whether this token is counted in [`Self::scan_counter`].  Only [`Self::clone_with_scan`]
+    /// sets it; `Pause::FullRC` has no separate scan phase and passes straight through.
+    counted_in_scan: bool,
+    /// This token's generation's **collect** counter, for the parallel collect phase.  Carried by
+    /// every token, as `mark_counter` is.
+    collect_counter: Arc<AtomicUsize>,
+    /// Whether this token is counted in [`Self::collect_counter`].  Only
+    /// [`Self::clone_with_collect`] sets it; `Pause::FullRC` passes straight through.
+    counted_in_collect: bool,
     /// This token's generation's overall counter.  Every token is counted in it.
     counter: Arc<AtomicUsize>,
 }
@@ -133,6 +150,10 @@ impl LazySweepingJobsCounter {
             cc_counter: None,
             mark_counter: lazy_sweeping_jobs.curr_mark_counter.as_ref().unwrap().clone(),
             counted_in_mark: false,
+            scan_counter: lazy_sweeping_jobs.curr_scan_counter.as_ref().unwrap().clone(),
+            counted_in_scan: false,
+            collect_counter: lazy_sweeping_jobs.curr_collect_counter.as_ref().unwrap().clone(),
+            counted_in_collect: false,
             counter: counter.clone(),
         }
     }
@@ -154,6 +175,10 @@ impl LazySweepingJobsCounter {
             cc_counter: Some(cc_counter.clone()),
             mark_counter: lazy_sweeping_jobs.curr_mark_counter.as_ref().unwrap().clone(),
             counted_in_mark: false,
+            scan_counter: lazy_sweeping_jobs.curr_scan_counter.as_ref().unwrap().clone(),
+            counted_in_scan: false,
+            collect_counter: lazy_sweeping_jobs.curr_collect_counter.as_ref().unwrap().clone(),
+            counted_in_collect: false,
             counter: counter.clone(),
         }
     }
@@ -166,6 +191,10 @@ impl LazySweepingJobsCounter {
             cc_counter: None,
             mark_counter: self.mark_counter.clone(),
             counted_in_mark: false,
+            scan_counter: self.scan_counter.clone(),
+            counted_in_scan: false,
+            collect_counter: self.collect_counter.clone(),
+            counted_in_collect: false,
             counter: self.counter.clone(),
         }
     }
@@ -190,6 +219,10 @@ impl LazySweepingJobsCounter {
             cc_counter: self.cc_counter.clone(),
             mark_counter: self.mark_counter.clone(),
             counted_in_mark: false,
+            scan_counter: self.scan_counter.clone(),
+            counted_in_scan: false,
+            collect_counter: self.collect_counter.clone(),
+            counted_in_collect: false,
             counter: self.counter.clone(),
         }
     }
@@ -211,6 +244,10 @@ impl LazySweepingJobsCounter {
             cc_counter: self.cc_counter.clone(),
             mark_counter: self.mark_counter.clone(),
             counted_in_mark: false,
+            scan_counter: self.scan_counter.clone(),
+            counted_in_scan: false,
+            collect_counter: self.collect_counter.clone(),
+            counted_in_collect: false,
             counter: self.counter.clone(),
         }
     }
@@ -220,6 +257,48 @@ impl LazySweepingJobsCounter {
     /// Callers: the mark fan-out in `LXR::on_lazy_cc_finished`, once per initial packet, and each
     /// mark packet when it splits.  While any of them is outstanding the mark counter is non-zero,
     /// so `end_of_mark` -- and with it the scan/collect packet -- cannot fire early.
+    /// Create a token for the **scan** packet, in the same generation as `self`.
+    ///
+    /// One caller, the scan fan-out in `LXR::on_lazy_mark_finished`, and one packet -- but the
+    /// shape matches [`Self::clone_with_mark`] so that a parallel scan is a change of packet count
+    /// and nothing else.
+    pub fn clone_with_scan(&self) -> Self {
+        self.scan_counter.fetch_add(1, Ordering::SeqCst);
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        Self {
+            decs_counter: None,
+            cc_counter: None,
+            mark_counter: self.mark_counter.clone(),
+            counted_in_mark: false,
+            scan_counter: self.scan_counter.clone(),
+            counted_in_scan: true,
+            collect_counter: self.collect_counter.clone(),
+            counted_in_collect: false,
+            counter: self.counter.clone(),
+        }
+    }
+
+    /// Create a token for one unit of **collect** work, in the same generation as `self`.
+    ///
+    /// Callers: the collect fan-out in `LXR::on_lazy_scan_finished`, once per packet plus the
+    /// guard it holds across the loop.  While any is outstanding the collect counter is non-zero,
+    /// so `end_of_collect` -- and with it the end-of-segment log line -- cannot fire early.
+    pub fn clone_with_collect(&self) -> Self {
+        self.collect_counter.fetch_add(1, Ordering::SeqCst);
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        Self {
+            decs_counter: None,
+            cc_counter: None,
+            mark_counter: self.mark_counter.clone(),
+            counted_in_mark: false,
+            scan_counter: self.scan_counter.clone(),
+            counted_in_scan: false,
+            collect_counter: self.collect_counter.clone(),
+            counted_in_collect: true,
+            counter: self.counter.clone(),
+        }
+    }
+
     pub fn clone_with_mark(&self) -> Self {
         self.mark_counter.fetch_add(1, Ordering::SeqCst);
         self.counter.fetch_add(1, Ordering::SeqCst);
@@ -228,6 +307,10 @@ impl LazySweepingJobsCounter {
             cc_counter: None,
             mark_counter: self.mark_counter.clone(),
             counted_in_mark: true,
+            scan_counter: self.scan_counter.clone(),
+            counted_in_scan: false,
+            collect_counter: self.collect_counter.clone(),
+            counted_in_collect: false,
             counter: self.counter.clone(),
         }
     }
@@ -251,22 +334,54 @@ impl Drop for LazySweepingJobsCounter {
             }
         }
 
-        // 2) middle phase finished? -> trigger end_of_cc(token_for_overall).
-        //    Since the reorder, that means sweeping is done and cycle collection is scheduled.
+        // 2) .. 3c) the phase chain: cc -> mark -> scan -> collect.
+        //
+        // `else if`, not four separate `if`s, because a token is counted in **at most one** of
+        // these.  Every constructor sets exactly one of `cc_counter`, `counted_in_mark`,
+        // `counted_in_scan`, `counted_in_collect` -- or none, for a token that only holds the
+        // overall counter alive.  The chain states that invariant instead of leaving it implicit.
+        //
+        // **The decrement step above is deliberately NOT part of the chain.** A decs token is
+        // counted in `cc_counter` as well (`new_decs`, `clone_with_decs`), so that the middle
+        // counter cannot reach zero while decrements are still outstanding.  It has to run step 1
+        // *and* step 2.
+        //
+        // Each arm hands the callback a token that keeps the OVERALL counter alive but is not
+        // counted in the phase that just ended.
+        debug_assert!(
+            self.cc_counter.is_some() as u8
+                + self.counted_in_mark as u8
+                + self.counted_in_scan as u8
+                + self.counted_in_collect as u8
+                <= 1,
+            "a token may be counted in at most one of cc / mark / scan / collect; with the `else \
+             if` chain below, a token counted in two would silently skip a decrement and that \
+             counter would never reach zero"
+        );
         if let Some(cc) = self.cc_counter.as_ref() {
+            // Since the reorder, this means sweeping is done and cycle collection is scheduled.
             if cc.fetch_sub(1, Ordering::SeqCst) == 1 {
                 let f = lazy.end_of_cc.as_ref().unwrap();
-                f(self.clone()); // keeps overall alive, NOT cc
+                f(self.clone());
             }
-        }
-
-        // 3) mark finished? -> trigger end_of_mark(token_for_overall), which schedules the
-        //    single-threaded scan/collect packet.  Gated on `counted_in_mark`, so the token handed
-        //    to a `Pause::FullRC` collection -- which has no mark phase -- passes straight through.
-        if self.counted_in_mark {
+        } else if self.counted_in_mark {
+            // Schedules the scan packet.  A `Pause::FullRC` token has no mark phase and its
+            // `counted_in_mark` is false, so it passes straight through.
             if self.mark_counter.fetch_sub(1, Ordering::SeqCst) == 1 {
                 let f = lazy.end_of_mark.as_ref().unwrap();
-                f(self.clone()); // keeps overall alive, NOT mark
+                f(self.clone());
+            }
+        } else if self.counted_in_scan {
+            // Fans out the collect packets.
+            if self.scan_counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let f = lazy.end_of_scan.as_ref().unwrap();
+                f(self.clone());
+            }
+        } else if self.counted_in_collect {
+            // Schedules nothing -- it closes the cycle-collection segment.
+            if self.collect_counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let f = lazy.end_of_collect.as_ref().unwrap();
+                f(self.clone());
             }
         }
 
@@ -286,11 +401,17 @@ pub struct LazySweepingJobs {
     curr_cc_counter: Option<Arc<AtomicUsize>>,      // Eyal added this for cycle collection phase
     prev_mark_counter: Option<Arc<AtomicUsize>>,
     curr_mark_counter: Option<Arc<AtomicUsize>>,
+    prev_scan_counter: Option<Arc<AtomicUsize>>,
+    curr_scan_counter: Option<Arc<AtomicUsize>>,
+    prev_collect_counter: Option<Arc<AtomicUsize>>,
+    curr_collect_counter: Option<Arc<AtomicUsize>>,
     prev_counter: Option<Arc<AtomicUsize>>,
     curr_counter: Option<Arc<AtomicUsize>>,
     pub end_of_decs: Option<Box<dyn Send + Sync + Fn(LazySweepingJobsCounter)>>,
     pub end_of_cc: Option<Box<dyn Send + Sync + Fn(LazySweepingJobsCounter)>>,     // Eyal added this for cycle collection phase
     pub end_of_mark: Option<Box<dyn Send + Sync + Fn(LazySweepingJobsCounter)>>,
+    pub end_of_scan: Option<Box<dyn Send + Sync + Fn(LazySweepingJobsCounter)>>,
+    pub end_of_collect: Option<Box<dyn Send + Sync + Fn(LazySweepingJobsCounter)>>,
     pub end_of_lazy: Option<Box<dyn Send + Sync + Fn()>>,
 }
 
@@ -303,11 +424,17 @@ impl LazySweepingJobs {
             curr_cc_counter: None,
             prev_mark_counter: None,
             curr_mark_counter: None,
+            prev_scan_counter: None,
+            curr_scan_counter: None,
+            prev_collect_counter: None,
+            curr_collect_counter: None,
             prev_counter: None,
             curr_counter: None,
             end_of_decs: None,
             end_of_cc: None,
             end_of_mark: None,
+            end_of_scan: None,
+            end_of_collect: None,
             end_of_lazy: None,
         }
     }
@@ -331,6 +458,12 @@ impl LazySweepingJobs {
 
         self.prev_mark_counter = self.curr_mark_counter.take();
         self.curr_mark_counter = Some(Arc::new(AtomicUsize::new(0)));
+
+        self.prev_scan_counter = self.curr_scan_counter.take();
+        self.curr_scan_counter = Some(Arc::new(AtomicUsize::new(0)));
+
+        self.prev_collect_counter = self.curr_collect_counter.take();
+        self.curr_collect_counter = Some(Arc::new(AtomicUsize::new(0)));
     
         self.prev_counter = self.curr_counter.take();
         self.curr_counter = Some(Arc::new(AtomicUsize::new(0)));
