@@ -245,6 +245,73 @@ pub mod cc {
             .is_ok()
     }
 
+    /// Claim `o` for freeing as cyclic garbage: `WHITE -> BLACK_OUT_OF_STACK`, one winner.
+    ///
+    /// `collect_whites` tests the colour and then frees, and those are separate operations: two
+    /// packets that both read `WHITE` would both free.  Most of that double free is benign --
+    /// the metadata writes are idempotent, `rc.dec` saturates at 0 (`Self::dec`), `Block::log()`
+    /// admits one enqueue and `LargeObjectSpace::rc_free` one release -- but two are not:
+    ///
+    /// * **LOS is a use-after-free.**  The branch walks the object's fields *before*
+    ///   `process_dead_object`, and `rc_free` releases pages immediately, with none of the
+    ///   deferral Immix gets from the sweep.  The loser reads memory the winner has returned.
+    /// * `crate::stat`'s dead-object and dead-volume totals are double counted.
+    ///
+    /// Making the colour store itself the claim costs nothing measurable: contention on the mark
+    /// phase's equivalent CAS measured 8.5 per million (`FINDINGS.md` §27.2).
+    #[inline(always)]
+    pub fn try_claim_white(o: ObjectReference) -> bool {
+        OBJ_COLOR_TABLE
+            .fetch_update_atomic::<u8, _>(
+                o.to_raw_address(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |c| {
+                    if c == super::WHITE {
+                        Some(super::BLACK_OUT_OF_STACK)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
+    }
+
+    /// Claim `o` for freeing as an unreferenced black object: `BLACK_IN_STACK ->
+    /// BLACK_OUT_OF_STACK`, one winner.
+    ///
+    /// **Callers must test `rc(o) == 1` BEFORE calling this, not after.**  The colour CAS picks one
+    /// winner, but the other half of the condition cannot be claimed -- and does not need to be,
+    /// because reference counts are **monotonically non-increasing** for the whole collect phase:
+    /// `scan_black`'s increments belong to the scan phase, which has fully joined; `collect_blacks`
+    /// only decrements; the next generation's `ProcessDecs` cannot overlap; and mutators increment
+    /// only objects they hold a reference to, of which they hold none into the collect set.  So
+    /// once a thread has read 1, nothing can move it except the winner of this CAS.
+    ///
+    /// Testing first is also what keeps this free of the hazard recorded in
+    /// `CYCLE_COLLECTOR_PARALLEL_PLAN.md` §10.1: claiming first would mean restoring the colour on
+    /// a failed re-test, and a colour store that undoes a claim is exactly what that bug was.
+    ///
+    /// A thread that reads `rc == 2` skips without writing anything, and loses nothing: the packet
+    /// whose decrement takes the object to 1 observes `prev_rc == 2` and pushes it itself.
+    #[inline(always)]
+    pub fn try_claim_black_in_stack(o: ObjectReference) -> bool {
+        OBJ_COLOR_TABLE
+            .fetch_update_atomic::<u8, _>(
+                o.to_raw_address(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |c| {
+                    if c == super::BLACK_IN_STACK {
+                        Some(super::BLACK_OUT_OF_STACK)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
+    }
+
     /// Set the trial-deletion colour of `o` with no atomic read-modify-write.
     ///
     /// # Safety

@@ -680,7 +680,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             let mut it = candidates.iter_mut();
             while let Some(cand) = it.next() {
                 debug_assert!(cc::colour(*cand, Ordering::SeqCst) != GREY);
-                self.collect_whites(*cand, lxr, dfs_stack, nested_stack, &mut cand_buffer);
+                self.collect_whites(*cand, lxr, dfs_stack, nested_stack, &mut cand_buffer, lxr.curr_vec.get());
             }
         }
         drop(cand_buffer);
@@ -1067,6 +1067,10 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         dfs_stack: &mut Vec<ObjectReference>,
         black_stack: &mut Vec<ObjectReference>,
         cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+        // The pool `cand_buffer` was acquired from, passed rather than read from `lxr.curr_vec`:
+        // `collect_blacks` tags what it pushes, and the tag and the pool must come from the same
+        // value.  Several workers share that `Cell` once collect is split.
+        curr_vec: u8,
     ) {
         debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
@@ -1082,7 +1086,9 @@ impl<VM: VMBinding> CycleTraversal<VM>{
 
             debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
 
-            if cc::colour(curr, Ordering::Relaxed) == WHITE {
+            // The colour store IS the claim, so it comes first -- everything below it frees the
+            // object, and only the winner may do that.  See `cc::try_claim_white`.
+            if cc::try_claim_white(curr) {
                 #[cfg(feature = "graph_project")]
                 {
                     let mut reporter = lxr.graph_reporter.lock().unwrap();
@@ -1090,20 +1096,39 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 }
                 debug_assert!(self.rc.count(curr) == 1);
                 debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) == 0);
-                // SAFETY: single-threaded CycleFullRC -- see the impl header.
-                unsafe { cc::set_tag_exclusive(curr, 0, Ordering::Relaxed) };
-                // SAFETY: single-threaded CycleFullRC -- see the impl header.
-                unsafe { cc::set_colour_exclusive(curr, BLACK_OUT_OF_STACK, Ordering::Relaxed) };
+                cc::set_tag(curr, 0, Ordering::Relaxed);
                 debug_assert!(lxr.rc.count(curr) == 1);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
-                self.process_dead_object(curr, lxr);
-                // SAFETY: single-threaded CycleFullRC -- see the impl header.
-                unsafe { self.rc.dec_exclusive(curr) };
+                let is_los = self.process_dead_object(curr, lxr);
+                // Free: RC -> 0 as a plain store, not `dec`.
+                //
+                // `dec` is a `fetch_update` CAS loop (`util/rc.rs`) and none of it is needed here.
+                // On the Immix path RC is provably exactly 1: the claim above admits one winner, so
+                // no other thread owns `curr`; nothing raises an RC during collect
+                // (`cc::try_claim_black_in_stack` lists why); and no other walk can decrement an
+                // object already at 1, because a walk only decrements children it still holds an
+                // edge to and RC 1 means none remain. With the default 8-bit `RC_TABLE` this is a
+                // single atomic byte store.
+                //
+                // **On the LOS path RC is already 0** and this store is idempotent:
+                // `process_dead_object` called `los().rc_free`, and
+                // `LargeObjectSpace::release_object` zeroes the RC itself before releasing the
+                // pages. The `dec_exclusive` this replaced absorbed that silently through its
+                // `old == 0` guard, which is why nothing here ever noticed. The assertion is
+                // therefore Immix-only -- `rc_free` also no-ops when the object is not in
+                // `rc_mature_objects`, so LOS has no single expected value to check.
+                debug_assert!(
+                    is_los || self.rc.count(curr) == 1,
+                    "the Immix 1 -> 0 free assumes RC is exactly 1"
+                );
+                self.rc.set(curr, 0);
             } else if cc::colour(curr, Ordering::Relaxed) == BLACK_IN_STACK
                 && self.rc.count(curr) == 1
             {
-                debug_assert!(cc::tag(curr, Ordering::Relaxed) != 0);
-                self.collect_blacks(curr, lxr, black_stack, cand_buffer);
+                // A filter, not a claim.  `collect_blacks` claims every object it pops, including
+                // this one -- objects also enter its loop through the `prev_rc == 2` push, and
+                // those would otherwise reach a free unclaimed.
+                self.collect_blacks(curr, lxr, black_stack, cand_buffer, curr_vec);
             }
         }
     }
@@ -1122,29 +1147,39 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         lxr: &LXR<VM>,
         dfs_stack: &mut Vec<ObjectReference>,
         cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+        curr_vec: u8,
     ) {
         debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
+            // Claim before anything else: everything below frees `curr`, and only one thread may.
+            //
+            // `rc == 1` FIRST, then the CAS -- never the other way round.  Reference counts only
+            // fall during collect, so a thread that has read 1 knows nothing can move it except
+            // the winner of this CAS; claiming first would mean restoring the colour on a failed
+            // re-test, which is the `CYCLE_COLLECTOR_PARALLEL_PLAN.md` §10.1 hazard exactly.
+            // See `cc::try_claim_black_in_stack`.
+            //
+            // This covers both ways in: the object `collect_whites` handed us, and the ones the
+            // `prev_rc == 2` push below adds.
+            if self.rc.count(curr) != 1 || !cc::try_claim_black_in_stack(curr) {
+                continue;
+            }
             #[cfg(feature = "s_rc_stats")]
             { self.stats.objects_in_collect.set(self.stats.objects_in_collect.get() + 1); }
-            debug_assert!(self.rc.count(curr) == 1);
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
                     debug_assert!(self.rc.count(x) > 1);
-                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
-                    let prev_rc = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
-                    // SAFETY: as above.  Returns the previous value directly rather than a
-                    // `Result`, so the `Ok(1)` test below becomes a plain comparison against
-                    // STRONG_RC_LAST_BEFORE_ZERO -- the same value, unwrapped.
-                    let prev_s_rc = unsafe { cc::strong_rc_dec_exclusive(x) };
+                    let prev_rc = lxr.rc_with_overflow.dec(x);
+                    // Both tests below are winner-take-all on an atomic RMW: exactly one thread
+                    // observes each transition, so no claim is needed on top of them.
+                    let prev_s_rc = cc::strong_rc_dec(x).unwrap_or_else(|e| e);
                     debug_assert!(prev_rc != 1);
                     if prev_rc == 2 {
                         dfs_stack.push(x);
                     } else if prev_s_rc == STRONG_RC_LAST_BEFORE_ZERO {
-                        // SAFETY: single-threaded CycleFullRC -- see the impl header.
-                        unsafe { cc::set_tag_exclusive(x, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
+                        cc::set_tag(x, (curr_vec + 1) as u8, Ordering::Relaxed);
                         cand_buffer.push(x);
                     }
                 }
@@ -1152,19 +1187,20 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
             debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
             debug_assert!(is_black(curr));
-            // SAFETY: single-threaded CycleFullRC -- see the impl header.
-            unsafe { cc::set_tag_exclusive(curr, 0, Ordering::Relaxed) };
-            // SAFETY: single-threaded CycleFullRC -- see the impl header.
-            unsafe { cc::set_colour_exclusive(curr, BLACK_OUT_OF_STACK, Ordering::Relaxed) };
+            cc::set_tag(curr, 0, Ordering::Relaxed);
             #[cfg(feature = "graph_project")]
             {
                 let mut reporter = lxr.graph_reporter.lock().unwrap();
                 reporter.add_cycle_collector_freed(curr.to_raw_address().as_usize());
             }
-            self.process_dead_object(curr, lxr);
-            debug_assert!(lxr.rc.count(curr) == 1);
-            // SAFETY: single-threaded CycleFullRC -- see the impl header.
-            unsafe { self.rc.dec_exclusive(curr) };
+            let is_los = self.process_dead_object(curr, lxr);
+            // As in `collect_whites`: a plain store, and the assertion is Immix-only because
+            // `LargeObjectSpace::release_object` has already zeroed the RC of a LOS object.
+            debug_assert!(
+                is_los || self.rc.count(curr) == 1,
+                "the Immix 1 -> 0 free assumes RC is exactly 1"
+            );
+            self.rc.set(curr, 0);
         }
     }
 
@@ -1406,9 +1442,22 @@ impl<VM: VMBinding> CycleScan<VM> {
 
 /// Collect, after scan has finished.
 ///
-/// One packet today; `collect_whites` and `collect_blacks` still use the `*_exclusive` stores and
-/// still read `lxr.curr_vec` directly, both of which are sound only while that is true.  Stage C3
-/// of the plan converts them; **do not schedule more than one of these before it has.**
+/// **Several run at once**, one per candidate buffer, fanned out by `LXR::on_lazy_scan_finished`.
+///
+/// What makes that safe, from stage C3: `collect_whites` and `collect_blacks` use atomic RMWs
+/// throughout -- no `unsafe`, no `*_exclusive` -- take `curr_vec` by value instead of reading the
+/// `Cell`, and **claim every object with a CAS before freeing it**
+/// (`cc::try_claim_white`, `cc::try_claim_black_in_stack`).
+///
+/// The claim comes first in both branches, before any field of the object is read. That ordering is
+/// load-bearing for more than double-free: `LargeObjectSpace::rc_free` returns pages immediately,
+/// so a loser that walked the object's fields before claiming would be reading memory the winner had
+/// already released.
+///
+/// Reclamation itself needed no change -- `possibly_dead_mature_blocks` is a `SegQueue`,
+/// `Block::log()` is a CAS so a block is enqueued once, and `rc_free` is `Mutex` +
+/// `remove().is_some()` so an object is released once. `ProcessDecs` has been freeing mature objects
+/// from many workers through the same path all along.
 pub struct CycleCollect<VM: VMBinding> {
     t: CycleTraversal<VM>,
     buffers: Vec<Vec<ObjectReference>>,
@@ -1485,7 +1534,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollect<VM> {
         let mut it = candidates.iter_mut();
         while let Some(cand) = it.next() {
             debug_assert!(cc::colour(*cand, Ordering::SeqCst) != GREY);
-            self.t.collect_whites(*cand, lxr, &mut dfs_stack, &mut nested_stack, &mut cand_buffer);
+            self.t.collect_whites(*cand, lxr, &mut dfs_stack, &mut nested_stack, &mut cand_buffer, self.curr_vec);
         }
 
         #[cfg(feature = "s_rc_stats")]

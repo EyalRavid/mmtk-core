@@ -1456,10 +1456,16 @@ impl<VM: VMBinding> LXR<VM> {
             .add(CycleScan::<VM>::new(buffers, c.clone_with_scan()));
     }
 
-    /// Fires when scanning finishes.  Collecting is single-threaded for now, so this schedules one
-    /// packet -- but it takes the guard token it will need when that becomes a loop (stage C4):
-    /// `add` makes a packet stealable at once, so without it the first packet could finish and fire
-    /// `end_of_collect` while later ones were still being added.
+    /// Fires when scanning finishes.  Fans the surviving candidates out into one `CycleCollect`
+    /// packet per buffer -- the same decomposition `schedule_cycle_mark` uses, and for the same
+    /// reason: the buffers are already the natural unit, and `FinalIterMut` is single-consumer, so
+    /// handing each worker a whole inner `Vec` keeps every removal worker-local.
+    ///
+    /// `guard` keeps the collect counter above zero for the whole loop.  `bucket.add` makes a
+    /// packet stealable at once, so without it the first packet could finish and fire
+    /// `end_of_collect` -- closing the segment and emitting its log line -- while later packets were
+    /// still being added.  It also covers an empty survivor list: the loop runs zero times, the
+    /// guard drops, and the segment closes with nothing to collect.
     ///
     /// `curr_vec` is read here rather than carried from the mark fan-out.  It cannot have moved:
     /// only `schedule_collection` writes it, and the generation's whole lazy chain completes before
@@ -1470,7 +1476,13 @@ impl<VM: VMBinding> LXR<VM> {
         let curr_vec = self.curr_vec.get();
         let bucket = &self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained];
         let guard = c.clone_with_collect();
-        bucket.add(CycleCollect::<VM>::new(buffers, curr_vec, c.clone_with_collect()));
+        for buf in buffers {
+            bucket.add(CycleCollect::<VM>::new(
+                vec![buf],
+                curr_vec,
+                c.clone_with_collect(),
+            ));
+        }
         drop(guard);
     }
 
