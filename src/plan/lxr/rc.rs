@@ -157,7 +157,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     /// bucketed: `prev >= MAX_REF_COUNT` is exactly the condition under which
     /// `rc_with_overflow::inc` entered the overflow map.
     ///
-    /// ⚠ SCOPE: this covers the two `ProcessIncs` increment sites only. The `CycleCollector`'s
+    /// ⚠ SCOPE: this covers the two `ProcessIncs` increment sites only. The `CycleFullRC`'s
     /// `inc_exclusive` is a different packet and is NOT counted here, so these do not sum to
     /// `rc_path.inc.slow`.
     #[cfg(feature = "s_rc_stats")]

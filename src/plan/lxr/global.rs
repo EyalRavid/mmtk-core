@@ -6,7 +6,7 @@ use crate::mmtk::VM_MAP;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::{BasePlan, CreateGeneralPlanArgs, CreateSpecificPlanArgs};
 use crate::plan::immix::Pause;
-use crate::plan::lxr::gc_work::{CycleCollector, FastRCPrepare};
+use crate::plan::lxr::gc_work::{CycleFullRC, FastRCPrepare};
 #[cfg(not(feature = "lxr_stw"))]
 use crate::plan::lxr::gc_work::{CycleCollect, CycleMark, CycleScan};
 use crate::plan::AllocationSemantics;
@@ -1096,7 +1096,7 @@ impl<VM: VMBinding> LXR<VM> {
 
         // New cycleCollection Phaze. corrently only prints "GOT TO CYCLE COLLECTION PHAZE"
        #[cfg(feature = "lxr_stw")]
-        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleCollector::<VM>::new());
+        scheduler.work_buckets[WorkBucketStage::CycleCollection].add(CycleFullRC::<VM>::new());
     }
 
     fn dump_memory(&self, pause: Pause) {
@@ -1335,11 +1335,11 @@ impl<VM: VMBinding> LXR<VM> {
 
         if self.current_pause() == Some(Pause::FullRC) {
             // `c` already holds the middle counter, which is exactly what the middle slot needs,
-            // so it is handed to the single CycleCollector packet directly.  When that packet
+            // so it is handed to the single CycleFullRC packet directly.  When that packet
             // drops, the middle counter reaches zero and `on_lazy_cc_finished` schedules the
             // sweep.
             self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained]
-                .add(CycleCollector::<VM>::new(c));
+                .add(CycleFullRC::<VM>::new(c));
         } else {
             self.immix_space.schedule_rc_block_sweeping_tasks(c, false);
         }
@@ -1361,7 +1361,7 @@ impl<VM: VMBinding> LXR<VM> {
         let ix = &self.immix_space;
 
         if self.current_pause() == Some(Pause::FullRC) {
-            // FullRC: this slot means CYCLE COLLECTION just ended, and `CycleCollector` has
+            // FullRC: this slot means CYCLE COLLECTION just ended, and `CycleFullRC` has
             // already logged that itself -- so nothing is printed here.  The sweep line is
             // emitted by `on_lazy_sweeping_finished`, where the sweep actually drains, which
             // keeps both orders emitting the same four lines and lets a reader tell them apart

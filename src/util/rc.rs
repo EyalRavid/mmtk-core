@@ -264,7 +264,7 @@ pub mod cc {
     /// Set the candidate-pool tag of `o`.
     ///
     /// Sub-byte, so this is `store_atomic`'s CAS loop.  `ProcessDecs` runs multi-threaded and
-    /// needs it; `CycleCollector` should use [`set_tag_exclusive`].
+    /// needs it; `CycleFullRC` should use [`set_tag_exclusive`].
     #[inline(always)]
     pub fn set_tag(o: ObjectReference, v: u8, order: Ordering) {
         CANDIDATES_STATUS.store_atomic::<u8>(o.to_raw_address(), v, order)

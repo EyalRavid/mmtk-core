@@ -646,7 +646,7 @@ struct Counters {
     ///                     so the map would not be entered and the operation would be a plain CAS.
     ///   `inc.slow_ge16b`  true count at or above 65_535 -- still saturated at 16 bits, still slow.
     ///
-    /// ⚠ INCREMENTS ONLY, and only the two `ProcessIncs` sites. The `CycleCollector`'s
+    /// ⚠ INCREMENTS ONLY, and only the two `ProcessIncs` sites. The `CycleFullRC`'s
     /// `inc_exclusive` is a different packet and is not counted, so these do not sum to
     /// `rc_path.inc.slow`. There is deliberately no `dec` equivalent: slow decrements are split
     /// between `ProcessDecs` (`dec`) and the cycle collector (`dec_exclusive`), and instrumenting

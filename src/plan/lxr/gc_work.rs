@@ -137,7 +137,7 @@ impl CycleCollectorStats {
 
 /// The trial-deletion traversal itself, with no notion of scheduling.
 ///
-/// Three packets drive it: `CycleCollector` (all phases, `Pause::FullRC`), and the `CycleMark` /
+/// Three packets drive it: `CycleFullRC` (all phases, `Pause::FullRC`), and the `CycleMark` /
 /// `CycleScanCollect` pair that splits the concurrent path so mark can run on several workers.
 /// Separating it from the packets is what lets those three own different tokens while sharing one
 /// implementation of every phase.
@@ -159,13 +159,13 @@ impl<VM: VMBinding> CycleTraversal<VM> {
 
 /// Cycle collection for `Pause::FullRC`: every phase, over all three candidate pools, inside the
 /// pause.  The concurrent path uses `CycleMark` + `CycleScanCollect` instead.
-pub struct CycleCollector<VM: VMBinding> {
+pub struct CycleFullRC<VM: VMBinding> {
     t: CycleTraversal<VM>,
     #[cfg(not(feature = "lxr_stw"))]
     _c: LazySweepingJobsCounter,
 }
 
-impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
+impl<VM: VMBinding> GCWork<VM> for CycleFullRC<VM> {
 
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
 
@@ -185,7 +185,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
         // one does not change that: the buffers are walked in sequence within a phase, so the
         // nesting depth is a property of the phases, not of how many candidates they see.
         //
-        // They are locals rather than `CycleCollector` fields on purpose: this packet is
+        // They are locals rather than `CycleFullRC` fields on purpose: this packet is
         // constructed fresh per GC and `do_work` runs once, so a field would retain nothing across
         // GCs, and a local cannot be aliased by construction -- which keeps them out of the
         // exclusivity argument in the impl header below.
@@ -211,7 +211,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
             // The concurrent path is `CycleMark` + `CycleScanCollect`, scheduled by
             // `LXR::schedule_cycle_mark`; nothing constructs this packet for it.  The one caller
             // that would is the `lxr_stw` site in `global.rs`, which does not currently compile.
-            _ => unreachable!("CycleCollector is the Pause::FullRC packet; see schedule_cycle_mark"),
+            _ => unreachable!("CycleFullRC is the Pause::FullRC packet; see schedule_cycle_mark"),
         }
 
         // Timestamp the end of cycle collection. Together with "lazy decs finished",
@@ -244,7 +244,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 /// still single-threaded.  The four phases above remain exclusive because they run after mark has
 /// joined, and the split must not change that.
 ///
-/// That holds because `CycleCollector` is a single `GCWork` packet, so it runs on exactly one GC
+/// That holds because `CycleFullRC` is a single `GCWork` packet, so it runs on exactly one GC
 /// worker, and the concurrent chain is ordered `decs -> sweep -> cc`, so `ProcessDecs` has fully
 /// drained before it starts.  The next GC cannot begin either: a GC request becomes a
 /// `ScheduleCollection` packet only when the *last* GC worker parks, and this packet is occupying
@@ -273,7 +273,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleCollector<VM> {
 /// What `mark` needs in order to hand part of its DFS stack to another worker.
 ///
 /// `Copy`, so it threads down `mark_buffer` -> `mark` -> `mark_from_stack` without reborrowing.
-/// `None` means "do not spill", which is how the `Pause::FullRC` path opts out: `CycleCollector`
+/// `None` means "do not spill", which is how the `Pause::FullRC` path opts out: `CycleFullRC`
 /// runs mark, scan and collect in one packet using the `*_exclusive` metadata stores, so it must
 /// not create packets that would still be running during its own scan -- see the impl header.
 #[derive(Clone, Copy)]
@@ -454,7 +454,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 );
                 // Already at real rc 0: nothing to subtract, and decrementing would underflow.
                 if lxr.rc.count(head) > 1 {
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
                     unsafe { lxr.rc_with_overflow.dec_exclusive(head) };
                     // `s_rc == 0` is what makes an object a candidate: `should_mark` requires it.
                     // Nothing is lost -- `scan_black` reconstructs `s_rc` from `rc` in step 3B.
@@ -609,7 +609,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             // yet, so nothing here is garbage until the VM says so.
             if let Some(head) = cut_head {
                 // `scan_black` asserts `count > 1` on entry, so the edge goes back first.
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { lxr.rc_with_overflow.inc_exclusive(head) };
                 // And the POINTER goes back with it, undoing step 3A's clear. It must be back
                 // before `collect_whites` runs and before the pause ends -- mutators resuming to
@@ -666,7 +666,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 // a candidate and the collector never examines it again.
                 let edge_targets = to_enqueue[1..].iter().copied().chain(old_head);
                 for x in edge_targets {
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
                     unsafe { lxr.rc_with_overflow.inc_exclusive(x) };
                 }
             }
@@ -989,7 +989,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 if RefCountHelper::<VM>::NEW.count(curr) > 1 {
                     self.scan_black(curr, lxr, black_stack);
                 } else {
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
                     unsafe { cc::set_colour_exclusive(curr, WHITE, Ordering::Relaxed) };
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 }
@@ -1012,10 +1012,10 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         while let Some(&curr) = dfs_stack.last() {
             debug_assert!(self.rc.count(curr) > 1);
             if !is_black(curr) {
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { cc::set_colour_exclusive(curr, BLACK_IN_STACK, Ordering::SeqCst) };
                 let s_rc = self.rc.count(curr) - 1;
-                // SAFETY: single-threaded CycleCollector -- see the impl header.  Note the
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.  Note the
                 // obligation here is the *wider* one: `STRONG_RC_TABLE` is 4 bits per entry, so
                 // two adjacent objects share a byte and the exclusive store is a read-merge-write
                 // of that byte with no CAS.  No other thread may write *any* entry in the same
@@ -1030,7 +1030,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 }
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = self.get_child(slot, lxr) {
-                        // SAFETY: single-threaded CycleCollector -- see the impl header.
+                        // SAFETY: single-threaded CycleFullRC -- see the impl header.
                         let _prev = unsafe { lxr.rc_with_overflow.inc_exclusive(x) };
                         if !in_stack(x) {
                             // SAFETY: as above.
@@ -1044,7 +1044,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 { self.stats.objects_in_scan_black.set(self.stats.objects_in_scan_black.get() + 1); }
               
             } else {
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { cc::set_colour_exclusive(curr, BLACK_OUT_OF_STACK, Ordering::Relaxed) };
                 debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) != 0);
                 dfs_stack.pop();
@@ -1090,14 +1090,14 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 }
                 debug_assert!(self.rc.count(curr) == 1);
                 debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) == 0);
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { cc::set_tag_exclusive(curr, 0, Ordering::Relaxed) };
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { cc::set_colour_exclusive(curr, BLACK_OUT_OF_STACK, Ordering::Relaxed) };
                 debug_assert!(lxr.rc.count(curr) == 1);
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 self.process_dead_object(curr, lxr);
-                // SAFETY: single-threaded CycleCollector -- see the impl header.
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { self.rc.dec_exclusive(curr) };
             } else if cc::colour(curr, Ordering::Relaxed) == BLACK_IN_STACK
                 && self.rc.count(curr) == 1
@@ -1133,7 +1133,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
                     debug_assert!(self.rc.count(x) > 1);
-                    // SAFETY: single-threaded CycleCollector -- see the impl header.
+                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
                     let prev_rc = unsafe { lxr.rc_with_overflow.dec_exclusive(x) };
                     // SAFETY: as above.  Returns the previous value directly rather than a
                     // `Result`, so the `Ok(1)` test below becomes a plain comparison against
@@ -1143,7 +1143,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     if prev_rc == 2 {
                         dfs_stack.push(x);
                     } else if prev_s_rc == STRONG_RC_LAST_BEFORE_ZERO {
-                        // SAFETY: single-threaded CycleCollector -- see the impl header.
+                        // SAFETY: single-threaded CycleFullRC -- see the impl header.
                         unsafe { cc::set_tag_exclusive(x, (lxr.curr_vec.get() + 1) as u8, Ordering::Relaxed) };
                         cand_buffer.push(x);
                     }
@@ -1152,9 +1152,9 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
             debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) as RcBits <= lxr.rc.count(curr));
             debug_assert!(is_black(curr));
-            // SAFETY: single-threaded CycleCollector -- see the impl header.
+            // SAFETY: single-threaded CycleFullRC -- see the impl header.
             unsafe { cc::set_tag_exclusive(curr, 0, Ordering::Relaxed) };
-            // SAFETY: single-threaded CycleCollector -- see the impl header.
+            // SAFETY: single-threaded CycleFullRC -- see the impl header.
             unsafe { cc::set_colour_exclusive(curr, BLACK_OUT_OF_STACK, Ordering::Relaxed) };
             #[cfg(feature = "graph_project")]
             {
@@ -1163,7 +1163,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             }
             self.process_dead_object(curr, lxr);
             debug_assert!(lxr.rc.count(curr) == 1);
-            // SAFETY: single-threaded CycleCollector -- see the impl header.
+            // SAFETY: single-threaded CycleFullRC -- see the impl header.
             unsafe { self.rc.dec_exclusive(curr) };
         }
     }
@@ -1226,9 +1226,9 @@ impl<VM: VMBinding> CycleTraversal<VM>{
 
 
 
-impl<VM: VMBinding> CycleCollector<VM> {
-    pub fn new(#[cfg(not(feature = "lxr_stw"))] c: LazySweepingJobsCounter) -> CycleCollector<VM> {
-        CycleCollector::<VM> {
+impl<VM: VMBinding> CycleFullRC<VM> {
+    pub fn new(#[cfg(not(feature = "lxr_stw"))] c: LazySweepingJobsCounter) -> CycleFullRC<VM> {
+        CycleFullRC::<VM> {
             t: CycleTraversal::new(),
             // Take ownership of the token handed over by `end_of_decs`.  Cloning it here and
             // dropping the original would be a redundant +1/-1 on the same cc counter.
@@ -1333,7 +1333,7 @@ impl<VM: VMBinding> GCWork<VM> for CycleMark<VM> {
         // The pool named by the SNAPSHOT, so the handle and the tag `mark` writes cannot disagree.
         let mut cand_buffer = unsafe { lxr.s_cycle_candidates_at(self.curr_vec) }.local_buffer();
 
-        // Spilling is on for this packet, and only this packet type -- `CycleCollector` passes
+        // Spilling is on for this packet, and only this packet type -- `CycleFullRC` passes
         // `None`.  Borrowing our own token means a chunk we hand off is counted in the same
         // generation, and our token stays alive until `do_work` returns, so the mark counter cannot
         // reach zero while we are still splitting.

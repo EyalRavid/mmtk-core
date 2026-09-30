@@ -61,7 +61,7 @@
 //!    that address indefinitely. The invariant says that cannot happen, and `dec` zeroing the
 //!    excess before the RC field leaves `MAX` is what enforces it.
 //! 2. **`inc` and `dec` never run concurrently with each other.** `ProcessIncs` is STW,
-//!    `ProcessDecs` is concurrent, and since the `decs -> sweep -> cc` reorder `CycleCollector` is
+//!    `ProcessDecs` is concurrent, and since the `decs -> sweep -> cc` reorder `CycleFullRC` is
 //!    a single packet ordered after sweeping, which is itself ordered after decs. What keeps the
 //!    *next* GC's increments behind the current GC's concurrent window is the scheduler, not any
 //!    LXR-level lock: a GC request becomes a `ScheduleCollection` packet only when the **last GC
