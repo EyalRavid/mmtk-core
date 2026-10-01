@@ -1313,6 +1313,9 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
                     debug_assert!(self.rc.count(x) > 1);
+                    if cc::colour(x, Ordering::Relaxed) == BLACK_IN_STACK {
+                        cc::set_colour(x, BLACK_OUT_OF_STACK, Ordering::SeqCst);
+                    }
                     let prev_rc = lxr.rc_with_overflow.dec(x);
                     // Both tests below are winner-take-all on an atomic RMW: exactly one thread
                     // observes each transition, so no claim is needed on top of them.
