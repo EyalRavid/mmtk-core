@@ -1477,11 +1477,7 @@ impl<VM: VMBinding> LXR<VM> {
         let bucket = &self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained];
         let guard = c.clone_with_collect();
         for buf in buffers {
-            bucket.add(CycleCollect::<VM>::new(
-                vec![buf],
-                curr_vec,
-                c.clone_with_collect(),
-            ));
+            bucket.add(CycleCollect::<VM>::new(buf, curr_vec, c.clone_with_collect()));
         }
         drop(guard);
     }

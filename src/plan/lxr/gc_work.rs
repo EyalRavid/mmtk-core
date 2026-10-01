@@ -285,10 +285,65 @@ struct Spill<'a> {
     curr_vec: u8,
 }
 
+/// What the collect phase needs in order to hand part of its work to another worker.
+///
+/// `Copy`, so it threads down without reborrowing.  `None` means "do not spill", which is how
+/// `CycleFullRC` opts out: it runs mark, scan and collect in one packet with the `*_exclusive`
+/// stores, so it must not create packets that outlive its own phases.
+///
+/// Unlike mark's [`Spill`], collect has **two kinds of work** and they are not interchangeable
+/// (`CYCLE_COLLECTOR_PARALLEL_COLLECT_PLAN.md` §1): `collect_whites` does not decrement its
+/// children, because `mark` subtracted those edges and never restored them, while `collect_blacks`
+/// does, because `scan_black` put them back.  So each kind spills into its own packet type and they
+/// are never merged into one queue.
+#[derive(Clone, Copy)]
+struct CollectSpill<'a> {
+    c: &'a LazySweepingJobsCounter,
+    curr_vec: u8,
+}
+
 impl<VM: VMBinding> CycleTraversal<VM>{
     
     pub const UNLOGGED_VALUE: u8 = 0b1;
     pub const LOGGED_VALUE: u8 = 0b0;
+
+    /// Export `buf` as another unclassified-work packet once it reaches `SPLIT_THRESHOLD`.
+    ///
+    /// Must be called after EVERY push, not once per popped object: the pushes happen inside
+    /// `iterate_fields`, so a single large object array would otherwise overshoot by its whole
+    /// length and hand one worker a chunk of unbounded size -- the opposite of load balancing.
+    #[inline(always)]
+    fn maybe_spill_work(buf: &mut Vec<ObjectReference>, spill: Option<CollectSpill<'_>>) {
+        #[cfg(feature = "lxr_stw")]
+        let _ = (buf, spill);
+        #[cfg(not(feature = "lxr_stw"))]
+        if let Some(sp) = spill {
+            if buf.len() >= Self::SPLIT_THRESHOLD {
+                let chunk = std::mem::replace(buf, Vec::with_capacity(Self::SPLIT_THRESHOLD));
+                GCWorker::<VM>::current().add_work_prioritized(
+                    WorkBucketStage::Unconstrained,
+                    CycleCollect::spilled(chunk, sp.curr_vec, sp.c.clone_with_collect()),
+                );
+            }
+        }
+    }
+
+    /// As [`Self::maybe_spill_work`], for black work.
+    #[inline(always)]
+    fn maybe_spill_black(buf: &mut Vec<ObjectReference>, spill: Option<CollectSpill<'_>>) {
+        #[cfg(feature = "lxr_stw")]
+        let _ = (buf, spill);
+        #[cfg(not(feature = "lxr_stw"))]
+        if let Some(sp) = spill {
+            if buf.len() >= Self::SPLIT_THRESHOLD {
+                let chunk = std::mem::replace(buf, Vec::with_capacity(Self::SPLIT_THRESHOLD));
+                GCWorker::<VM>::current().add_work_prioritized(
+                    WorkBucketStage::Unconstrained,
+                    CycleCollectBlack::<VM>::new(chunk, sp.curr_vec, sp.c.clone_with_collect()),
+                );
+            }
+        }
+    }
 
     /// Hand work off once the DFS stack passes twice this, in chunks of this size.
     ///
@@ -680,7 +735,9 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             let mut it = candidates.iter_mut();
             while let Some(cand) = it.next() {
                 debug_assert!(cc::colour(*cand, Ordering::SeqCst) != GREY);
-                self.collect_whites(*cand, lxr, dfs_stack, nested_stack, &mut cand_buffer, lxr.curr_vec.get());
+                // `None`: a FullRC collection must not spill, for the same reason its mark must not --
+                // its scan and collect run in this same packet with the `*_exclusive` stores.
+                self.collect_whites(*cand, lxr, dfs_stack, nested_stack, &mut cand_buffer, lxr.curr_vec.get(), None);
             }
         }
         drop(cand_buffer);
@@ -1071,16 +1128,57 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         // `collect_blacks` tags what it pushes, and the tag and the pool must come from the same
         // value.  Several workers share that `Cell` once collect is split.
         curr_vec: u8,
+        spill: Option<CollectSpill<'_>>,
     ) {
         debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
-        while let Some(curr) = dfs_stack.pop() {
+        self.collect_from_stack(lxr, dfs_stack, black_stack, cand_buffer, curr_vec, spill);
+    }
+
+    /// The collect loop, over everything in `work` and everything it discovers.
+    ///
+    /// **Two kinds of work, two queues, never merged.**  `work` holds objects of unknown colour --
+    /// the children of freed white objects -- and each is classified when it is popped.  Black work
+    /// is discovered at that moment, and goes to `black` rather than recursing, so it can be handed
+    /// to another worker.  Merging the two would be a mistake and not merely a style choice:
+    /// `collect_whites` does not decrement its children and `collect_blacks` does, so one queue
+    /// would have to carry the distinction anyway (§1 of the collect plan).
+    ///
+    /// Each queue spills into its own packet type once it reaches [`Self::SPLIT_THRESHOLD`].
+    /// Whatever black work is left over at the end is drained here.
+    fn collect_from_stack(
+        &self,
+        lxr: &LXR<VM>,
+        work: &mut Vec<ObjectReference>,
+        black: &mut Vec<ObjectReference>,
+        cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
+        curr_vec: u8,
+        spill: Option<CollectSpill<'_>>,
+    ) {
+        #[cfg(feature = "lxr_stw")]
+        let _ = spill;
+        let mut new_work = Vec::<ObjectReference>::with_capacity(Self::SPLIT_THRESHOLD);
+        let mut nested = Vec::<ObjectReference>::new();
+        loop {
+            let curr = match work.pop() {
+                Some(o) => o,
+                None => {
+                    if new_work.is_empty() {
+                        break;
+                    }
+                    std::mem::swap(work, &mut new_work);
+                    continue;
+                }
+            };
             #[cfg(feature = "s_rc_stats")]
             { self.stats.objects_in_collect.set(self.stats.objects_in_collect.get() + 1); }
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
-                    dfs_stack.push(x);
+                    new_work.push(x);
+                    // After every push -- a large object array would otherwise overshoot by its
+                    // whole length.  See `maybe_spill_work`.
+                    Self::maybe_spill_work(&mut new_work, spill);
                 }
             };
 
@@ -1122,14 +1220,25 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     "the Immix 1 -> 0 free assumes RC is exactly 1"
                 );
                 self.rc.set(curr, 0);
-            } else if cc::colour(curr, Ordering::Relaxed) == BLACK_IN_STACK
-                && self.rc.count(curr) == 1
-            {
-                // A filter, not a claim.  `collect_blacks` claims every object it pops, including
-                // this one -- objects also enter its loop through the `prev_rc == 2` push, and
-                // those would otherwise reach a free unclaimed.
-                self.collect_blacks(curr, lxr, black_stack, cand_buffer, curr_vec);
+            } else if self.rc.count(curr) == 1
+                && cc::try_claim_black_in_stack(curr)
+            { 
+                // A filter, not a claim -- `collect_blacks` claims every object it pops, including
+                // this one, because objects also enter its loop through the `prev_rc == 2` push.
+                //
+                // Queued rather than recursed into, which is what lets black work be handed to
+                // another worker.  Order does not matter: every transition below is winner-take-all
+                // and reference counts only fall during collect.
+                black.push(curr);
+                // One push per popped object here, so the end of the branch IS after every push.
+                Self::maybe_spill_black(black, spill);
             }
+        }
+
+        // Drain the black work this packet did not hand off.  Full chunks left; the remainder is
+        // ours, exactly as `ProcessDecs` drains its partial buffer.
+        while let Some(b) = black.pop() {
+            self.collect_blacks(b, lxr, &mut nested, cand_buffer, curr_vec, spill);
         }
     }
 
@@ -1148,23 +1257,56 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         dfs_stack: &mut Vec<ObjectReference>,
         cand_buffer: &mut LocalBuffer<'_, ObjectReference>,
         curr_vec: u8,
+        spill: Option<CollectSpill<'_>>,
     ) {
+        #[cfg(feature = "lxr_stw")]
+        let _ = spill;
         debug_assert!(dfs_stack.is_empty());
         dfs_stack.push(o);
-        while let Some(curr) = dfs_stack.pop() {
-            // Claim before anything else: everything below frees `curr`, and only one thread may.
+        // Two buffers, as in `mark_from_stack`: `dfs_stack` drains, `new_work` fills, and a full
+        // `new_work` becomes another packet rather than growing.  A black packet only ever
+        // produces black work -- a child is pushed only on `prev_rc == 2`, and the
+        // `debug_assert!(is_black(curr))` below has held for every object that reaches this loop --
+        // so this is the only kind it can spill.
+        let mut new_work = Vec::<ObjectReference>::with_capacity(Self::SPLIT_THRESHOLD);
+        loop {
+            let curr = match dfs_stack.pop() {
+                Some(o) => o,
+                None => {
+                    if new_work.is_empty() {
+                        break;
+                    }
+                    std::mem::swap(dfs_stack, &mut new_work);
+                    continue;
+                }
+            };
+            // No claim here -- ownership was established when `curr` was PUSHED, and the two
+            // arrival paths establish it differently:
             //
-            // `rc == 1` FIRST, then the CAS -- never the other way round.  Reference counts only
-            // fall during collect, so a thread that has read 1 knows nothing can move it except
-            // the winner of this CAS; claiming first would mean restoring the colour on a failed
-            // re-test, which is the `CYCLE_COLLECTOR_PARALLEL_PLAN.md` §10.1 hazard exactly.
-            // See `cc::try_claim_black_in_stack`.
+            //   * a root handed over by `collect_from_stack` was claimed there with
+            //     `cc::try_claim_black_in_stack`, which one packet wins;
+            //   * a child pushed on `prev_rc == 2` below is claimed by that decrement itself --
+            //     exactly one thread observes `prev == 2` on an atomic RMW.
             //
-            // This covers both ways in: the object `collect_whites` handed us, and the ones the
-            // `prev_rc == 2` push below adds.
-            if self.rc.count(curr) != 1 || !cc::try_claim_black_in_stack(curr) {
-                continue;
-            }
+            // So rc is 1 for everything on this stack, at the moment it was pushed.
+            //
+            // **The assertion is about push time, and it can legitimately fire at pop time.** The
+            // two claims above are on different resources, so they are not mutually exclusive: if
+            // one packet's decrement takes `curr` 2 -> 1 and queues it while the colour is still
+            // `BLACK_IN_STACK`, the white loop of another packet can then claim the same object and
+            // queue it a second time. Whichever frees first leaves rc 0, and the other arrives here
+            // with rc 0 -- which is a double free, not merely a failed assertion, because nothing
+            // below re-checks.
+            //
+            // If this never fires on `pmd` with 14 workers, that interleaving does not occur in
+            // practice and the removed `rc != 1` guard really was redundant. If it does fire, the
+            // fix is to make the free itself the claim -- `self.rc.dec(curr) != Ok(1) => continue`,
+            // one atomic RMW that both picks the winner and performs the 1 -> 0 transition.
+            debug_assert!(
+                self.rc.count(curr) == 1,
+                "collect_blacks: rc must be 1 on entry; 0 means another packet already freed it"
+            );
+
             #[cfg(feature = "s_rc_stats")]
             { self.stats.objects_in_collect.set(self.stats.objects_in_collect.get() + 1); }
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
@@ -1177,7 +1319,10 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     let prev_s_rc = cc::strong_rc_dec(x).unwrap_or_else(|e| e);
                     debug_assert!(prev_rc != 1);
                     if prev_rc == 2 {
-                        dfs_stack.push(x);
+                        // This decrement IS the claim for `x`: exactly one thread sees `prev == 2`.
+                        debug_assert!(self.rc.count(x) == 1);
+                        new_work.push(x);
+                        Self::maybe_spill_black(&mut new_work, spill);
                     } else if prev_s_rc == STRONG_RC_LAST_BEFORE_ZERO {
                         cc::set_tag(x, (curr_vec + 1) as u8, Ordering::Relaxed);
                         cand_buffer.push(x);
@@ -1201,6 +1346,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 "the Immix 1 -> 0 free assumes RC is exactly 1"
             );
             self.rc.set(curr, 0);
+
         }
     }
 
@@ -1460,7 +1606,14 @@ impl<VM: VMBinding> CycleScan<VM> {
 /// from many workers through the same path all along.
 pub struct CycleCollect<VM: VMBinding> {
     t: CycleTraversal<VM>,
-    buffers: Vec<Vec<ObjectReference>>,
+    /// Candidates, or a chunk spilled by another packet -- this packet treats them identically,
+    /// classifying each object by its colour when it is popped.
+    ///
+    /// One flat `Vec`, not mark's `FinalBuffers`: mark has to keep that type because `mark_buffer`
+    /// prunes it with `swap_remove_current` and the *pruned* buffer is what `mark_survivors` hands
+    /// to scan.  Collect is the end of the chain -- it consumes candidates and keeps nothing -- so
+    /// there is nothing to prune and nothing to preserve.
+    work: Vec<ObjectReference>,
     /// The pool this packet's `LocalBuffer` is taken from -- `collect_blacks` produces candidates
     /// for the next GC.
     curr_vec: u8,
@@ -1469,19 +1622,105 @@ pub struct CycleCollect<VM: VMBinding> {
 }
 
 impl<VM: VMBinding> CycleCollect<VM> {
+    /// A seed packet, over one buffer of surviving candidates.
     pub fn new(
-        buffers: Vec<Vec<ObjectReference>>,
+        work: Vec<ObjectReference>,
         curr_vec: u8,
         #[cfg(not(feature = "lxr_stw"))] c: LazySweepingJobsCounter,
     ) -> Self {
+        // Candidates only.  A spilled chunk is children of freed white objects, whose colour this
+        // says nothing about, so `spilled` deliberately does not assert it.
+        #[cfg(debug_assertions)]
+        for &cand in work.iter() {
+            debug_assert!(cc::colour(cand, Ordering::SeqCst) != GREY);
+        }
         Self {
             t: CycleTraversal::new(),
-            buffers,
+            work,
             curr_vec,
             #[cfg(not(feature = "lxr_stw"))]
             _c: c,
         }
     }
+
+    /// A packet for one chunk of unclassified work spilled out of another `CycleCollect`.
+    #[cfg(not(feature = "lxr_stw"))]
+    pub fn spilled(
+        work: Vec<ObjectReference>,
+        curr_vec: u8,
+        c: LazySweepingJobsCounter,
+    ) -> Self {
+        Self {
+            t: CycleTraversal::new(),
+            work,
+            curr_vec,
+            _c: c,
+        }
+    }
+}
+
+/// One chunk of **black** collect work spilled by another packet.
+///
+/// Its own type rather than a mode on `CycleCollect`, for two reasons. The work is genuinely
+/// different -- `collect_blacks` decrements its children where `collect_whites` does not -- and the
+/// profiler reports per packet type, so `work.CycleCollect.*` and `work.CycleCollectBlack.*`
+/// separate the two halves of the phase for free.
+///
+/// A black packet produces only black work, so it is the one packet type that can spill exactly one
+/// kind.
+pub struct CycleCollectBlack<VM: VMBinding> {
+    t: CycleTraversal<VM>,
+    stack: Vec<ObjectReference>,
+    curr_vec: u8,
+    #[cfg(not(feature = "lxr_stw"))]
+    _c: LazySweepingJobsCounter,
+}
+
+impl<VM: VMBinding> CycleCollectBlack<VM> {
+    pub fn new(
+        stack: Vec<ObjectReference>,
+        curr_vec: u8,
+        #[cfg(not(feature = "lxr_stw"))] c: LazySweepingJobsCounter,
+    ) -> Self {
+        Self {
+            t: CycleTraversal::new(),
+            stack,
+            curr_vec,
+            #[cfg(not(feature = "lxr_stw"))]
+            _c: c,
+        }
+    }
+}
+
+impl<VM: VMBinding> GCWork<VM> for CycleCollectBlack<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        let mut cand_buffer = unsafe { lxr.s_cycle_candidates_at(self.curr_vec) }.local_buffer();
+        let mut work = std::mem::take(&mut self.stack);
+
+        #[cfg(not(feature = "lxr_stw"))]
+        let spill = Some(CollectSpill { c: &self._c, curr_vec: self.curr_vec });
+        #[cfg(feature = "lxr_stw")]
+        let spill: Option<CollectSpill<'_>> = None;
+
+        // `collect_blacks` takes one root and drains, so feed it the chunk one at a time; its own
+        // two-buffer loop absorbs everything each root discovers.
+        let mut nested = Vec::<ObjectReference>::with_capacity(Self::SPLIT_HINT);
+        while let Some(o) = work.pop() {
+            self.t
+                .collect_blacks(o, lxr, &mut nested, &mut cand_buffer, self.curr_vec, spill);
+        }
+
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.t.stats.peak_stack = nested.capacity();
+            self.t.stats.flush_to_counters();
+        }
+    }
+}
+
+impl<VM: VMBinding> CycleCollectBlack<VM> {
+    const SPLIT_HINT: usize = 1024;
 }
 
 impl<VM: VMBinding> GCWork<VM> for CycleScan<VM> {
@@ -1523,26 +1762,33 @@ impl<VM: VMBinding> GCWork<VM> for CycleScan<VM> {
 impl<VM: VMBinding> GCWork<VM> for CycleCollect<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
-        let mut candidates = FinalBuffers::from_vecs(std::mem::take(&mut self.buffers));
 
-        // Two stacks: `collect_whites` nests into `collect_blacks`.
-        let mut dfs_stack = Vec::<ObjectReference>::with_capacity(4096);
-        let mut nested_stack = Vec::<ObjectReference>::with_capacity(4096);
+        // The work arrives flat, so there is nothing to convert and nothing to copy.  `nested` is
+        // the second stack `collect_blacks` needs for its own traversal.
+        let mut work = std::mem::take(&mut self.work);
+        let mut nested = Vec::<ObjectReference>::with_capacity(4096);
         let mut cand_buffer = unsafe { lxr.s_cycle_candidates_at(self.curr_vec) }.local_buffer();
 
-        // Free WHITE objects and handle the remaining BLACK_IN_STACK ones.
-        let mut it = candidates.iter_mut();
-        while let Some(cand) = it.next() {
-            debug_assert!(cc::colour(*cand, Ordering::SeqCst) != GREY);
-            self.t.collect_whites(*cand, lxr, &mut dfs_stack, &mut nested_stack, &mut cand_buffer, self.curr_vec);
-        }
+        #[cfg(not(feature = "lxr_stw"))]
+        let spill = Some(CollectSpill { c: &self._c, curr_vec: self.curr_vec });
+        #[cfg(feature = "lxr_stw")]
+        let spill: Option<CollectSpill<'_>> = None;
+
+        self.t.collect_from_stack(
+            lxr,
+            &mut work,
+            &mut nested,
+            &mut cand_buffer,
+            self.curr_vec,
+            spill,
+        );
 
         #[cfg(feature = "s_rc_stats")]
         {
             // A peak reading, so it belongs after collecting.  `fetch_max` in `flush_to_counters`,
             // so several packets taking it is correct.
             self.t.stats.satb_map_size = lxr.satb_map.len();
-            self.t.stats.peak_stack = dfs_stack.capacity().max(nested_stack.capacity());
+            self.t.stats.peak_stack = work.capacity().max(nested.capacity());
             self.t.stats.flush_to_counters();
         }
     }
