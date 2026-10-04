@@ -24,6 +24,17 @@ use crate::plan::lxr::buffer::FinalBuffers;
 use crate::util::rc::RcBits;
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::LazySweepingJobsCounter;
+// At most one `cc_split_*` feature: they pick `CycleTraversal::SPLIT_THRESHOLD`, and a cfg chain
+// would otherwise silently take the first one listed.
+const _: () = assert!(
+    (cfg!(feature = "cc_split_256") as u32)
+        + (cfg!(feature = "cc_split_512") as u32)
+        + (cfg!(feature = "cc_split_1024") as u32)
+        + (cfg!(feature = "cc_split_4096") as u32)
+        + (cfg!(feature = "cc_split_8192") as u32)
+        <= 1,
+    "enable at most one cc_split_* feature"
+);
 #[cfg(feature = "graph_project")]
 use crate::plan::lxr:: graphs_project::{*};
 #[cfg(feature = "graph_project")]
@@ -345,13 +356,28 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         }
     }
 
-    /// Hand work off once the DFS stack passes twice this, in chunks of this size.
+    /// Hand the whole work buffer off as a new packet once it reaches this many objects; the
+    /// current packet carries on with an empty buffer.
     ///
     /// Mirrors `ProcessDecs::CAPACITY` (`crate::args::BUFFER_SIZE`, 1024), which is the same
-    /// mechanism: a bounded buffer that becomes a new packet instead of growing.  The high-water
-    /// mark is `2 *` so that crossing the line exports one chunk and leaves a full chunk to work
-    /// on, rather than exporting on every push from then on.
-    const SPLIT_THRESHOLD: usize = 2048;
+    /// mechanism: a bounded buffer that becomes a new packet instead of growing.
+    ///
+    /// Selected at compile time by the `cc_split_*` cargo features (default 2048).
+    const SPLIT_THRESHOLD: usize = {
+        if cfg!(feature = "cc_split_256") {
+            256
+        } else if cfg!(feature = "cc_split_512") {
+            512
+        } else if cfg!(feature = "cc_split_1024") {
+            1024
+        } else if cfg!(feature = "cc_split_4096") {
+            4096
+        } else if cfg!(feature = "cc_split_8192") {
+            8192
+        } else {
+            2048
+        }
+    };
 
     const UNLOG_BITS: SideMetadataSpec = *VM::VMObjectModel::GLOBAL_FIELD_UNLOG_BIT_SPEC
         .as_spec()

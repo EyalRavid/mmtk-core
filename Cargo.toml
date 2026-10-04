@@ -254,6 +254,14 @@ s_rc_stats = []
 # Diagnostic only: adds six columns to the MMTk stats block. Must NOT be enabled for
 # publication timing builds. With it off, the module and every call site are cfg'd away.
 lxr_rc_path_stats = []
+# Concurrent cycle collector: objects per mark/collect work buffer before it is handed off as a
+# new packet (`CycleTraversal::SPLIT_THRESHOLD` in src/plan/lxr/gc_work.rs). Default, with none
+# of these enabled, is 2048. Enable at most one -- more than one is a compile error.
+cc_split_256 = []
+cc_split_512 = []
+cc_split_1024 = []
+cc_split_4096 = []
+cc_split_8192 = []
 graph_project = ["serde", "serde_json", "lxr_stw"]
 # This feature is only supported on x86-64 for now
 # It's manually added to CI scripts
