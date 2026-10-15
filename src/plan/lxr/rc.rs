@@ -94,6 +94,9 @@ pub struct ProcessIncs<VM: VMBinding, const KIND: EdgeKind> {
     true_max: std::cell::Cell<usize>,
     #[cfg(feature = "s_rc_stats")]
     fast: std::cell::Cell<usize>,
+    /// `lxr_defer_saturated_incs`: saturated increments put in this worker's `SatIncBuf`.
+    #[cfg(feature = "s_rc_stats")]
+    deferred: std::cell::Cell<usize>,
 }
 
 unsafe impl<VM: VMBinding, const KIND: EdgeKind> Send for ProcessIncs<VM, KIND> {}
@@ -150,6 +153,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             true_max: std::cell::Cell::new(0),
             #[cfg(feature = "s_rc_stats")]
             fast: std::cell::Cell::new(0),
+            #[cfg(feature = "s_rc_stats")]
+            deferred: std::cell::Cell::new(0),
         }
     }
 
@@ -175,6 +180,57 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             } else {
                 self.slow_lt16b.set(self.slow_lt16b.get() + 1);
             }
+        }
+    }
+
+    /// `rc_with_overflow.inc(o)` plus its `s_rc_stats` bookkeeping -- the one increment used by
+    /// both `ProcessIncs` sites.
+    ///
+    /// With `lxr_defer_saturated_incs`, an increment that finds the RC field saturated is counted
+    /// in this worker's `SatIncBuf` instead of by a `fetch_add` on `OVERFLOW_RC_TABLE`; the
+    /// buffers are applied in `LXR::release` (see `sat_inc_buf.rs`). It then returns
+    /// `MAX_REF_COUNT` rather than the true previous count. Every caller only compares the result
+    /// with `RC_NURSERY_OR_DEAD`, and a saturated object cannot be nursery, so that is exact.
+    #[inline(always)]
+    fn inc_rc(&self, o: ObjectReference) -> usize {
+        #[cfg(not(feature = "lxr_defer_saturated_incs"))]
+        {
+            let prev = self.lxr.rc_with_overflow.inc(o);
+            #[cfg(feature = "s_rc_stats")]
+            self.record_inc(prev);
+            prev
+        }
+        #[cfg(feature = "lxr_defer_saturated_incs")]
+        match self.rc.inc(o) {
+            Ok(prev) => {
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::inc_fast();
+                #[cfg(feature = "s_rc_stats")]
+                self.record_inc(prev as usize);
+                prev as usize
+            }
+            Err(crate::util::rc::MAX_REF_COUNT) => {
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::inc_slow();
+                #[cfg(feature = "s_rc_stats")]
+                self.deferred.set(self.deferred.get() + 1);
+                // SAFETY: the buffer is this worker's own, and nothing else touches it until the
+                // `Release` stage.
+                let buf = unsafe { self.lxr.sat_incs.get(self.worker().ordinal) };
+                if !buf.add(o) {
+                    // Full: apply what this worker has so far and start again. Still inside the
+                    // pause, so still before every decrement.
+                    buf.drain(|o, n| self.lxr.apply_saturated_incs(o, n));
+                    #[cfg(feature = "s_rc_stats")]
+                    crate::counters()
+                        .inc_deferred_flushes
+                        .fetch_add(1, Ordering::Relaxed);
+                    let added = buf.add(o);
+                    debug_assert!(added);
+                }
+                crate::util::rc::MAX_REF_COUNT as usize
+            }
+            Err(other) => panic!("unexpected RC increment error: {:?}", other),
         }
     }
 
@@ -391,9 +447,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                             self.tgt_rc2 += 1;
                         }
                     }
-                    let result = self.lxr.rc_with_overflow.inc(target);
-                    #[cfg(feature = "s_rc_stats")]
-                    self.record_inc(result);
+                    let result = self.inc_rc(target);
                     //this is assert may not be true
                     //debug_assert!(cc::strong_rc(target, Ordering::SeqCst) != 0);
                     debug_assert!(cc::strong_rc(target, Ordering::SeqCst) as RcBits <= self.rc.count(target));
@@ -445,9 +499,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
     fn inc(&self, o: ObjectReference) -> bool {
         //this asseretion might not be true on multiple threads.
         //debug_assert!(self.rc.count(o) != RC_DEATH_TRANSIENT, "RC=1 is reserved for death processing");
-        let prev0 = self.lxr.rc_with_overflow.inc(o);
-        #[cfg(feature = "s_rc_stats")]
-        self.record_inc(prev0);
+        let prev0 = self.inc_rc(o);
         if prev0 == RC_NURSERY_OR_DEAD as usize {
             // First promotion: establish the +1 bias (0 → 1 → RC_DEATH_THRESHOLD)
             #[cfg(feature = "graph_project")]
@@ -456,9 +508,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 reporter.add_allocated(o.to_raw_address().as_usize());
             }
             cc::strong_rc_inc(o);
-            let prev1 = self.lxr.rc_with_overflow.inc(o);
-            #[cfg(feature = "s_rc_stats")]
-            self.record_inc(prev1);
+            let _prev1 = self.inc_rc(o);
             return true;
         }
         //debug_assert!(
@@ -947,8 +997,22 @@ impl<VM: VMBinding, const KIND: EdgeKind> GCWork<VM> for ProcessIncs<VM, KIND> {
             INC_OBJS.fetch_add(self.inc_objs, Ordering::SeqCst);
             COPY_OBJS.fetch_add(self.copy_objs, Ordering::SeqCst);
         }
+        // The guard must cover EVERY tally flushed below. It used to test only `tgt_*`, which move
+        // only when a packet scanned a promoted object's fields, so a packet whose slots all
+        // targeted mature objects -- exactly the saturated traffic -- dropped its `inc.fast` /
+        // `inc.slow_*` / `rc.true_max` on the floor (2026-10-13; FINDINGS §20.3 and §24.6 were
+        // measured with that bug).
         #[cfg(feature = "s_rc_stats")]
-        if self.tgt_rc2 | self.tgt_rc3 | self.tgt_rc4p | self.tgt_sat != 0 {
+        if self.tgt_rc2
+            | self.tgt_rc3
+            | self.tgt_rc4p
+            | self.tgt_sat
+            | self.fast.get()
+            | self.slow_lt16b.get()
+            | self.slow_ge16b.get()
+            | self.deferred.get()
+            != 0
+        {
             let c = crate::counters();
             c.inc_tgt_rc2.fetch_add(self.tgt_rc2, Ordering::Relaxed);
             c.inc_tgt_rc3.fetch_add(self.tgt_rc3, Ordering::Relaxed);
@@ -960,7 +1024,9 @@ impl<VM: VMBinding, const KIND: EdgeKind> GCWork<VM> for ProcessIncs<VM, KIND> {
             c.inc_slow_ge16b.fetch_add(self.slow_ge16b.get(), Ordering::Relaxed);
             c.rc_true_max.fetch_max(self.true_max.get(), Ordering::Relaxed);
             c.inc_fast.fetch_add(self.fast.get(), Ordering::Relaxed);
+            c.inc_deferred.fetch_add(self.deferred.get(), Ordering::Relaxed);
             self.fast.set(0);
+            self.deferred.set(0);
             self.slow_lt16b.set(0);
             self.slow_ge16b.set(0);
             self.true_max.set(0);
@@ -1322,6 +1388,14 @@ impl<VM: VMBinding> GCWork<VM> for ProcessDecs<VM> {
             return;
         }
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        // Tripwire for `sat_inc_buf.rs`: a decrement must never run while a saturated increment is
+        // still buffered (SATURATED_INCS_DEFERRAL_PLAN.md §3.1). Reads other workers' buffers,
+        // which is only race-free if the invariant holds -- the point is to catch it when it does not.
+        #[cfg(all(feature = "lxr_defer_saturated_incs", debug_assertions))]
+        debug_assert!(
+            unsafe { lxr.sat_incs.all_empty() },
+            "ProcessDecs started with buffered saturated increments"
+        );
         self.cm_in_progress = lxr.cm_in_progress()
             || (!crate::args::LAZY_DECREMENTS && lxr.current_pause() == Some(Pause::InitialMark));
         self.mature_sweeping_in_progress = if crate::args::LAZY_DECREMENTS {

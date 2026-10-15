@@ -106,6 +106,7 @@ default = [
     #"s_rc_stats",
     #"tracing",
     "immix_non_moving",
+    "lxr_defer_saturated_incs",
     #"graph_project",
     #"lxr_rc_path_stats",
 ]
@@ -254,6 +255,10 @@ s_rc_stats = []
 # Diagnostic only: adds six columns to the MMTk stats block. Must NOT be enabled for
 # publication timing builds. With it off, the module and every call site are cfg'd away.
 lxr_rc_path_stats = []
+# ProcessIncs: an increment that finds the RC field saturated adds 1 to a per-worker table instead
+# of doing an atomic fetch_add on OVERFLOW_RC_TABLE; the totals are applied once per GC in
+# `LXR::release`, before any decrement can start (~/mmtk/SATURATED_INCS_DEFERRAL_PLAN.md, stage S1).
+lxr_defer_saturated_incs = []
 # Concurrent cycle collector: objects per mark/collect work buffer before it is handed off as a
 # new packet (`CycleTraversal::SPLIT_THRESHOLD` in src/plan/lxr/gc_work.rs). Default, with none
 # of these enabled, is 2048. Enable at most one -- more than one is a compile error.

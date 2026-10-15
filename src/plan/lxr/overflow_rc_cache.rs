@@ -156,6 +156,27 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
         }
     }
 
+    /// Add `n` increments to the excess of an object whose RC field the caller has already seen
+    /// at `MAX_REF_COUNT`. Returns the previous excess.
+    ///
+    /// This is [`Self::inc`]'s saturated arm applied `n` times in one RMW, for the per-worker
+    /// buffers of `lxr_defer_saturated_incs` (`rc.rs`, `SatIncBuf`). Skipping the RC-field check
+    /// is safe because a saturated RC field cannot leave `MAX_REF_COUNT` without a decrement, and
+    /// no decrement runs while increments are being buffered or applied (invariant 2).
+    #[cfg(feature = "lxr_defer_saturated_incs")]
+    pub fn inc_saturated_n(&self, o: ObjectReference, n: u32) -> u32 {
+        debug_assert!(n > 0);
+        debug_assert_eq!(self.rc.count(o), MAX_REF_COUNT);
+        let prev: Excess =
+            OVERFLOW_RC_TABLE.fetch_add_atomic::<Excess>(o.to_raw_address(), n, Ordering::Relaxed);
+        debug_assert!(prev.checked_add(n).is_some(), "overflow excess wrapped for {:?}", o);
+        #[cfg(feature = "s_rc_stats")]
+        if prev == 0 {
+            self.overflowed.fetch_add(1, Ordering::Relaxed);
+        }
+        prev
+    }
+
     pub fn dec(&self, o: ObjectReference) -> usize {
         // As in `inc`: one `Result` per logical dec regardless of internal CAS retries.
         match self.rc.dec(o) {

@@ -338,6 +338,14 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     }
 
     fn release_object(&self, start: Address) -> usize {
+        // Stale-epoch fix (see `SanityRelease`): a large object allocated later at this address
+        // must not inherit this one's sanity epoch or dead-cycle count.
+        #[cfg(feature = "sanity")]
+        {
+            use crate::util::sanity::sanity_checker::SANITY_DEAD_CYCLE_COUNT;
+            SANITY_MARK_BITS.store_atomic::<u8>(start, 0, Ordering::SeqCst);
+            SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(start, 0, Ordering::SeqCst);
+        }
         if crate::args::BARRIER_MEASUREMENT
             || (self.common.needs_log_bit && self.common.needs_field_log_bit)
         {
@@ -601,6 +609,12 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         }
     }
 
+    /// DIAGNOSTIC (2026-10-13, temporary): the mature large objects, for the sanity leak report.
+    #[cfg(feature = "sanity")]
+    pub fn sanity_mature_objects(&self) -> Vec<ObjectReference> {
+        self.rc_mature_objects.lock().unwrap().keys().copied().collect()
+    }
+
     //Eyal added this function to use in sanity gc
     #[cfg(feature = "sanity")]
     pub fn sanity_sweep_large_objects(&self) {
@@ -618,6 +632,8 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
                 let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
                 assert!(prev != 5, "Large object {:?} has been dead for 5 cycles without being collected", o);
                 SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), prev + 1, Ordering::SeqCst);
+                // Stale-epoch fix (see `SanityRelease`): an unmarked object must not keep an old epoch.
+                SANITY_MARK_BITS.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
             } else {
                 SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
             }

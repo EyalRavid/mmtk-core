@@ -12,6 +12,9 @@ mod remset;
 #[allow(dead_code)]
 mod stack;
 mod overflow_rc_cache;
+/// Per-worker buffers for saturated increments. Exists only under the feature.
+#[cfg(feature = "lxr_defer_saturated_incs")]
+mod sat_inc_buf;
 /// Fast/slow path counters for `overflow_rc_cache`. The whole module exists only under
 /// the feature, so a publication build contains none of it. See `rc_path_stats.rs`.
 #[cfg(feature = "lxr_rc_path_stats")]

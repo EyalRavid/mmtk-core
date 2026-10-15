@@ -1,0 +1,147 @@
+//! Per-worker buffers for increments of saturated objects (`lxr_defer_saturated_incs`).
+//!
+//! An increment whose target's RC field reads `MAX_REF_COUNT` must add 1 to the target's excess in
+//! `OVERFLOW_RC_TABLE`. On workloads with a few very popular objects (`biojava`: ~43) every GC
+//! worker does that `fetch_add` on the same few words, and the cache lines bounce between cores.
+//! Here each worker instead counts its saturated increments per object in a private table, and the
+//! totals are applied with one `fetch_add(n)` per (worker, object):
+//!
+//! * when a worker's table fills up mid-pause (`SatIncBuf::add` returns `false`), and
+//! * once per GC for every worker, in `LXR::release`, before `ImmixSpace::release_rc`.
+//!
+//! # Why applying late is safe
+//!
+//! Increments only commute with other increments. `overflow_rc_cache.rs` invariant 2 already says
+//! increments (`ProcessIncs`, STW) and decrements (`ProcessDecs`, after the pause, or in
+//! `STWRCDecsAndSweep` for `FullRC`) never overlap; the decrements of a pause are released into a
+//! runnable bucket only by `release_rc` (FullRC) or `on_gc_finished` (RefCount), both after the
+//! drain. So every buffered increment is in the table before any decrement can read it.
+//!
+//! While an increment sits in a buffer the object's RC field reads `MAX_REF_COUNT`, which is all
+//! any in-pause reader looks at, except the `sanity`-only `rc.rs` check for a true count of exactly
+//! `2 * MAX_REF_COUNT`, which merely chooses which objects the sanity GC re-checks.
+//!
+//! See `~/mmtk/SATURATED_INCS_DEFERRAL_PLAN.md` (stage S1 only; S2 is not implemented).
+
+use std::cell::UnsafeCell;
+
+use crossbeam::utils::CachePadded;
+
+use crate::util::{Address, ObjectReference};
+
+/// Table size. Power of two. 12 KiB of keys and counts per worker.
+const CAPACITY: usize = 1024;
+const LOG_CAPACITY: u32 = CAPACITY.trailing_zeros();
+/// Linear probing gives up after this many slots and reports the table full.
+const MAX_PROBE: usize = 16;
+
+pub struct SatIncBuf {
+    /// `ObjectReference` as an address; 0 is empty.
+    keys: Box<[usize; CAPACITY]>,
+    counts: Box<[u32; CAPACITY]>,
+    /// Occupied slots, so draining and clearing cost O(entries) rather than O(CAPACITY).
+    used: Vec<u16>,
+}
+
+impl SatIncBuf {
+    fn new() -> Self {
+        Self {
+            keys: Box::new([0; CAPACITY]),
+            counts: Box::new([0; CAPACITY]),
+            used: Vec::with_capacity(CAPACITY),
+        }
+    }
+
+    #[inline(always)]
+    fn hash(key: usize) -> usize {
+        // Fibonacci hashing of the 8-byte-aligned address.
+        ((key >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - LOG_CAPACITY)) as usize
+    }
+
+    /// Count one increment of `o`. Returns `false`, changing nothing, if there is no room; the
+    /// caller then drains the table and retries.
+    #[inline(always)]
+    pub fn add(&mut self, o: ObjectReference) -> bool {
+        let key = o.to_raw_address().as_usize();
+        let mut i = Self::hash(key);
+        for _ in 0..MAX_PROBE {
+            let k = self.keys[i];
+            if k == key {
+                self.counts[i] += 1;
+                return true;
+            }
+            if k == 0 {
+                self.keys[i] = key;
+                self.counts[i] = 1;
+                self.used.push(i as u16);
+                return true;
+            }
+            i = (i + 1) & (CAPACITY - 1);
+        }
+        false
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn is_empty(&self) -> bool {
+        self.used.is_empty()
+    }
+
+    /// Hand every (object, count) to `f` and leave the table empty.
+    pub fn drain(&mut self, mut f: impl FnMut(ObjectReference, u32)) {
+        for &i in &self.used {
+            let i = i as usize;
+            let o = unsafe { ObjectReference::from_raw_address_unchecked(Address::from_usize(self.keys[i])) };
+            f(o, self.counts[i]);
+            self.keys[i] = 0;
+            self.counts[i] = 0;
+        }
+        self.used.clear();
+    }
+}
+
+/// One `SatIncBuf` per GC worker, indexed by `GCWorker::ordinal`.
+pub struct SatIncBuffers {
+    bufs: Box<[CachePadded<UnsafeCell<SatIncBuf>>]>,
+}
+
+// Each buffer is written only by its own worker, and read by another thread only in `drain_all`,
+// when no `ProcessIncs` can be running. The scheduler's park/open-bucket handshake orders the two.
+unsafe impl Sync for SatIncBuffers {}
+unsafe impl Send for SatIncBuffers {}
+
+impl SatIncBuffers {
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            bufs: (0..num_workers)
+                .map(|_| CachePadded::new(UnsafeCell::new(SatIncBuf::new())))
+                .collect(),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Only the worker with this `ordinal` may call it, and the returned reference must not outlive
+    /// the current increment.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get(&self, ordinal: usize) -> &mut SatIncBuf {
+        &mut *self.bufs[ordinal].get()
+    }
+
+    /// Drain every worker's buffer into `f`.
+    ///
+    /// # Safety
+    ///
+    /// No `ProcessIncs` may be running or runnable: call it from the `Release` stage only.
+    pub unsafe fn drain_all(&self, mut f: impl FnMut(ObjectReference, u32)) {
+        for b in self.bufs.iter() {
+            (*b.get()).drain(&mut f);
+        }
+    }
+
+    /// True if every buffer is empty. For debug assertions, under the same rule as `drain_all`.
+    #[cfg(debug_assertions)]
+    pub unsafe fn all_empty(&self) -> bool {
+        self.bufs.iter().all(|b| (*b.get()).is_empty())
+    }
+}

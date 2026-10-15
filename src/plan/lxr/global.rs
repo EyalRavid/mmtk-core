@@ -143,6 +143,9 @@ pub struct LXR<VM: VMBinding> {
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
     pub in_cycle_collection: AtomicBool,
     pub rc_with_overflow: RefCountWithOverflow<VM>,
+    /// Saturated increments buffered per worker during the pause, applied in `release()`.
+    #[cfg(feature = "lxr_defer_saturated_incs")]
+    pub(super) sat_incs: super::sat_inc_buf::SatIncBuffers,
     #[cfg(feature = "graph_project")]
     pub graph_reporter: std::sync::Mutex<GcCycleReport>,
 }
@@ -475,6 +478,16 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             "    - ({:.3}ms) ix release start",
             crate::gc_start_time_ms(),
         );
+        // Apply the saturated increments buffered during this pause. MUST precede `release_rc`:
+        // for `FullRC` that call is what moves this pause's decrements into a runnable bucket
+        // (`process_lazy_decrement_packets`), and for `RefCount` they stay postponed until
+        // `on_gc_finished`. Every `ProcessIncs` has finished: `Release` opened only after all
+        // workers parked with every open bucket, `Unconstrained` included, empty.
+        #[cfg(feature = "lxr_defer_saturated_incs")]
+        unsafe {
+            self.sat_incs
+                .drain_all(|o, n| self.apply_saturated_incs(o, n));
+        }
         self.immix_space.release_rc(pause);
         self.update_fixed_alloc_trigger();
         self.update_fragmentation_analysis_experiment();
@@ -687,6 +700,8 @@ impl<VM: VMBinding> LXR<VM> {
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
         let options = args.options.clone();
+        #[cfg(feature = "lxr_defer_saturated_incs")]
+        let num_workers = args.scheduler.num_workers();
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &LXR_CONSTRAINTS,
@@ -737,6 +752,8 @@ impl<VM: VMBinding> LXR<VM> {
             #[cfg(feature = "graph_project")]
             graph_reporter: std::sync::Mutex::new(GcCycleReport::new()),
             rc_with_overflow: RefCountWithOverflow::new(),
+            #[cfg(feature = "lxr_defer_saturated_incs")]
+            sat_incs: super::sat_inc_buf::SatIncBuffers::new(num_workers),
         });
 
         lxr.update_fixed_alloc_trigger();
@@ -746,6 +763,31 @@ impl<VM: VMBinding> LXR<VM> {
         lxr.verify_side_metadata_sanity();
 
         lxr
+    }
+
+    /// Apply `n` buffered increments of `o`, whose RC field is saturated, as one RMW on its
+    /// excess. Called from a worker whose `SatIncBuf` filled up, and from `release()`.
+    #[cfg(feature = "lxr_defer_saturated_incs")]
+    pub(super) fn apply_saturated_incs(&self, o: ObjectReference, n: u32) {
+        let _prev = self.rc_with_overflow.inc_saturated_n(o, n);
+        // The n increments saw true counts MAX + prev, ..., MAX + prev + n - 1 (any interleaving
+        // of the buffered and the fallback ones gives the same multiset), so `inc.slow_*` and
+        // `rc.true_max` can still be bucketed exactly, as `ProcessIncs::record_inc` does without
+        // the feature.
+        #[cfg(feature = "s_rc_stats")]
+        {
+            const B16: usize = u16::MAX as usize;
+            let first = crate::util::rc::MAX_REF_COUNT as usize + _prev as usize;
+            let last = first + n as usize - 1;
+            let lt16b = if first >= B16 { 0 } else { last.min(B16 - 1) - first + 1 };
+            let c = crate::counters();
+            c.inc_slow_lt16b.fetch_add(lt16b, Ordering::Relaxed);
+            c.inc_slow_ge16b.fetch_add(n as usize - lt16b, Ordering::Relaxed);
+            c.rc_true_max.fetch_max(last, Ordering::Relaxed);
+            c.inc_deferred_entries.fetch_add(1, Ordering::Relaxed);
+            c.inc_overflow_peak
+                .fetch_max(self.rc_with_overflow.num_entries(), Ordering::Relaxed);
+        }
     }
 
     pub fn cm_enabled(&self) -> bool {

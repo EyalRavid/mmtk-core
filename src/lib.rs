@@ -660,6 +660,16 @@ struct Counters {
     pub inc_fast: AtomicUsize,
     pub inc_slow_lt16b: AtomicUsize,
     pub inc_slow_ge16b: AtomicUsize,
+    /// `lxr_defer_saturated_incs` only (zero without it). Saturated increments that went into a
+    /// per-worker `SatIncBuf` instead of an atomic on `OVERFLOW_RC_TABLE`; with the feature on they
+    /// are also counted, at apply time, in `inc.slow_*` (bucketed by their exact true count).
+    pub inc_deferred: AtomicUsize,
+    /// Buffer entries applied, i.e. the `fetch_add(n)`s that replaced `inc.deferred` single ones.
+    /// `inc.deferred / inc.deferred_entries` is the batching factor.
+    pub inc_deferred_entries: AtomicUsize,
+    /// Times a worker's buffer filled inside a pause and was applied early. Correct either way;
+    /// a high count means the table is too small for the workload's hot set.
+    pub inc_deferred_flushes: AtomicUsize,
     pub cc_satb_reads: AtomicUsize,
     // ---- write-barrier instrumentation ------------------------------------------------------
     //
@@ -740,6 +750,9 @@ impl Counters {
         "inc.fast": self.inc_fast.load(Ordering::SeqCst),
         "inc.slow_lt16b": self.inc_slow_lt16b.load(Ordering::SeqCst),
         "inc.slow_ge16b": self.inc_slow_ge16b.load(Ordering::SeqCst),
+        "inc.deferred": self.inc_deferred.load(Ordering::SeqCst),
+        "inc.deferred_entries": self.inc_deferred_entries.load(Ordering::SeqCst),
+        "inc.deferred_flushes": self.inc_deferred_flushes.load(Ordering::SeqCst),
         "cc.satb_reads": self.cc_satb_reads.load(Ordering::SeqCst),
         "barrier.slow_in_cc": self.barrier_slow_in_cc.load(Ordering::SeqCst),
         "barrier.satb_inserts": self.barrier_satb_inserts.load(Ordering::SeqCst),

@@ -214,6 +214,130 @@ fn is_straddle_filler<VM: VMBinding>(rc: &crate::util::rc::RefCountHelper<VM>, a
     rc.is_straddle_line(Line::from(Line::align(a)))
 }
 
+/// DIAGNOSTIC (2026-10-13, temporary): called just before the "dead for 5 cycles" assertion fires.
+/// Prints the leaked object's RC metadata and every heap object that still points at it, so the
+/// failure says which of "a dead cycle the collector never filed" and "a lost decrement" it is.
+fn report_leaked_object<VM: VMBinding>(
+    mmtk: &'static MMTK<VM>,
+    lxr: &crate::plan::lxr::LXR<VM>,
+    target: ObjectReference,
+) {
+    // `class_is_valid` prints on failure and this walk visits every RC-carrying granule, so the
+    // same test is repeated here silently. A granule that fails it is skipped, not walked: walking
+    // fields through a garbage klass is what crashed the first version of this report.
+    let plausible = |o: ObjectReference| -> bool {
+        let v = o.class_pointer::<VM>().as_usize();
+        v % 8 == 0
+            && if VM::VMObjectModel::COMPRESSED_PTR_ENABLED {
+                (0x10000_0000..=0x20000_0000).contains(&v)
+            } else {
+                (v & 0xff000_00000000) == 0x7000_00000000
+            }
+    };
+    let mark_state = MARK_STATE.load(Ordering::SeqCst);
+    let describe = |o: ObjectReference| -> String {
+        let a = o.to_raw_address();
+        let (w0, w1) = unsafe { (a.load::<usize>(), (a + 8usize).load::<usize>()) };
+        let mut cls = if plausible(o) {
+            VM::VMObjectModel::dump_object_s(o)
+        } else {
+            format!("NOT AN OBJECT: header={:#x} klass_word={:#x}", w0, w1)
+        };
+        cls.truncate(160);
+        format!(
+            "{:?} rc={} rc_table={} s_rc={} tag={} colour={} marked={} dead_cycles={} curr_vec={} | {}",
+            o,
+            lxr.rc_with_overflow.get(o),
+            lxr.rc.count(o),
+            cc::strong_rc(o, Ordering::SeqCst),
+            cc::tag(o, Ordering::SeqCst),
+            cc::colour(o, Ordering::SeqCst),
+            MARK_BITS.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst) == mark_state,
+            SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst),
+            lxr.curr_vec.get(),
+            cls.replace('\n', " "),
+        )
+    };
+    eprintln!("LEAK-DIAG target: {}", describe(target));
+    if !plausible(target) {
+        // Is the address the interior of a real object? Walk back granule by granule (up to one
+        // block) to the nearest plausible object start carrying an RC, and test its extent.
+        let mut a = target.to_raw_address();
+        let floor = a.align_down(crate::policy::immix::block::Block::BYTES);
+        while a > floor {
+            a = a - rc::MIN_OBJECT_SIZE;
+            let o = a.to_object_reference::<VM>();
+            if lxr.rc_with_overflow.get(o) != 0 && plausible(o) {
+                let size = VM::VMObjectModel::get_current_size(o);
+                eprintln!(
+                    "LEAK-DIAG   nearest object below: {:?} size={} covers_target={} | {}",
+                    o,
+                    size,
+                    a + size > target.to_raw_address(),
+                    describe(o)
+                );
+                break;
+            }
+        }
+    }
+    let mut referrers = 0usize;
+    let mut skipped = 0usize;
+    let mut check = |src: ObjectReference| {
+        if !plausible(src) {
+            skipped += 1;
+            return;
+        }
+        src.iterate_fields::<VM, _>(
+            crate::util::address::CLDScanPolicy::Ignore,
+            crate::util::address::RefScanPolicy::Follow,
+            |slot: VM::VMSlot, _| {
+                if slot.load() == Some(target) && referrers < 32 {
+                    referrers += 1;
+                    eprintln!("LEAK-DIAG   referrer: {}", describe(src));
+                }
+            },
+        );
+    };
+    for chunk in lxr
+        .immix_space
+        .chunk_map
+        .all_chunks()
+        .filter(|c| lxr.immix_space.chunk_map.get(*c) == ChunkState::Allocated)
+    {
+        for block in chunk
+            .iter_region::<Block>()
+            .filter(|b| b.get_state() != BlockState::Unallocated)
+        {
+            let mut cursor = block.start();
+            while cursor < block.end() {
+                let o = cursor.to_object_reference::<VM>();
+                if lxr.rc_with_overflow.get(o) != 0 && !is_straddle_filler(&lxr.rc, cursor) {
+                    check(o);
+                }
+                cursor = cursor + rc::MIN_OBJECT_SIZE;
+            }
+        }
+    }
+    for o in lxr.los().sanity_mature_objects() {
+        check(o);
+    }
+    eprintln!("LEAK-DIAG {} heap referrer(s) found ({} granules skipped as non-objects)", referrers, skipped);
+    // Roots the sanity trace replayed this cycle. A hit here means the sanity trace SHOULD have
+    // marked the target, so "unmarked" would be a checker problem, not a leak.
+    match mmtk.sanity_checker.try_lock() {
+        Ok(sc) => {
+            for (roots, kind) in sc.root_slots.iter() {
+                for s in roots.iter() {
+                    if s.load() == Some(target) {
+                        eprintln!("LEAK-DIAG   sanity root slot {:?} kind={:?} points at target", s, kind);
+                    }
+                }
+            }
+        }
+        Err(_) => eprintln!("LEAK-DIAG   sanity_checker locked; root slots not checked"),
+    }
+}
+
 impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
     fn do_work(&mut self, _worker: &mut GCWorker<P::VM>, mmtk: &'static MMTK<P::VM>) {
         info!("Sanity GC release");
@@ -235,9 +359,38 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                     "object: {} has metadata rc of: {}, but acording to scan: {}", obj.to_raw_address(), real_rc, *rc);
 
             }
-            for chunk in lxr.immix_space.chunk_map.all_chunks()
-            .filter(|c| lxr.immix_space.chunk_map.get(*c) == ChunkState::Allocated){
-                for block in chunk.iter_region::<Block>().filter(|block| block.get_state() != BlockState::Unallocated) {
+            // STALE-EPOCH FIX. `MARK_BITS` holds a 4-bit epoch that wraps every 15 sanity GCs, and
+            // `attempt_mark` treats "bits == current epoch" as "already visited" and does NOT scan
+            // the object. Bits left over from an earlier cycle -- on an object sanity did not reach,
+            // or on memory a dead object vacated and a new object now occupies -- can therefore equal
+            // the current epoch by coincidence; that object is then never scanned and everything
+            // reachable only through it reads as dead. On a long chain (the `Finalizer` list) the
+            // cut repeats cycle after cycle and trips the dead-for-5-cycles assert on live objects.
+            //
+            // So this walk leaves every granule holding either the CURRENT epoch (marked this cycle)
+            // or 0, and the epoch is never 0. The next cycle's epoch is current + 1, so nothing can
+            // match it until the trace marks it. That covers granules the walk visits (unmarked
+            // objects and rc == 0 granules, below) and memory it does not: unallocated blocks and
+            // freed chunks are zeroed whole, since a block reused 15 GCs later would otherwise bring
+            // its old epochs back. Large objects are handled in `LargeObjectSpace`.
+            for chunk in lxr.immix_space.chunk_map.all_chunks() {
+                if lxr.immix_space.chunk_map.get(chunk) != ChunkState::Allocated {
+                    // A freed chunk's metadata may still be mapped and hold old epochs. A chunk
+                    // that was never allocated has no metadata mapped and nothing to clear.
+                    let meta = crate::util::metadata::side_metadata::address_to_meta_address(
+                        &MARK_BITS,
+                        chunk.start(),
+                    );
+                    if meta.is_mapped() {
+                        MARK_BITS.bzero_metadata(chunk.start(), crate::util::heap::chunk_map::Chunk::BYTES);
+                    }
+                    continue;
+                }
+                for block in chunk.iter_region::<Block>() {
+                    if block.get_state() == BlockState::Unallocated {
+                        MARK_BITS.bzero_metadata(block.start(), Block::BYTES);
+                        continue;
+                    }
                     let mut cursor = block.start();
                     let limit = block.end();
                     while cursor < limit {
@@ -258,11 +411,16 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                             // Track how many cycles it survives unmarked.
                             if mark_val != mark_state {
                                 let prev = SANITY_DEAD_CYCLE_COUNT.load_atomic::<u8>(o.to_raw_address(), Ordering::SeqCst);
+                                if prev == 6 && lxr.rc_with_overflow.get(o) - 1 != 0 {
+                                    report_leaked_object(mmtk, lxr, o);
+                                }
                                 assert!(prev != 6 || lxr.rc_with_overflow.get(o) - 1 == 0, 
                                             "Object {:?} has been dead for 5 cycles without being collected it has rc of: {}", 
                                             o, lxr.rc_with_overflow.get(o) - 1
                                 );
                                 SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), prev + 1, Ordering::SeqCst);
+                                // Stale-epoch fix: an unmarked granule must not keep an old epoch.
+                                MARK_BITS.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
                             } else {
                                 // Object is live and marked — reset counter
                                 SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
@@ -273,6 +431,9 @@ impl<P: Plan> GCWork<P::VM> for SanityRelease<P> {
                         }
                         else{
                             SANITY_DEAD_CYCLE_COUNT.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
+                            // Stale-epoch fix: free (or interior) granule -- clear whatever epoch a
+                            // dead occupant left, before a new object can be allocated over it.
+                            MARK_BITS.store_atomic::<u8>(o.to_raw_address(), 0, Ordering::SeqCst);
                             cursor = cursor + rc::MIN_OBJECT_SIZE;
                         }
 
