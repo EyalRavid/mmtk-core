@@ -1096,7 +1096,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             debug_assert!(self.rc.count(curr) > 1);
             if !is_black(curr) {
                 // SAFETY: single-threaded CycleFullRC -- see the impl header.
-                unsafe { cc::set_colour_exclusive(curr, BLACK_IN_STACK, Ordering::SeqCst) };
+                
                 let s_rc = self.rc.count(curr) - 1;
                 // SAFETY: single-threaded CycleFullRC -- see the impl header.  Note the
                 // obligation here is the *wider* one: `STRONG_RC_TABLE` is 4 bits per entry, so
@@ -1115,7 +1115,13 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     if let Some(x) = self.get_child(slot, lxr) {
                         // SAFETY: single-threaded CycleFullRC -- see the impl header.
                         let _prev = unsafe { lxr.rc_with_overflow.inc_exclusive(x) };
-                        if !in_stack(x) {
+                        // `curr` is not BLACK_IN_STACK yet -- its colour is stored after this walk --
+                        // so a self-edge must be excluded by hand, exactly as `in_stack` excluded it
+                        // before.  Pushing `curr` again would pop the duplicate first and paint it
+                        // BLACK_OUT_OF_STACK while it is still an ancestor on the stack, and every
+                        // back-edge to it from a subtree walked after that would then add to its
+                        // strong RC.
+                        if x != curr && !in_stack(x) {
                             // SAFETY: as above.
                             unsafe { cc::strong_rc_inc_exclusive(x) };
                             dfs_stack.push(x);
@@ -1125,7 +1131,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 });
                 #[cfg(feature = "s_rc_stats")]
                 { self.stats.objects_in_scan_black.set(self.stats.objects_in_scan_black.get() + 1); }
-              
+                unsafe { cc::set_colour_exclusive(curr, BLACK_IN_STACK, Ordering::SeqCst) };
             } else {
                 // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { cc::set_colour_exclusive(curr, BLACK_OUT_OF_STACK, Ordering::Relaxed) };

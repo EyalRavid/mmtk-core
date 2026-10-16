@@ -244,7 +244,7 @@ impl<VM: VMBinding> LXRFieldBarrierSemantics<VM> {
             #[cfg(feature = "s_rc_stats")]
             { self.slow_in_cc += 1; }
             if let Some(obj) = _src {
-                if cc::colour(obj, Ordering::SeqCst) >= BLACK_IN_STACK {
+                if cc::colour(obj, Ordering::SeqCst) > BLACK_IN_STACK {
                     #[cfg(feature = "s_rc_stats")]
                     { self.satb_inserts += 1; }
                     self.lxr.satb_map.insert(slot, old);
