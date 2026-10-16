@@ -624,6 +624,15 @@ impl<VM: VMBinding> CycleTraversal<VM>{
 
         lxr.curr_vec.set(entry_vec);
 
+        // Apply the mark decrements buffered on saturated objects before `scan` reads any count.
+        // This packet is the only one running cycle collection (see the impl header), so every
+        // buffered decrement is this worker's own and nothing else is writing the buffers.
+        #[cfg(feature = "lxr_defer_saturated_cc_decs")]
+        unsafe {
+            lxr.sat_cc_decs
+                .drain_all(|o, n| lxr.apply_saturated_cc_decs(o, n));
+        }
+
         #[cfg(feature = "s_rc_stats")]
         {
             self.stats.candidates_after_filter = buffers.iter().map(|(c, _)| c.len()).sum();
@@ -813,6 +822,48 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         }
     }
 
+    /// Subtract one edge into `x` -- `mark`'s only RC write.
+    ///
+    /// With `lxr_defer_saturated_cc_decs`, a decrement that finds `x`'s RC field at
+    /// `MAX_REF_COUNT` is counted in this worker's `LXR::sat_cc_decs` buffer instead of being
+    /// applied to `OVERFLOW_RC_TABLE` (see `sat_inc_buf.rs`). `RefCountHelper::dec` makes the
+    /// test and leaves a saturated field untouched in one RMW, so there is no window between
+    /// seeing `MAX_REF_COUNT` and buffering. The buffers are applied when mark ends, before scan.
+    #[inline(always)]
+    fn mark_dec(lxr: &LXR<VM>, x: ObjectReference) {
+        #[cfg(not(feature = "lxr_defer_saturated_cc_decs"))]
+        {
+            let prev = lxr.rc_with_overflow.dec(x);
+            debug_assert!(prev != 1);
+            debug_assert!(prev != 0);
+        }
+        #[cfg(feature = "lxr_defer_saturated_cc_decs")]
+        match lxr.rc.dec(x) {
+            Ok(prev) => {
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::dec_fast();
+                debug_assert!(prev != 1);
+                debug_assert!(prev != 0);
+            }
+            Err(crate::util::rc::MAX_REF_COUNT) => {
+                #[cfg(feature = "lxr_rc_path_stats")]
+                super::rc_path_stats::dec_slow();
+                // SAFETY: the buffer is this worker's own, and no other thread reads it until the
+                // mark phase has ended.
+                let buf = unsafe { lxr.sat_cc_decs.get(GCWorker::<VM>::current().ordinal) };
+                if !buf.add(x) {
+                    // Full: apply what this worker has so far and start again. Still inside mark,
+                    // so still before scan reads any count; concurrent mark workers only decrement,
+                    // and `dec_saturated_n` is atomic against them.
+                    buf.drain(|o, n| lxr.apply_saturated_cc_decs(o, n));
+                    let added = buf.add(x);
+                    debug_assert!(added);
+                }
+            }
+            Err(other) => panic!("unexpected RC decrement error in mark: {:?}", other),
+        }
+    }
+
     /// Trial deletion: decrements RC of children for each GREY candidate via DFS.
     ///
     /// **Decrements are applied on commit, not while walking.**  The field walk only collects the
@@ -949,9 +1000,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     // Commit: subtract each collected edge exactly once, then hand the children to
                     // the walk.
                     for &x in children.iter() {
-                        let prev = lxr.rc_with_overflow.dec(x);
-                        debug_assert!(prev != 1);
-                        debug_assert!(prev != 0);
+                        Self::mark_dec(lxr, x);
                         let _ = cc::strong_rc_dec(x);
                         new_work.push(x);
                         #[cfg(feature = "s_rc_stats")]
@@ -1761,6 +1810,13 @@ impl<VM: VMBinding> CycleCollectBlack<VM> {
 impl<VM: VMBinding> GCWork<VM> for CycleScan<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        // Tripwire for `lxr_defer_saturated_cc_decs`: scan reads true counts, so every buffered
+        // mark decrement must already be applied (`on_lazy_mark_finished`).
+        #[cfg(all(feature = "lxr_defer_saturated_cc_decs", debug_assertions))]
+        debug_assert!(
+            unsafe { lxr.sat_cc_decs.all_empty() },
+            "CycleScan started with buffered mark decrements"
+        );
         let mut candidates = FinalBuffers::from_vecs(std::mem::take(&mut self.buffers));
 
         // Two stacks: `scan` nests into `scan_black`.

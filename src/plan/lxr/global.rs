@@ -146,6 +146,11 @@ pub struct LXR<VM: VMBinding> {
     /// Saturated increments buffered per worker during the pause, applied in `release()`.
     #[cfg(feature = "lxr_defer_saturated_incs")]
     pub(super) sat_incs: super::sat_inc_buf::SatIncBuffers,
+    /// Saturated decrements buffered per worker by the cycle collector's mark, applied when mark
+    /// ends (`on_lazy_mark_finished`; `all_buff_gc` for `FullRC`). Separate from `sat_incs` so the
+    /// `ProcessDecs` tripwire on `sat_incs` stays meaningful.
+    #[cfg(feature = "lxr_defer_saturated_cc_decs")]
+    pub(super) sat_cc_decs: super::sat_inc_buf::SatIncBuffers,
     #[cfg(feature = "graph_project")]
     pub graph_reporter: std::sync::Mutex<GcCycleReport>,
 }
@@ -700,7 +705,7 @@ impl<VM: VMBinding> LXR<VM> {
         ]);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
         let options = args.options.clone();
-        #[cfg(feature = "lxr_defer_saturated_incs")]
+        #[cfg(any(feature = "lxr_defer_saturated_incs", feature = "lxr_defer_saturated_cc_decs"))]
         let num_workers = args.scheduler.num_workers();
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
@@ -754,6 +759,8 @@ impl<VM: VMBinding> LXR<VM> {
             rc_with_overflow: RefCountWithOverflow::new(),
             #[cfg(feature = "lxr_defer_saturated_incs")]
             sat_incs: super::sat_inc_buf::SatIncBuffers::new(num_workers),
+            #[cfg(feature = "lxr_defer_saturated_cc_decs")]
+            sat_cc_decs: super::sat_inc_buf::SatIncBuffers::new(num_workers),
         });
 
         lxr.update_fixed_alloc_trigger();
@@ -763,6 +770,13 @@ impl<VM: VMBinding> LXR<VM> {
         lxr.verify_side_metadata_sanity();
 
         lxr
+    }
+
+    /// Apply `n` buffered mark decrements of `o`, whose RC field read `MAX_REF_COUNT` when they
+    /// were buffered. Called from a mark worker whose buffer filled up, and when mark ends.
+    #[cfg(feature = "lxr_defer_saturated_cc_decs")]
+    pub(super) fn apply_saturated_cc_decs(&self, o: ObjectReference, n: u32) {
+        let _replayed = self.rc_with_overflow.dec_saturated_n(o, n);
     }
 
     /// Apply `n` buffered increments of `o`, whose RC field is saturated, as one RMW on its
@@ -1493,6 +1507,16 @@ impl<VM: VMBinding> LXR<VM> {
     /// mark counter this hangs off guarantees.
     #[cfg(not(feature = "lxr_stw"))]
     fn on_lazy_mark_finished(&self, c: LazySweepingJobsCounter) {
+        // Apply the mark decrements buffered on saturated objects BEFORE the scan packet exists:
+        // `scan` is the first reader of true counts (`count(curr) > 1`). This runs on the thread
+        // whose token drop took the mark counter to 0, so every mark packet -- spilled ones
+        // included, each holds a `clone_with_mark` -- has finished, and the SeqCst `fetch_sub`
+        // chain on that counter orders their buffer writes before these reads.
+        #[cfg(feature = "lxr_defer_saturated_cc_decs")]
+        unsafe {
+            self.sat_cc_decs
+                .drain_all(|o, n| self.apply_saturated_cc_decs(o, n));
+        }
         let buffers = std::mem::take(&mut *self.mark_survivors.lock().unwrap());
         self.immix_space.scheduler().work_buckets[WorkBucketStage::Unconstrained]
             .add(CycleScan::<VM>::new(buffers, c.clone_with_scan()));

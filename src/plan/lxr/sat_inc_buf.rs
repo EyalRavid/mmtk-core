@@ -22,6 +22,24 @@
 //! `2 * MAX_REF_COUNT`, which merely chooses which objects the sanity GC re-checks.
 //!
 //! See `~/mmtk/SATURATED_INCS_DEFERRAL_PLAN.md` (stage S1 only; S2 is not implemented).
+//!
+//! # Second use: cycle-collector mark decrements (`lxr_defer_saturated_cc_decs`)
+//!
+//! A separate set of buffers (`LXR::sat_cc_decs`) counts the decrements `mark` applies to children
+//! whose RC field reads `MAX_REF_COUNT`. On `biojava` these are ~22 M per timed iteration, almost all
+//! on a few dozen very popular objects, and every mark worker CASes the same few excess words. The
+//! counts here are *decrements*; `LXR::apply_saturated_cc_decs` applies them.
+//!
+//! Applying them late is safe for the same reason as the increments: nothing that depends on an
+//! exact count runs while they are buffered. During mark nothing increments (`ProcessIncs` is in
+//! the pause, `scan_black` runs after mark) and no other phase decrements (`ProcessDecs` has
+//! drained before cycle collection starts; `collect_*` run after scan). Mark itself reads only the
+//! RC *field*, which stays `MAX_REF_COUNT` while a decrement is buffered. `scan` is the first
+//! reader of the true count, and the buffers are drained before it can start: in
+//! `LXR::on_lazy_mark_finished`, which runs only after the last mark token is dropped, and after
+//! the mark loop of `all_buff_gc` for `FullRC`. A mark decrement never kills an object (death is in
+//! collect), so the apply has no death or candidate side effects; the only boundary is the excess
+//! running out, handled in `RefCountWithOverflow::dec_saturated_n`.
 
 use std::cell::UnsafeCell;
 
@@ -105,7 +123,9 @@ pub struct SatIncBuffers {
 }
 
 // Each buffer is written only by its own worker, and read by another thread only in `drain_all`,
-// when no `ProcessIncs` can be running. The scheduler's park/open-bucket handshake orders the two.
+// when no packet that writes it can be running. For the increments the scheduler's park/open-bucket
+// handshake orders the two; for the mark decrements it is the SeqCst `fetch_sub` chain on the mark
+// counter, whose last decrement runs `on_lazy_mark_finished`.
 unsafe impl Sync for SatIncBuffers {}
 unsafe impl Send for SatIncBuffers {}
 
@@ -132,7 +152,9 @@ impl SatIncBuffers {
     ///
     /// # Safety
     ///
-    /// No `ProcessIncs` may be running or runnable: call it from the `Release` stage only.
+    /// No packet that writes these buffers may be running or runnable: for `LXR::sat_incs`, no
+    /// `ProcessIncs` (call from the `Release` stage only); for `LXR::sat_cc_decs`, no mark packet
+    /// (call from `on_lazy_mark_finished`, or from the single `CycleFullRC` packet after its mark).
     pub unsafe fn drain_all(&self, mut f: impl FnMut(ObjectReference, u32)) {
         for b in self.bufs.iter() {
             (*b.get()).drain(&mut f);

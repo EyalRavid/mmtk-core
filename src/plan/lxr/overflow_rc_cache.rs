@@ -177,6 +177,45 @@ impl<VM: VMBinding> RefCountWithOverflow<VM> {
         prev
     }
 
+    /// Apply `n` decrements to an object whose RC field the caller saw at `MAX_REF_COUNT`, for the
+    /// per-worker buffers of `lxr_defer_saturated_cc_decs` (cycle-collector mark). Returns how many
+    /// of the `n` did not fit in the excess and went through [`Self::dec`] one at a time.
+    ///
+    /// One RMW takes `min(excess, n)` off the excess. The excess may have shrunk since the
+    /// decrements were buffered -- another worker's flush, or a full buffer flushed mid-mark -- and
+    /// whatever did not fit is replayed through `dec`, which steps the RC field down from
+    /// `MAX_REF_COUNT` exactly as an unbuffered decrement would. No increment runs during mark
+    /// (invariant 2 above; `scan_black` runs after mark), so the excess can only fall while the
+    /// buffers fill. Mark never takes a count to 0 (`debug_assert!(prev != 1)` in `mark`), so the
+    /// replay has no death to handle.
+    ///
+    /// With `lxr_rc_path_stats`, a replayed decrement is counted twice in `rc_path.dec.*` -- once
+    /// as `slow` when it was buffered, and again here. Replays happen only for an object that
+    /// leaves overflow during mark, so the distortion is small, but it is not zero.
+    #[cfg(feature = "lxr_defer_saturated_cc_decs")]
+    pub fn dec_saturated_n(&self, o: ObjectReference, n: u32) -> u32 {
+        debug_assert!(n > 0);
+        let prev: Excess = OVERFLOW_RC_TABLE
+            .fetch_update_atomic::<Excess, _>(
+                o.to_raw_address(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |e| Some(e.saturating_sub(n)),
+            )
+            .unwrap_or_else(|e| e);
+        let taken = prev.min(n);
+        #[cfg(feature = "s_rc_stats")]
+        if prev != 0 && prev <= n {
+            self.overflowed.fetch_sub(1, Ordering::Relaxed);
+        }
+        let rest = n - taken;
+        for _ in 0..rest {
+            let _prev = self.dec(o);
+            debug_assert!(_prev != RC_DEATH_TRANSIENT && _prev != 0, "mark took {:?} to 0", o);
+        }
+        rest
+    }
+
     pub fn dec(&self, o: ObjectReference) -> usize {
         // As in `inc`: one `Result` per logical dec regardless of internal CAS retries.
         match self.rc.dec(o) {
