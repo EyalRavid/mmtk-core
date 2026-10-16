@@ -507,10 +507,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 let mut reporter =  self.lxr.graph_reporter.lock().unwrap();
                 reporter.add_allocated(o.to_raw_address().as_usize());
             }
-            
-            unsafe {
-                cc::strong_rc_inc_exclusive(o);
-            }
+            cc::strong_rc_inc(o);
             let _prev1 = self.inc_rc(o);
             return true;
         }
@@ -581,15 +578,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             //debug_assert!(promoted == false);
             //Eyal added this if
             if !promoted && K == EDGE_KIND_ROOT{
-
-                unsafe {
-                    cc::strong_rc_inc_exclusive(new);
-                }
+                cc::strong_rc_inc(new);
             }
             else if K == EDGE_KIND_MATURE && o != new && !promoted{
-                unsafe {
-                    cc::strong_rc_inc_exclusive(new);
-                }
+                cc::strong_rc_inc(new);
             }
 
             if promoted && new == o {
@@ -604,9 +596,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             }
             //Eyal added this if
             else if K == EDGE_KIND_ROOT{
-                unsafe {
-                    cc::strong_rc_inc_exclusive(o);
-                }
+                cc::strong_rc_inc(o);
             } 
             return o;
         }
@@ -616,9 +606,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             let new = object_forwarding::spin_and_get_forwarded_object::<VM>(o, forwarding_status);
             //debug_assert!(self.rc.clone().count(o) != 0);
             if !self.inc(new) && (K == EDGE_KIND_ROOT || K == EDGE_KIND_MATURE){
-                unsafe {
-                    cc::strong_rc_inc_exclusive(new);
-                }
+                cc::strong_rc_inc(new);
             }
             new
         } else {
@@ -637,9 +625,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 }
                 if let Some(new) = new {
                     if !self.inc(new) && K == EDGE_KIND_ROOT{
-                        unsafe {
-                            cc::strong_rc_inc_exclusive(new);
-                        }
+                        cc::strong_rc_inc(new);
                     }
                     self.promote(new, true, false, depth);
                     new
@@ -648,9 +634,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                     // Object is not moved.
                     let promoted = self.inc(o);
                     if !promoted && K == EDGE_KIND_ROOT{
-                        unsafe {
-                           cc::strong_rc_inc_exclusive(o);
-                        }
+                        cc::strong_rc_inc(o);
                     }
                     object_forwarding::clear_forwarding_bits::<VM>(o);
                     if promoted {
@@ -664,9 +648,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
                 // Object is not moved.
                 let promoted = self.inc(o);
                 if !promoted && K == EDGE_KIND_ROOT{
-                    unsafe{
-                        cc::strong_rc_inc_exclusive(o);
-                    }
+                    cc::strong_rc_inc(o);
                 }
                 object_forwarding::clear_forwarding_bits::<VM>(o);
                 if promoted {
