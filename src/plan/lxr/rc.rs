@@ -270,6 +270,11 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     fn promote(&mut self, o: ObjectReference, copied: bool, los: bool, depth: u32) {
         o.verify::<VM>();
+        // Register a promoted Reference (REFERENCE_PROCESSING_PLAN.md §3.1). `o` is the final
+        // address: the copied path passes the new copy.
+        if <VM::VMScanning as crate::vm::Scanning<VM>>::reference_kind(o) != 0 {
+            self.lxr.refs.insert(o);
+        }
         crate::stat(|s| {
             s.promoted_objects += 1;
             s.promoted_volume += o.get_size::<VM>();
@@ -1167,6 +1172,10 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
     #[cold]
     fn process_dead_object(&mut self, o: ObjectReference, lxr: &LXR<VM>) -> bool {
+        // RC death of a Reference: drop it from the registry (§3.2). The header is intact here.
+        if <VM::VMScanning as crate::vm::Scanning<VM>>::reference_kind(o) != 0 {
+            lxr.refs.remove(o);
+        }
         crate::stat(|s| {
             s.dead_mature_objects += 1;
             s.dead_mature_volume += o.get_size::<VM>();

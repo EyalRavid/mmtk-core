@@ -20,6 +20,8 @@ mod sat_inc_buf;
 /// the feature, so a publication build contains none of it. See `rc_path_stats.rs`.
 #[cfg(feature = "lxr_rc_path_stats")]
 pub(crate) mod rc_path_stats;
+/// The set of live `java.lang.ref.Reference` objects (REFERENCE_PROCESSING_PLAN.md §3).
+pub(crate) mod ref_registry;
 #[cfg(feature = "graph_project")]
 mod graphs_project;
 

@@ -474,6 +474,12 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         // reads `curr_vec` in that window.
         let entry_vec = lxr.curr_vec.get();
 
+        // REFERENCE_PROCESSING_PLAN.md R0: check the registry once per FullRC -- a correctness
+        // check, so debug builds only. No insert or remove can race: this is the single
+        // CycleFullRC packet and ProcessDecs has drained.
+        #[cfg(debug_assertions)]
+        lxr.refs.assert_valid::<VM>(&self.rc);
+
         // FINALIZER_RC_PLAN step 3A -- cut the ONE root edge into the unfinalized chain.
         //
         // `Finalizer.unfinalized` is a static field holding the head of a chain that is otherwise
@@ -1435,6 +1441,10 @@ impl<VM: VMBinding> CycleTraversal<VM>{
     }
 
     fn process_dead_object(&self, o: ObjectReference, lxr: &LXR<VM>) -> bool {
+        // Cycle-collector death of a Reference: drop it from the registry (§3.2).
+        if <VM::VMScanning as crate::vm::Scanning<VM>>::reference_kind(o) != 0 {
+            lxr.refs.remove(o);
+        }
         crate::stat(|s| {
             s.dead_mature_objects += 1;
             s.dead_mature_volume += o.get_size::<VM>();

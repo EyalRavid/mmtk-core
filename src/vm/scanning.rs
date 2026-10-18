@@ -271,6 +271,13 @@ pub trait Scanning<VM: VMBinding> {
         unreachable!()
     }
 
+    /// The kind of `java.lang.ref.Reference` `o` is: 0 not a Reference, 1 other, 2 soft, 3 weak,
+    /// 4 final, 5 phantom. The default (0) is correct for a VM without reference types. Used by the
+    /// LXR reference registry (`REFERENCE_PROCESSING_PLAN.md`).
+    fn reference_kind(_o: ObjectReference) -> u8 {
+        0
+    }
+
     /// MMTk calls this method at the first time during a collection that thread's stacks
     /// have been scanned. This can be used (for example) to clean up
     /// obsolete compiled methods that are no longer being executed.

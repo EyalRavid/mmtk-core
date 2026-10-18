@@ -204,6 +204,8 @@ impl Stats {
         println!("------------------------------ End MMTk Statistics -----------------------------");
         #[cfg(feature = "lxr_rc_path_stats")]
         crate::plan::lxr::rc_path_stats::print_report();
+        #[cfg(feature = "lxr_rc_path_stats")]
+        crate::plan::lxr::ref_registry::print_report();
     }
 
     pub fn print_column_names(&self, scheduler_stat: &HashMap<String, String>) {
