@@ -167,6 +167,36 @@ pub trait Collection<VM: VMBinding> {
         None
     }
 
+    /// Enumerate every Cleaner-style special-reference chain and its nodes, leaving the heap
+    /// unchanged. See `~/mmtk/CLEANER_RC_PLAN.md` §12: the collector cuts each eligible node's
+    /// `referent` edge ([`Self::clear_referent_raw`]), lets trial deletion decide which referents are
+    /// wanted by nothing but `referent` fields, restores the others
+    /// ([`Self::restore_referent_raw`]) and enqueues the cleaners of the rest
+    /// ([`Self::enqueue_references_raw`]).
+    ///
+    /// STOP-THE-WORLD ONLY. The default returns nothing, which is correct for a VM without such
+    /// chains.
+    fn cleaner_chains() -> Vec<CleanerChain> {
+        vec![]
+    }
+
+    /// Clear `reference`'s referent field, bypassing the write barrier, and return the old value.
+    /// The caller accounts the destroyed edge itself (one real decrement).
+    fn clear_referent_raw(_reference: ObjectReference) -> Option<ObjectReference> {
+        None
+    }
+
+    /// Put `referent` back into `reference`'s referent field, bypassing the write barrier -- the
+    /// inverse of [`Self::clear_referent_raw`]. The caller accounts the edge.
+    fn restore_referent_raw(_reference: ObjectReference, _referent: ObjectReference) {}
+
+    /// As [`Self::enqueue_finalizers`], for any `Reference` objects (here: cleaners whose referent
+    /// was just cleared). Returns the previous pending-list head; the caller accounts the spliced
+    /// edges.
+    fn enqueue_references_raw(_refs: &[ObjectReference]) -> Option<ObjectReference> {
+        None
+    }
+
     fn clear_cld_claimed_marks() {}
 
     fn set_concurrent_marking_state(_active: bool) {}
@@ -255,4 +285,14 @@ pub trait Collection<VM: VMBinding> {
     fn create_gc_trigger() -> Box<dyn GCTriggerPolicy<VM>> {
         unimplemented!()
     }
+}
+
+/// One special-reference chain reported by [`Collection::cleaner_chains`].
+#[derive(Debug)]
+pub struct CleanerChain {
+    /// VM-specific chain kind, opaque to the collector (diagnostics only).
+    pub vm_kind: usize,
+    /// Every node of the chain other than a dummy head, with its referent when the node is
+    /// eligible to be cleaned (not already handed to the VM, referent not null), else `None`.
+    pub nodes: Vec<(ObjectReference, Option<ObjectReference>)>,
 }

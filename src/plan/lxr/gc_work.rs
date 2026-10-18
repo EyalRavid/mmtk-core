@@ -564,6 +564,58 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             );
         }
 
+        // CLEANER_RC_PLAN §12 step A -- cut every eligible cleaner's REFERENT edge.
+        //
+        // A cleaner (jdk.internal.ref.Cleaner, or a phantom / weak cleanable of a
+        // java.lang.ref.Cleaner) must run when its referent is reachable by nothing but
+        // `referent` fields. The cleaner itself and its list are legitimately reachable (the list
+        // is a live data structure), so what has to be taken out of the trial is exactly the
+        // referent edges -- not the list's root. (Cutting the root, the first design, fails as soon
+        // as any node is live: `scan_black` from that node walks `next` into every other node and,
+        // through each `referent`, restores every referent.)
+        //
+        // So for every eligible (cleaner, referent): null `referent` in the HEAP (raw; the batik
+        // lesson -- a pointer left in place is found by `mark` and subtracted a second time), take
+        // that one edge off the referent's count (raw: no death processing), and seed the referent
+        // as a candidate (`s_rc = 0` + a tag, `should_mark`'s condition). Trial deletion then
+        // decides each referent's liveness without any cleaner's help. Step B puts back every edge
+        // whose referent is still wanted.
+        #[cfg(feature = "lxr_cleaners")]
+        let mut cut_refs: Vec<(ObjectReference, ObjectReference)> = vec![];
+        #[cfg(feature = "lxr_cleaners")]
+        {
+            let chains = <VM::VMCollection as Collection<VM>>::cleaner_chains();
+            let eligible: usize = chains.iter().map(|c| c.nodes.iter().filter(|(_, r)| r.is_some()).count()).sum();
+            if eligible > 0 {
+                let tag = ((entry_vec + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
+                let pool = unsafe { lxr.s_cycle_candidates() };
+                let mut buf = pool.local_buffer();
+                for (n, r) in chains.iter().flat_map(|c| c.nodes.iter()) {
+                    let Some(r) = *r else { continue };
+                    let old = <VM::VMCollection as Collection<VM>>::clear_referent_raw(*n);
+                    debug_assert_eq!(old, Some(r), "cleaner {:?} referent changed during the pause", n);
+                    // The referent is referenced by this cleaner, so its raw count is >= 2 and the
+                    // raw decrement cannot reach death processing.
+                    debug_assert!(lxr.rc.count(r) >= 2, "cleaner referent {:?} with rc {}", r, lxr.rc.count(r));
+                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
+                    unsafe { lxr.rc_with_overflow.dec_exclusive(r) };
+                    cc::set_strong_rc(r, 0, Ordering::Relaxed);
+                    if cc::tag(r, Ordering::Relaxed) == 0 {
+                        // SAFETY: as above.
+                        unsafe { cc::set_tag_exclusive(r, tag, Ordering::Relaxed) };
+                        buf.push(r);
+                    }
+                    cut_refs.push((*n, r));
+                }
+            }
+            gc_log!([2]
+                "    - cleaners: {} chains, {} nodes, {} referent edges cut",
+                chains.len(),
+                chains.iter().map(|c| c.nodes.len()).sum::<usize>(),
+                cut_refs.len(),
+            );
+        }
+
         // Drain all three pools BEFORE any producer handle exists.
         //
         // Up front, and not per round, for two reasons. `into_final_buffers` takes `&mut self` and
@@ -760,6 +812,51 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     unsafe { lxr.rc_with_overflow.inc_exclusive(x) };
                 }
             }
+        }
+
+        // CLEANER_RC_PLAN §12 step B -- verdict, restore, enqueue. In the 3B seam (after every
+        // `scan`, before any `collect_whites`) and AFTER the finalizer restore above: anything that
+        // restore re-blackened is reachable from an object whose finalizer has not run, so it is
+        // not phantom-reachable yet and its cleaner must wait.
+        //
+        //   referent WHITE  -> wanted by nothing but `referent` fields: garbage. The field stays
+        //                      null (the cleared phantom), the count already excludes the edge, and
+        //                      `collect_whites` frees the referent in this pause. Enqueue the cleaner.
+        //   otherwise       -> still wanted: put the pointer and the edge back, and rebuild `s_rc`
+        //                      (it was zeroed for the seed; a black object with `s_rc == 0` and tag 0
+        //                      could never be filed as a candidate again).
+        #[cfg(feature = "lxr_cleaners")]
+        if !cut_refs.is_empty() {
+            let mut refs: Vec<ObjectReference> = vec![];
+            for (n, r) in cut_refs.iter() {
+                if cc::colour(*r, Ordering::Relaxed) == WHITE {
+                    refs.push(*n);
+                } else {
+                    <VM::VMCollection as Collection<VM>>::restore_referent_raw(*n, *r);
+                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
+                    unsafe { lxr.rc_with_overflow.inc_exclusive(*r) };
+                    let s_rc = (self.rc.count(*r) as usize).saturating_sub(1).min(MAX_STRONG_REF_COUNT as usize);
+                    cc::set_strong_rc(*r, s_rc as u8, Ordering::Relaxed);
+                }
+            }
+            // A cleaner node itself must be live (it is on its list); a WHITE one would mean the
+            // list is not what we think. Drop it rather than hand the VM something being freed.
+            refs.retain(|n| {
+                let ok = cc::colour(*n, Ordering::Relaxed) != WHITE;
+                debug_assert!(ok, "cleaner {:?} is WHITE", n);
+                ok
+            });
+            if !refs.is_empty() {
+                // Splice onto the pending list and account the edges the splice creates -- identical
+                // to 3B (the `pmd` crash fix, FINALIZER_RC_IMPLEMENTATION.md §4.5.1): the VM later
+                // destroys each `discovered` edge with a barriered store, i.e. a real decrement.
+                let old_head = <VM::VMCollection as Collection<VM>>::enqueue_references_raw(&refs);
+                for x in refs.iter().skip(1).copied().chain(old_head) {
+                    // SAFETY: single-threaded CycleFullRC -- see the impl header.
+                    unsafe { lxr.rc_with_overflow.inc_exclusive(x) };
+                }
+            }
+            gc_log!([2] "    - cleaners: {} enqueued for the VM", refs.len());
         }
 
         // Collect phase, over every buffer. `curr_vec` is back to its entry value, so the
@@ -1906,3 +2003,4 @@ impl<VM: VMBinding> CycleTraversal<VM> {
         reporter.clear();
     }
 }
+

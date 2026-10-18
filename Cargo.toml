@@ -265,6 +265,10 @@ lxr_defer_saturated_incs = []
 # when the mark phase ends, before scan reads any count (`LXR::on_lazy_mark_finished`, and after
 # the mark loop in `CycleTraversal::all_buff_gc` for `FullRC`).
 lxr_defer_saturated_cc_decs = []
+# FullRC: cut, trial-delete and enqueue Cleaner chains (jdk.internal.ref.Cleaner -- direct
+# buffers -- and the phantom / weak rings of every java.lang.ref.Cleaner), as the finalizer chain
+# is handled. ~/mmtk/CLEANER_RC_PLAN.md. Off by default until validated.
+lxr_cleaners = []
 # Concurrent cycle collector: objects per mark/collect work buffer before it is handed off as a
 # new packet (`CycleTraversal::SPLIT_THRESHOLD` in src/plan/lxr/gc_work.rs). Default, with none
 # of these enabled, is 2048. Enable at most one -- more than one is a compile error.

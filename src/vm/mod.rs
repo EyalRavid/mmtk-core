@@ -23,6 +23,7 @@ mod scanning;
 pub mod slot;
 pub use self::active_plan::ActivePlan;
 pub use self::collection::Collection;
+pub use self::collection::CleanerChain;
 pub use self::collection::GCThreadContext;
 pub use self::object_model::specs::*;
 pub use self::object_model::ObjectModel;
