@@ -20,6 +20,12 @@ pub trait SlotVisitor<SL: Slot> {
     fn should_claim_clds(&self) -> bool {
         true
     }
+    /// If true, a `java.lang.ref.Reference` reports every slot except its `referent`
+    /// (`discovered` included), and no reference discovery happens. Used by the LXR cycle
+    /// collector during `Pause::FullRC` (`REFERENCE_PROCESSING_PLAN.md` §4).
+    fn should_skip_referent(&self) -> bool {
+        false
+    }
     /// Call this function for each slot.
     fn visit_slot(&mut self, slot: SL, _out_of_heap: bool);
 }

@@ -181,6 +181,7 @@ impl<E: ProcessEdgesWork> Drop for ObjectsClosure<'_, E> {
 struct SlotIteratorImpl<VM: VMBinding, F: FnMut(VM::VMSlot, bool)> {
     f: F,
     should_discover_references: bool,
+    should_skip_referent: bool,
     should_claim_clds: bool,
     should_follow_clds: bool,
     _p: PhantomData<VM>,
@@ -191,6 +192,9 @@ impl<VM: VMBinding, F: FnMut(VM::VMSlot, bool)> SlotVisitor<VM::VMSlot>
 {
     fn should_discover_references(&self) -> bool {
         self.should_discover_references
+    }
+    fn should_skip_referent(&self) -> bool {
+        self.should_skip_referent
     }
     fn should_claim_clds(&self) -> bool {
         self.should_claim_clds
@@ -211,6 +215,7 @@ impl<VM: VMBinding> SlotIterator<VM> {
     pub fn iterate(
         o: ObjectReference,
         should_discover_references: bool,
+        should_skip_referent: bool,
         should_claim_clds: bool,
         should_follow_clds: bool,
         f: impl FnMut(VM::VMSlot, bool),
@@ -219,6 +224,7 @@ impl<VM: VMBinding> SlotIterator<VM> {
         let mut x = SlotIteratorImpl::<VM, _> {
             f,
             should_discover_references,
+            should_skip_referent,
             should_claim_clds,
             should_follow_clds,
             _p: PhantomData,

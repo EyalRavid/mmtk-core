@@ -152,7 +152,7 @@ pub struct LXR<VM: VMBinding> {
     #[cfg(feature = "lxr_defer_saturated_cc_decs")]
     pub(super) sat_cc_decs: super::sat_inc_buf::SatIncBuffers,
     /// Live `java.lang.ref.Reference` objects (REFERENCE_PROCESSING_PLAN.md §3).
-    pub(super) refs: super::ref_registry::RefRegistry,
+    pub(crate) refs: super::ref_registry::RefRegistry,
     #[cfg(feature = "graph_project")]
     pub graph_reporter: std::sync::Mutex<GcCycleReport>,
 }

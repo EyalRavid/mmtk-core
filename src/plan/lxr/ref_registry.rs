@@ -9,7 +9,8 @@
 //! (removed) and a mutator has allocated a new object there; that object's promotion (insert) is in
 //! a later pause. So the set always describes what lives at an address now.
 //!
-//! Stage R0: the set is maintained and checked, nothing reads it yet. Debug builds assert that an
+//! Stage R0: the set is maintained and checked. Stage R1: `all_buff_gc` reads it (`snapshot`) to
+//! take every `referent` edge out of the cycle collector's trial and put it back. Debug builds assert that an
 //! insert is new, that a remove finds its entry, and (at every FullRC) that every entry is a live
 //! Reference. Under `lxr_rc_path_stats` only, counters report sizes (`inserts`, `removes`, `peak`;
 //! compare with the census, `FINDINGS.md` §34) and contention (`ops`, `op_ns` — time inside insert / remove, shard lock included, §3.3).
@@ -137,6 +138,17 @@ impl RefRegistry {
                 LIVE.fetch_sub(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Whether `o` is registered (sanity checks).
+    pub fn contains(&self, o: ObjectReference) -> bool {
+        self.set.contains(&o)
+    }
+
+    /// Every registered Reference, copied out (`all_buff_gc` step A). Must run where no insert /
+    /// remove can race: `CycleFullRC`.
+    pub fn snapshot(&self) -> Vec<ObjectReference> {
+        self.set.iter().map(|e| *e).collect()
     }
 
     /// FullRC check (§3.4), debug builds only: assert that every entry is a mapped, live object that

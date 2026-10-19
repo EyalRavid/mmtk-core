@@ -635,6 +635,18 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
                     self.edge,
                     object
                 );
+                // REFERENCE_PROCESSING_PLAN.md §5.1: every reachable Reference with a target must
+                // be registered, or FullRC skips its `referent` without having subtracted it.
+                if <VM::VMScanning as crate::vm::Scanning<VM>>::reference_kind(object) != 0 {
+                    assert!(
+                        lxr.refs.contains(object)
+                            || <VM::VMReferenceGlue as crate::vm::ReferenceGlue<VM>>::get_referent(object).is_none(),
+                        "{:?} -> {:?}: reachable Reference (kind {}) with a referent is not registered",
+                        self.edge,
+                        object,
+                        <VM::VMScanning as crate::vm::Scanning<VM>>::reference_kind(object)
+                    );
+                }
 
                 assert!(
                     !crate::util::object_forwarding::is_forwarded_or_being_forwarded::<VM>(object),

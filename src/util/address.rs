@@ -905,6 +905,7 @@ impl ObjectReference {
         SlotIterator::<VM>::iterate(
             self,
             ref_scan == RefScanPolicy::Discover,
+            ref_scan == RefScanPolicy::SkipReferent,
             cld_scan == CLDScanPolicy::Claim,
             cld_scan != CLDScanPolicy::Ignore,
             f,
@@ -922,6 +923,7 @@ impl ObjectReference {
         SlotIterator::<VM>::iterate(
             self,
             ref_scan == RefScanPolicy::Discover,
+            ref_scan == RefScanPolicy::SkipReferent,
             cld_scan == CLDScanPolicy::Claim,
             cld_scan != CLDScanPolicy::Ignore,
             f,
@@ -956,6 +958,8 @@ pub enum RefScanPolicy {
     Follow,
     /// Perform weak/soft/phantom/final reference discovery
     Discover,
+    /// Do not visit a Reference's `referent` slot at all (see `SlotVisitor::should_skip_referent`)
+    SkipReferent,
 }
 
 /// allows print Address as upper-case hex value

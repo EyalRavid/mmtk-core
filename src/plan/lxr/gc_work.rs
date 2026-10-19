@@ -154,14 +154,30 @@ impl CycleCollectorStats {
 /// implementation of every phase.
 pub struct CycleTraversal<VM: VMBinding> {
     rc: RefCountHelper<VM>,
+    /// The policy `mark_from_stack`, `scan` and `scan_black` walk fields with. `Follow` everywhere
+    /// except inside `all_buff_gc`, which sets `SkipReferent` for those three phases and puts it
+    /// back before collect (`REFERENCE_PROCESSING_PLAN.md` §4). The collect phases always follow.
+    ref_scan: RefScanPolicy,
     #[cfg(feature = "s_rc_stats")]
     stats: CycleCollectorStats,
+}
+
+/// One `referent` edge taken out of the trial by step A (`REFERENCE_PROCESSING_PLAN.md` §5.1).
+#[derive(Clone, Copy)]
+struct RefEdge {
+    r: ObjectReference,
+    t: ObjectReference,
+    /// `Scanning::reference_kind(r)`.
+    kind: u8,
+    /// Whether step A's `s_rc(t)` decrement happened (it does nothing at 0).
+    s_dec: bool,
 }
 
 impl<VM: VMBinding> CycleTraversal<VM> {
     fn new() -> Self {
         Self {
             rc: RefCountHelper::NEW,
+            ref_scan: RefScanPolicy::Follow,
             #[cfg(feature = "s_rc_stats")]
             stats: CycleCollectorStats::default(),
         }
@@ -570,6 +586,69 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             );
         }
 
+        // REFERENCE_PROCESSING_PLAN.md step A (§5.1) -- take every `referent` edge out of the trial.
+        //
+        // For every registered Reference `r` with a target `t`: subtract the `r -> t` edge from
+        // `t` once, here, and make `t` a candidate. `mark`, `scan` and `scan_black` then skip the
+        // `referent` slot of every Reference (`SkipReferent`), so nothing subtracts or restores
+        // that edge a second time, and after `scan` a target is non-WHITE only if something other
+        // than a `referent` field holds it. Step B puts each edge back before collect, which
+        // follows `referent` like any field (§5.3, §5.4).
+        //
+        // The registry holds every live Reference (§3), and `SkipReferent` skips by class, so the
+        // two describe the same set of edges. A Reference missing from the registry would have its
+        // edge neither subtracted nor walked: consistent while it lives, a leak of `t` if it is
+        // freed WHITE (`collect_whites` does not decrement children).
+        //
+        // Both counts drop by one, as for any removed edge: `rc` and `s_rc`. `t` becomes a
+        // candidate only if its `s_rc` is then 0 -- the cycle collector's own test for "every strong
+        // reference may come from inside the trial"; a `t` with `s_rc > 0` is presumed alive and
+        // is not walked. Raw `*_exclusive` writes, as in 3A: no death processing may run here, and
+        // this is the single CycleFullRC packet.
+        //
+        // Before `into_final_buffers()` below, so the seeds are marked by THIS collection. Same
+        // pool and tag as 3A: the pool drained first.
+        let mut ref_edges: Vec<RefEdge> = vec![];
+        {
+            let tag = ((entry_vec + 1) % NUM_OF_CANDIDATES_VECTORS + 1) as u8;
+            let mut buf = unsafe { lxr.s_cycle_candidates() }.local_buffer();
+            for r in lxr.refs.snapshot() {
+                let Some(t) = <VM::VMReferenceGlue as ReferenceGlue<VM>>::get_referent(r) else {
+                    continue;
+                };
+                // The edge is counted, so `t` holds at least the bias plus this edge. Anything less
+                // means the edge was never counted; leave it alone (it is then walked by nobody).
+                debug_assert!(
+                    self.rc.count(t) > 1,
+                    "referent {:?} of {:?} has rc {}",
+                    t,
+                    r,
+                    self.rc.count(t)
+                );
+                if self.rc.count(t) <= 1 {
+                    continue;
+                }
+                let kind = <VM::VMScanning as Scanning<VM>>::reference_kind(r);
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
+                let s_dec = unsafe {
+                    lxr.rc_with_overflow.dec_exclusive(t);
+                    // 0 means it was already 0 and nothing was written.
+                    cc::strong_rc_dec_exclusive(t) != 0
+                };
+                // Already filed in some pool: it is marked through that pool, and a second entry
+                // would mark it twice.
+                if cc::strong_rc(t, Ordering::Relaxed) == 0 && cc::tag(t, Ordering::Relaxed) == 0 {
+                    // SAFETY: as above.
+                    unsafe { cc::set_tag_exclusive(t, tag, Ordering::Relaxed) };
+                    buf.push(t);
+                }
+                ref_edges.push(RefEdge { r, t, kind, s_dec });
+            }
+            gc_log!([2] "    - references: {} referent edges taken out", ref_edges.len());
+        }
+        // Until step B: `mark_from_stack`, `scan` and `scan_black` (including 3B's) skip `referent`.
+        self.ref_scan = RefScanPolicy::SkipReferent;
+
         // Drain all three pools BEFORE any producer handle exists.
         //
         // Up front, and not per round, for two reasons. `into_final_buffers` takes `&mut self` and
@@ -655,6 +734,14 @@ impl<VM: VMBinding> CycleTraversal<VM>{
 
         lxr.in_cycle_collection.store(false, Ordering::Relaxed);
 
+        // REFERENCE_PROCESSING_PLAN.md step B2, stage R1: no verdict -- every edge goes back.
+        //
+        // In two passes around 3B, so that 3B decides exactly what it decided before R1: its
+        // verdict "referent WHITE" must mean "held by nothing but its Finalizer", so every other
+        // kind's edge is restored before 3B reads colours, and the Finalizers' edges after.
+        let mut restored = vec![false; ref_edges.len()];
+        self.restore_referent_edges(lxr, &ref_edges, &mut restored, |kind| kind != Self::REF_KIND_FINAL, nested_stack);
+
         // FINALIZER_RC_PLAN step 3B -- read the verdict, restore the chain, enqueue.
         //
         // THIS SEAM IS LOAD-BEARING. `all_buff_gc` runs mark-over-all-buffers, then
@@ -695,8 +782,9 @@ impl<VM: VMBinding> CycleTraversal<VM>{
 
             // 2. RESTORE. Put the root edge back and re-blacken the chain.
             //
-            // One `scan_black` from the head covers the whole chain AND every referent, because
-            // each `Finalizer` reaches its referent as an ordinary field. Where it stops early at
+            // One `scan_black` from the head covers the whole chain. It no longer covers the
+            // referents: `scan_black` skips `referent` until step B, whose second pass below
+            // restores every Finalizer's edge and target. Where it stops early at
             // an already-black node, that node was restored by `scan`'s own `scan_black`, which
             // re-incremented its children -- so the chain past it is restored too. Every node is
             // therefore either already black, or reached from here.
@@ -768,6 +856,21 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             }
         }
 
+        // Step B2, second pass: the Finalizers' edges (see the first pass), and any other kind
+        // whose Reference 3B's `scan_black` from the chain head brought back from WHITE.
+        self.restore_referent_edges(lxr, &ref_edges, &mut restored, |_| true, nested_stack);
+        #[cfg(any(debug_assertions, feature = "sanity"))]
+        for (i, e) in ref_edges.iter().enumerate() {
+            assert!(
+                cc::colour(e.r, Ordering::Relaxed) == WHITE || (restored[i] && is_black(e.t)),
+                "R1: referent {:?} of live reference {:?} not restored",
+                e.t,
+                e.r
+            );
+        }
+        // Every edge is now in the state collect expects; collect follows `referent`.
+        self.ref_scan = RefScanPolicy::Follow;
+
         // Collect phase, over every buffer. `curr_vec` is back to its entry value, so the
         // candidates `collect_blacks` discovers are tagged and filed exactly as they would be by
         // an ordinary collection, and are drained two GCs from now.
@@ -783,6 +886,19 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         }
         drop(cand_buffer);
 
+        // A Reference left WHITE kept its edge subtracted on the promise that `collect_whites`
+        // frees it. One that survived would undercount its target forever.
+        #[cfg(any(debug_assertions, feature = "sanity"))]
+        for (i, e) in ref_edges.iter().enumerate() {
+            assert!(
+                restored[i] || self.rc.count(e.r) == 0,
+                "R1: WHITE reference {:?} (kind {}) survived collect, rc {}",
+                e.r,
+                e.kind,
+                self.rc.count(e.r)
+            );
+        }
+
         #[cfg(feature = "s_rc_stats")]
         {
             self.stats.satb_map_size = lxr.satb_map.len();
@@ -790,6 +906,57 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             // high-water mark to within a doubling, read once here at no per-object cost.
             self.stats.peak_stack = dfs_stack.capacity().max(nested_stack.capacity());
             self.stats.flush_to_counters();
+        }
+    }
+
+    /// `Scanning::reference_kind` of a FinalReference (`java.lang.ref.Finalizer`).
+    const REF_KIND_FINAL: u8 = 4;
+
+    /// Step B2 with no verdict (stage R1), for the recorded edges whose kind passes `select` and
+    /// that `restored` does not already mark.
+    ///
+    /// A WHITE Reference is left alone: its edge stays subtracted, which is exactly the state
+    /// `collect_whites` expects of a WHITE object's out-edges -- it frees `r` without decrementing
+    /// its children. Any other Reference gets its edge back, and its target is restored the way
+    /// `scan` restores an externally referenced object: `scan_black` if it is not black (it can be
+    /// WHITE now that the edge was taken out), else just its strong RC, which step A zeroed.
+    ///
+    /// **Repeated until nothing changes.** `scan_black(t)` can repaint a WHITE Reference passed
+    /// over earlier -- it walks that Reference's fields but, under `SkipReferent`, not its
+    /// `referent` -- and a live Reference must have its edge back. Each edge is restored at most
+    /// once, so this terminates; usually in two rounds.
+    fn restore_referent_edges(
+        &self,
+        lxr: &LXR<VM>,
+        ref_edges: &[RefEdge],
+        restored: &mut [bool],
+        select: impl Fn(u8) -> bool,
+        dfs_stack: &mut Vec<ObjectReference>,
+    ) {
+        loop {
+            let mut progress = false;
+            for (i, &RefEdge { r, t, kind, s_dec }) in ref_edges.iter().enumerate() {
+                if restored[i] || !select(kind) || cc::colour(r, Ordering::Relaxed) == WHITE {
+                    continue;
+                }
+                restored[i] = true;
+                progress = true;
+                // SAFETY: single-threaded CycleFullRC -- see the impl header.
+                unsafe { lxr.rc_with_overflow.inc_exclusive(t) };
+                if !is_black(t) {
+                    // `count > 1` now, as `scan_black` asserts on entry. It rebuilds `s_rc(t)` from
+                    // `rc(t)`, which already counts the edge again.
+                    self.scan_black(t, lxr, dfs_stack);
+                } else if s_dec {
+                    // Undo step A's `s_rc` decrement. If `scan` (or an earlier `scan_black` here)
+                    // rebuilt `s_rc(t)` from an `rc` without this edge, this puts it back too.
+                    // SAFETY: as above; see `scan_black` for the wider obligation of this table.
+                    unsafe { cc::strong_rc_inc_exclusive(t) };
+                }
+            }
+            if !progress {
+                break;
+            }
         }
     }
 
@@ -998,7 +1165,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
 
                         }
                     };
-                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, self.ref_scan, visitor);
                 }
                 #[cfg(feature = "s_rc_stats")]
                 { self.stats.objects_in_mark.set(self.stats.objects_in_mark.get() + 1); }
@@ -1129,7 +1296,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 } else {
                     // SAFETY: single-threaded CycleFullRC -- see the impl header.
                     unsafe { cc::set_colour_exclusive(curr, WHITE, Ordering::Relaxed) };
-                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
+                    curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, self.ref_scan, visitor);
                 }
             }
         }
@@ -1166,7 +1333,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 else{
                     unsafe { cc::set_strong_rc_exclusive(curr, s_rc as u8, Ordering::Relaxed) };
                 }
-                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, |slot: <VM as vm::VMBinding>::VMSlot, b| {
+                curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, self.ref_scan, |slot: <VM as vm::VMBinding>::VMSlot, b| {
                     if let Some(x) = self.get_child(slot, lxr) {
                         // SAFETY: single-threaded CycleFullRC -- see the impl header.
                         let _prev = unsafe { lxr.rc_with_overflow.inc_exclusive(x) };
