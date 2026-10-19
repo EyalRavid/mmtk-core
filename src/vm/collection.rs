@@ -1,7 +1,6 @@
 use crate::util::alloc::AllocationError;
 use crate::util::heap::gc_trigger::GCTriggerPolicy;
 use crate::util::opaque_pointer::*;
-use crate::util::ObjectReference;
 use crate::vm::VMBinding;
 use crate::{scheduler::*, Mutator};
 
@@ -101,71 +100,6 @@ pub trait Collection<VM: VMBinding> {
     fn process_phantom_refs<E: ProcessEdgesWork<VM = VM>>(_worker: &mut GCWorker<VM>) {}
 
     fn update_weak_processor(_lxr: bool) {}
-
-    /// Enumerate every object registered for finalization, as `(finalizer, referent)` pairs.
-    ///
-    /// For OpenJDK this walks the static `java.lang.ref.Finalizer.unfinalized` list, which is a
-    /// permanent GC root: every finalizable object ever allocated is on it until its finalizer
-    /// has run. That makes each `referent` field a strong edge the collector must account for
-    /// explicitly -- see `FINALIZER_RC_PLAN.md`.
-    ///
-    /// STOP-THE-WORLD ONLY. The list is mutated by mutators under a Java-level lock and this
-    /// takes none.
-    ///
-    /// The default returns nothing, which is correct for a VM with no finalization.
-    fn finalizer_candidates() -> Vec<(ObjectReference, ObjectReference)> {
-        vec![]
-    }
-
-    /// Take the head of `java.lang.ref.Finalizer.unfinalized`: return `(head, mirror)` **and
-    /// clear the static**, or `None` when the VM has no finalization (or the chain is empty, or
-    /// the Finalizer class is not yet initialized). `mirror` is the object that owns the static,
-    /// returned for diagnostics only.
-    ///
-    /// This static field is the only reference into the unfinalized chain from outside it. The
-    /// cycle collector subtracts that one edge, seeds the head as a candidate, and lets ordinary
-    /// trial deletion walk the chain -- so every `Finalizer.referent` edge is subtracted exactly
-    /// once, by `mark`, instead of once by hand and once by the traversal.
-    ///
-    /// **The implementation must remove the edge from the HEAP, not merely report it**, and the
-    /// store must bypass the write barrier. Adjusting the reference count while leaving the
-    /// pointer in place is not a cut: the static lives in the `Finalizer` class mirror, an
-    /// ordinary object whose fields the trial-deletion walk iterates, so the walk finds the
-    /// pointer and subtracts the same edge a second time. Measured on `jython`: that drove the
-    /// head one below the trial-deletion floor, `scan_black` rebuilt its strong count from the
-    /// transient value as zero, and the head was left live and permanently unfileable as a
-    /// candidate.
-    ///
-    /// NOT the first pair from [`Self::finalizer_candidates`]: that walk skips finalizers already
-    /// handed to Java, so its first entry need not be the head.
-    ///
-    /// STOP-THE-WORLD ONLY, and the caller MUST pair it with
-    /// [`Self::finalizer_restore_list_head`] before the pause ends.
-    fn finalizer_take_list_head() -> Option<(ObjectReference, ObjectReference)> {
-        None
-    }
-
-    /// Put the head back into `java.lang.ref.Finalizer.unfinalized`, undoing
-    /// [`Self::finalizer_take_list_head`]. Must bypass the write barrier, for the same reason.
-    ///
-    /// STOP-THE-WORLD ONLY.
-    fn finalizer_restore_list_head(_head: ObjectReference) {}
-
-    /// Hand these `Finalizer` objects to the VM's pending-reference list, so the VM's own
-    /// finalizer thread runs `finalize()` on their referents -- outside any GC pause.
-    ///
-    /// The collector must NOT run finalizers itself: `finalize()` is arbitrary user code that
-    /// allocates, takes locks, and may resurrect its object. It must also not clear the
-    /// referent, which `finalize()` still needs. Both are the VM's job after the pause.
-    ///
-    /// Each reference must be passed at most once, ever.
-    ///
-    /// Returns the previous head of the pending list. The caller needs it because splicing
-    /// creates real heap edges through the `discovered` fields, and those edges bypass the write
-    /// barrier -- so their reference counts must be applied by hand. See the caller.
-    fn enqueue_finalizers(_refs: &[ObjectReference]) -> Option<ObjectReference> {
-        None
-    }
 
     fn clear_cld_claimed_marks() {}
 

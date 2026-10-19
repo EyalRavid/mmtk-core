@@ -390,10 +390,9 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         //Eyal added this
         // `FullRC` is included deliberately.  It is the pause that runs at every iteration
         // boundary and carries the newest pipeline -- STW decrements, the three-pool
-        // `all_buff_gc`, the inverted phase order, weak-root clearing -- and until this clause
+        // `all_buff_gc`, the inverted phase order -- and until this clause
         // was added, sanity never ran after it: the `Full || FinalMark` arm above is dead code in
-        // this fork, so `RefCount` was the only kind ever checked.  See `FINALIZER_RC_PLAN.md`
-        // step 1; the finalizer work needs this check to exist before it lands.
+        // this fork, so `RefCount` was the only kind ever checked.
         #[cfg(feature = "sanity")]
         if pause == Pause::RefCount || pause == Pause::FullRC
         {
@@ -1423,24 +1422,6 @@ impl<VM: VMBinding> LXR<VM> {
             // keeps both orders emitting the same four lines and lets a reader tell them apart
             // from the timestamps alone.  `c` holds only the overall counter, so the sweep
             // packets must be derived from it with a plain `clone` -- hence `true`.
-
-            // The weak-root pass.  This is the only window it can occupy: AFTER cycle collection,
-            // so trial deletion has already run with the weak contribution absent and `rc == 0`
-            // is final; and BEFORE the sweep, because the VM closure resolves a moved object by
-            // reading the forwarding word out of the from-space copy's header and the sweep is
-            // what releases those blocks.  Called inline rather than as a work packet: packets in
-            // `Unconstrained` carry no ordering relative to the sweep packets scheduled on the
-            // next line.  See `~/mmtk/WEAK_ROOTS.md`.
-            gc_log!([3]
-                "    - ({:.3}ms) weak processor start",
-                crate::gc_start_time_ms(),
-            );
-            VM::VMCollection::update_weak_processor(true);
-            gc_log!([3]
-                "    - ({:.3}ms) weak processor finish",
-                crate::gc_start_time_ms(),
-            );
-
             self.immix_space.schedule_rc_block_sweeping_tasks(c, true);
             return;
         }
