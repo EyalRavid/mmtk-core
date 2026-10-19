@@ -521,8 +521,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.rc_killed_bytes.store(0, Ordering::SeqCst);
         debug_assert_ne!(pause, Pause::FullDefrag);
         if pause == Pause::InitialMark || pause == Pause::Full {
-            // Select mature evacuation set
-            if !cfg!(feature = "lxr_no_evac") {
+            // Select mature evacuation set -- only if mature evacuation can use it. With
+            // `lxr_no_mature_evac` the selected blocks are never evacuated, yet
+            // `sweep_mature_evac_candidates` would still free them whole at FinalMark / Full,
+            // live objects included.
+            if crate::args::RC_MATURE_EVACUATION && !cfg!(feature = "lxr_no_evac") {
                 self.schedule_defrag_selection_packets(pause);
             }
         }
