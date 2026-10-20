@@ -833,27 +833,6 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 } else {
                     #[cfg(feature = "s_rc_stats")]
                     { self.stats.mark_logged.set(self.stats.mark_logged.get() + 1); }
-                    // Nothing was decremented, so there is nothing to revert -- but the NET effect
-                    // of the old walk-then-revert has to be reproduced exactly, and it is
-                    // asymmetric on purpose:
-                    //
-                    //   rc         unchanged   (walk decremented, revert incremented)
-                    //   strong_rc  -1          (walk decremented; the revert's `strong_rc_inc` is
-                    //                           commented out, so it was never restored)
-                    //   strong_rc  -2 in total when the child is not black (the second decrement
-                    //                           below, which the revert applied as an extra)
-                    //
-                    // Do NOT "correct" this while reading it: `strong_rc` is a sinking heuristic,
-                    // not a reference count, and making it accurate stops cyclic garbage being
-                    // collected at all (`sanity_checker.rs` fires; `FINDINGS.md` 26.5).
-                    for &x in children.iter() {
-                        let _ = cc::strong_rc_dec(x);
-                        cand_buffer.push(x);
-                        cc::set_tag(x, (curr_vec + 1) as u8, Ordering::Relaxed);
-                        if !is_black(x) { // this condition is unnecessary. it is only to satisfy assertion (should be remove after assertion removal)
-                            let _ = cc::strong_rc_dec(x);
-                        }
-                    }
 
                     cand_buffer.push(curr);
 
