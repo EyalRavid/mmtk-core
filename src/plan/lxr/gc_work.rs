@@ -93,10 +93,21 @@ fn is_black(o: ObjectReference) -> bool {
 struct CycleCollectorStats {
     raw_cycle_candidates: usize,
     candidates_after_filter: usize,
-    objects_in_mark: std::cell::Cell<usize>,
-    objects_in_scan: std::cell::Cell<usize>,
-    objects_in_scan_black: std::cell::Cell<usize>,
-    objects_in_collect: std::cell::Cell<usize>,
+    // Per phase: `*_visits` = every pop from the phase's work stack, including objects then skipped
+    // (wrong colour, claim lost) and repeat visits of one object pushed by several parents;
+    // `*_walked` = objects whose children the phase actually iterated.  `collect_blacks` never
+    // skips a popped object (ownership is taken at push time), so it has only `walked`.
+    mark_visits: std::cell::Cell<usize>,
+    mark_walked: std::cell::Cell<usize>,
+    scan_visits: std::cell::Cell<usize>,
+    scan_walked: std::cell::Cell<usize>,
+    scan_black_visits: std::cell::Cell<usize>,
+    scan_black_walked: std::cell::Cell<usize>,
+    collect_whites_visits: std::cell::Cell<usize>,
+    collect_whites_walked: std::cell::Cell<usize>,
+    collect_blacks_walked: std::cell::Cell<usize>,
+    /// Objects freed (`process_dead_object`); subtracted from `crate::LIVE_PROMOTED` at flush.
+    freed: std::cell::Cell<usize>,
     satb_map_size: usize,
     satb_reads: std::cell::Cell<usize>,
     // Parallel-mark baseline; see `Counters` for what each one is for.
@@ -127,12 +138,16 @@ impl CycleCollectorStats {
         c.cc_raw_candidates.fetch_add(self.raw_cycle_candidates, Relaxed);
         c.cc_candidates_after_filter
             .fetch_add(self.candidates_after_filter, Relaxed);
-        c.cc_objects_in_mark.fetch_add(self.objects_in_mark.get(), Relaxed);
-        c.cc_objects_in_scan.fetch_add(self.objects_in_scan.get(), Relaxed);
-        c.cc_objects_in_scan_black
-            .fetch_add(self.objects_in_scan_black.get(), Relaxed);
-        c.cc_objects_in_collect
-            .fetch_add(self.objects_in_collect.get(), Relaxed);
+        c.cc_mark_visits.fetch_add(self.mark_visits.get(), Relaxed);
+        c.cc_mark_walked.fetch_add(self.mark_walked.get(), Relaxed);
+        c.cc_scan_visits.fetch_add(self.scan_visits.get(), Relaxed);
+        c.cc_scan_walked.fetch_add(self.scan_walked.get(), Relaxed);
+        c.cc_scan_black_visits.fetch_add(self.scan_black_visits.get(), Relaxed);
+        c.cc_scan_black_walked.fetch_add(self.scan_black_walked.get(), Relaxed);
+        c.cc_collect_whites_visits.fetch_add(self.collect_whites_visits.get(), Relaxed);
+        c.cc_collect_whites_walked.fetch_add(self.collect_whites_walked.get(), Relaxed);
+        c.cc_collect_blacks_walked.fetch_add(self.collect_blacks_walked.get(), Relaxed);
+        crate::LIVE_PROMOTED.fetch_sub(self.freed.get() as isize, Relaxed);
         c.cc_satb_reads.fetch_add(self.satb_reads.get(), Relaxed);
         // A level, not a sum: the peak SATB map size across the run.
         c.cc_satb_map_peak.fetch_max(self.satb_map_size, Relaxed);
@@ -183,6 +198,8 @@ impl<VM: VMBinding> GCWork<VM> for CycleFullRC<VM> {
         let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
         lxr.satb_map.clear();
         lxr.in_cycle_collection.store(true, Ordering::SeqCst);
+        #[cfg(feature = "s_rc_stats")]
+        crate::cc_stats_begin();
         #[cfg(feature = "s_rc_stats")]
         { self.t.stats.mark_packets.set(self.t.stats.mark_packets.get() + 1); }
         //println!("size of rc cache: {}, num of entreies: {}", lxr.rc_with_overflow.capacity(), lxr.rc_with_overflow.num_entries());
@@ -724,6 +741,8 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     continue;
                 }
             };
+            #[cfg(feature = "s_rc_stats")]
+            { self.stats.mark_visits.set(self.stats.mark_visits.get() + 1); }
             debug_assert!(self.rc.count(curr) > 0);
             let mut is_logged = false;
             children.clear();
@@ -792,7 +811,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 }
                 #[cfg(feature = "s_rc_stats")]
-                { self.stats.objects_in_mark.set(self.stats.objects_in_mark.get() + 1); }
+                { self.stats.mark_walked.set(self.stats.mark_walked.get() + 1); }
                 if !is_logged {
                     // Commit: subtract each collected edge exactly once, then hand the children to
                     // the walk.
@@ -883,7 +902,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
         dfs_stack.push(o);
         while let Some(curr) = dfs_stack.pop() {
             #[cfg(feature = "s_rc_stats")]
-            { self.stats.objects_in_scan.set(self.stats.objects_in_scan.get() + 1); }
+            { self.stats.scan_visits.set(self.stats.scan_visits.get() + 1); }
             debug_assert!(self.rc.count(curr) > 0);
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 if let Some(x) = self.get_child(slot, lxr) {
@@ -899,6 +918,8 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 } else {
                     // SAFETY: single-threaded CycleFullRC -- see the impl header.
                     unsafe { cc::set_colour_exclusive(curr, WHITE, Ordering::Relaxed) };
+                    #[cfg(feature = "s_rc_stats")]
+                    { self.stats.scan_walked.set(self.stats.scan_walked.get() + 1); }
                     curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 }
             }
@@ -955,13 +976,15 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                     }
                 });
                 #[cfg(feature = "s_rc_stats")]
-                { self.stats.objects_in_scan_black.set(self.stats.objects_in_scan_black.get() + 1); }
+                { self.stats.scan_black_walked.set(self.stats.scan_black_walked.get() + 1); }
                 unsafe { cc::set_colour_exclusive(curr, BLACK_IN_STACK, Ordering::SeqCst) };
             } else {
                 // SAFETY: single-threaded CycleFullRC -- see the impl header.
                 unsafe { cc::set_colour_exclusive(curr, BLACK_OUT_OF_STACK, Ordering::Relaxed) };
                 debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) != 0);
                 dfs_stack.pop();
+                #[cfg(feature = "s_rc_stats")]
+                { self.stats.scan_black_visits.set(self.stats.scan_black_visits.get() + 1); }
             }
         }
     }
@@ -1028,7 +1051,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 }
             };
             #[cfg(feature = "s_rc_stats")]
-            { self.stats.objects_in_collect.set(self.stats.objects_in_collect.get() + 1); }
+            { self.stats.collect_whites_visits.set(self.stats.collect_whites_visits.get() + 1); }
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
@@ -1053,6 +1076,8 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 debug_assert!(cc::strong_rc(curr, Ordering::SeqCst) == 0);
                 cc::set_tag(curr, 0, Ordering::Relaxed);
                 debug_assert!(lxr.rc.count(curr) == 1);
+                #[cfg(feature = "s_rc_stats")]
+                { self.stats.collect_whites_walked.set(self.stats.collect_whites_walked.get() + 1); }
                 curr.iterate_fields::<VM, _>(CLDScanPolicy::Ignore, RefScanPolicy::Follow, visitor);
                 let is_los = self.process_dead_object(curr, lxr);
                 // Free: RC -> 0 as a plain store, not `dec`.
@@ -1165,7 +1190,7 @@ impl<VM: VMBinding> CycleTraversal<VM>{
             );
 
             #[cfg(feature = "s_rc_stats")]
-            { self.stats.objects_in_collect.set(self.stats.objects_in_collect.get() + 1); }
+            { self.stats.collect_blacks_walked.set(self.stats.collect_blacks_walked.get() + 1); }
             let visitor = |slot: <VM as vm::VMBinding>::VMSlot, _| {
                 debug_assert!(self.get_slot_logging_state(slot) == Self::UNLOGGED_VALUE);
                 if let Some(x) = slot.load() {
@@ -1211,6 +1236,8 @@ impl<VM: VMBinding> CycleTraversal<VM>{
     }
 
     fn process_dead_object(&self, o: ObjectReference, lxr: &LXR<VM>) -> bool {
+        #[cfg(feature = "s_rc_stats")]
+        { self.stats.freed.set(self.stats.freed.get() + 1); }
         crate::stat(|s| {
             s.dead_mature_objects += 1;
             s.dead_mature_volume += o.get_size::<VM>();

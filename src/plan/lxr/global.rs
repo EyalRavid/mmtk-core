@@ -1413,6 +1413,8 @@ impl<VM: VMBinding> LXR<VM> {
     /// still drained exactly once per GC, which is the premise of the retry-termination
     /// argument in `policy/immix/rc_work.rs`.
     fn on_lazy_cc_finished(&self, c: LazySweepingJobsCounter) {
+        #[cfg(feature = "s_rc_stats")]
+        crate::cc_stats_end();
         let ix = &self.immix_space;
 
         if self.current_pause() == Some(Pause::FullRC) {
@@ -1450,6 +1452,8 @@ impl<VM: VMBinding> LXR<VM> {
     fn schedule_cycle_mark(&self, c: LazySweepingJobsCounter) {
         self.satb_map.clear();
         self.in_cycle_collection.store(true, Ordering::SeqCst);
+        #[cfg(feature = "s_rc_stats")]
+        crate::cc_stats_begin();
 
         // The pool filled two GCs ago, and the tag that matches it. Snapshotted rather than read
         // from `curr_vec` later: that field is a `Cell`, and the packets may run on other workers.

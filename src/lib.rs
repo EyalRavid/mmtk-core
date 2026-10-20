@@ -523,6 +523,78 @@ static GC_EPOCH: AtomicUsize = AtomicUsize::new(0);
 static RESERVED_PAGES_AT_GC_START: AtomicUsize = AtomicUsize::new(0);
 static RESERVED_PAGES_AT_GC_END: AtomicUsize = AtomicUsize::new(0);
 static INSIDE_HARNESS: AtomicBool = AtomicBool::new(false);
+
+/// `s_rc_stats`: live promoted objects since the JVM started -- +1 when an object gets its first
+/// increment (`ProcessIncs::promote`), -1 when it is freed (`ProcessDecs::process_dead_object`,
+/// `CycleTraversal::process_dead_object`).  Each packet accumulates locally and adds its net here
+/// once.  A LEVEL, so it is never reset: a reset at `harness_begin` would forget the objects the
+/// warmups promoted, which still die later and would drive it below the truth.  Per-iteration
+/// numbers are built from snapshots of it (`cc.live_at_cc`).
+#[cfg(feature = "s_rc_stats")]
+pub(crate) static LIVE_PROMOTED: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+/// `s_rc_stats`: state of the cycle collection in progress, for its log line.
+#[cfg(feature = "s_rc_stats")]
+static CC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "s_rc_stats")]
+static CC_START_LIVE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+#[cfg(feature = "s_rc_stats")]
+static CC_START_WALKED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "s_rc_stats")]
+static CC_START_MARK_WALKED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "s_rc_stats")]
+fn cc_walked_total() -> usize {
+    let c = counters();
+    let r = Ordering::SeqCst;
+    c.cc_mark_walked.load(r)
+        + c.cc_scan_walked.load(r)
+        + c.cc_scan_black_walked.load(r)
+        + c.cc_collect_whites_walked.load(r)
+        + c.cc_collect_blacks_walked.load(r)
+}
+
+/// `s_rc_stats`: a cycle collection is starting (`CycleFullRC` or the concurrent
+/// `schedule_cycle_mark`).  Every `ProcessIncs` / `ProcessDecs` of the pause has flushed by now
+/// (decs -> sweep -> cc), so `LIVE_PROMOTED` is exact here.
+#[cfg(feature = "s_rc_stats")]
+pub(crate) fn cc_stats_begin() {
+    let live = LIVE_PROMOTED.load(Ordering::SeqCst);
+    CC_START_LIVE.store(live, Ordering::SeqCst);
+    CC_START_WALKED.store(cc_walked_total(), Ordering::SeqCst);
+    CC_START_MARK_WALKED.store(counters().cc_mark_walked.load(Ordering::SeqCst), Ordering::SeqCst);
+    CC_IN_PROGRESS.store(true, Ordering::SeqCst);
+    let c = counters();
+    c.cc_live_at_cc.fetch_add(live.max(0) as usize, Ordering::Relaxed);
+    c.cc_collections.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `s_rc_stats`: the cycle collection started by `cc_stats_begin` has ended; log what it walked
+/// against the live objects at its start.  No-op if none was in progress (the CC slot also ends
+/// pauses that ran no cycle collection).
+#[cfg(feature = "s_rc_stats")]
+pub(crate) fn cc_stats_end() {
+    if !CC_IN_PROGRESS.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let live = CC_START_LIVE.load(Ordering::SeqCst);
+    // `saturating_sub`: a `harness_begin` reset between start and end zeroes the walked counters.
+    let walked = cc_walked_total().saturating_sub(CC_START_WALKED.load(Ordering::SeqCst));
+    let marked = counters()
+        .cc_mark_walked
+        .load(Ordering::SeqCst)
+        .saturating_sub(CC_START_MARK_WALKED.load(Ordering::SeqCst));
+    // `marked` is the share of live objects: mark walks an object at most once per collection
+    // (`try_claim_grey`).  `walked` sums all phases, so one object is counted again by
+    // `scan_black` (restored) or `collect` (freed) and it can exceed `live`.
+    gc_log!([2]
+        "    - cc: {} live at start, mark walked {} ({:.1}%), all phases walked {}",
+        live,
+        marked,
+        if live > 0 { marked as f64 * 100.0 / live as f64 } else { 0.0 },
+        walked,
+    );
+}
 static SATB_START: Timer = Timer::new();
 static PAUSE_CONCURRENT_MARKING: AtomicBool = AtomicBool::new(false);
 static MOVE_CONCURRENT_MARKING_TO_STW: AtomicBool = AtomicBool::new(false);
@@ -605,10 +677,18 @@ struct Counters {
     // `EVALUATION_PLAN.md` E2(a).
     pub cc_raw_candidates: AtomicUsize,
     pub cc_candidates_after_filter: AtomicUsize,
-    pub cc_objects_in_mark: AtomicUsize,
-    pub cc_objects_in_scan: AtomicUsize,
-    pub cc_objects_in_scan_black: AtomicUsize,
-    pub cc_objects_in_collect: AtomicUsize,
+    // Per phase, `visits` = pops from the phase's work stack (skips and repeats included),
+    // `walked` = objects whose children were iterated.  See `CycleCollectorStats` in
+    // `plan/lxr/gc_work.rs`.
+    pub cc_mark_visits: AtomicUsize,
+    pub cc_mark_walked: AtomicUsize,
+    pub cc_scan_visits: AtomicUsize,
+    pub cc_scan_walked: AtomicUsize,
+    pub cc_scan_black_visits: AtomicUsize,
+    pub cc_scan_black_walked: AtomicUsize,
+    pub cc_collect_whites_visits: AtomicUsize,
+    pub cc_collect_whites_walked: AtomicUsize,
+    pub cc_collect_blacks_walked: AtomicUsize,
     /// High-water mark, not a sum: `fetch_max`, like `max_reserved_pages`.
     pub cc_satb_map_peak: AtomicUsize,
 
@@ -664,6 +744,15 @@ struct Counters {
     /// per-worker `SatIncBuf` instead of an atomic on `OVERFLOW_RC_TABLE`; with the feature on they
     /// are also counted, at apply time, in `inc.slow_*` (bucketed by their exact true count).
     pub inc_deferred: AtomicUsize,
+    /// Objects that got their first increment (`ProcessIncs::promote`), i.e. survived to their
+    /// first RC pause.  `s_rc_stats`.  Denominator for `cc.*_walked`.
+    pub inc_promoted_objects: AtomicUsize,
+    /// Sum, over the cycle collections that STARTED in this iteration, of the number of live
+    /// promoted objects at that start (`LIVE_PROMOTED` snapshot).  `s_rc_stats`.
+    /// `Σ cc.*_walked / cc.live_at_cc` = the average share of live objects one collection walks.
+    pub cc_live_at_cc: AtomicUsize,
+    /// Number of cycle collections that started in this iteration.  `s_rc_stats`.
+    pub cc_collections: AtomicUsize,
     /// Buffer entries applied, i.e. the `fetch_add(n)`s that replaced `inc.deferred` single ones.
     /// `inc.deferred / inc.deferred_entries` is the batching factor.
     pub inc_deferred_entries: AtomicUsize,
@@ -736,10 +825,15 @@ impl Counters {
         "rc_during_satb": self.rc_during_satb.load(Ordering::SeqCst),
         "cc.raw_candidates": self.cc_raw_candidates.load(Ordering::SeqCst),
         "cc.candidates_after_filter": self.cc_candidates_after_filter.load(Ordering::SeqCst),
-        "cc.objects_in_mark": self.cc_objects_in_mark.load(Ordering::SeqCst),
-        "cc.objects_in_scan": self.cc_objects_in_scan.load(Ordering::SeqCst),
-        "cc.objects_in_scan_black": self.cc_objects_in_scan_black.load(Ordering::SeqCst),
-        "cc.objects_in_collect": self.cc_objects_in_collect.load(Ordering::SeqCst),
+        "cc.mark_visits": self.cc_mark_visits.load(Ordering::SeqCst),
+        "cc.mark_walked": self.cc_mark_walked.load(Ordering::SeqCst),
+        "cc.scan_visits": self.cc_scan_visits.load(Ordering::SeqCst),
+        "cc.scan_walked": self.cc_scan_walked.load(Ordering::SeqCst),
+        "cc.scan_black_visits": self.cc_scan_black_visits.load(Ordering::SeqCst),
+        "cc.scan_black_walked": self.cc_scan_black_walked.load(Ordering::SeqCst),
+        "cc.collect_whites_visits": self.cc_collect_whites_visits.load(Ordering::SeqCst),
+        "cc.collect_whites_walked": self.cc_collect_whites_walked.load(Ordering::SeqCst),
+        "cc.collect_blacks_walked": self.cc_collect_blacks_walked.load(Ordering::SeqCst),
         "cc.satb_map_peak": self.cc_satb_map_peak.load(Ordering::SeqCst),
         "inc.tgt_rc2": self.inc_tgt_rc2.load(Ordering::SeqCst),
         "inc.tgt_rc3": self.inc_tgt_rc3.load(Ordering::SeqCst),
@@ -751,6 +845,9 @@ impl Counters {
         "inc.slow_lt16b": self.inc_slow_lt16b.load(Ordering::SeqCst),
         "inc.slow_ge16b": self.inc_slow_ge16b.load(Ordering::SeqCst),
         "inc.deferred": self.inc_deferred.load(Ordering::SeqCst),
+        "inc.promoted_objects": self.inc_promoted_objects.load(Ordering::SeqCst),
+        "cc.live_at_cc": self.cc_live_at_cc.load(Ordering::SeqCst),
+        "cc.collections": self.cc_collections.load(Ordering::SeqCst),
         "inc.deferred_entries": self.inc_deferred_entries.load(Ordering::SeqCst),
         "inc.deferred_flushes": self.inc_deferred_flushes.load(Ordering::SeqCst),
         "cc.satb_reads": self.cc_satb_reads.load(Ordering::SeqCst),

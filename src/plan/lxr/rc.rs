@@ -97,6 +97,10 @@ pub struct ProcessIncs<VM: VMBinding, const KIND: EdgeKind> {
     /// `lxr_defer_saturated_incs`: saturated increments put in this worker's `SatIncBuf`.
     #[cfg(feature = "s_rc_stats")]
     deferred: std::cell::Cell<usize>,
+    /// Objects given their FIRST increment (`promote`): every young object that survives to its
+    /// first RC pause, LOS included.  The denominator for the cycle collector's `cc.*_walked`.
+    #[cfg(feature = "s_rc_stats")]
+    promoted: usize,
 }
 
 unsafe impl<VM: VMBinding, const KIND: EdgeKind> Send for ProcessIncs<VM, KIND> {}
@@ -155,6 +159,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
             fast: std::cell::Cell::new(0),
             #[cfg(feature = "s_rc_stats")]
             deferred: std::cell::Cell::new(0),
+            #[cfg(feature = "s_rc_stats")]
+            promoted: 0,
         }
     }
 
@@ -270,6 +276,10 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
 
     fn promote(&mut self, o: ObjectReference, copied: bool, los: bool, depth: u32) {
         o.verify::<VM>();
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.promoted += 1;
+        }
         crate::stat(|s| {
             s.promoted_objects += 1;
             s.promoted_volume += o.get_size::<VM>();
@@ -1011,6 +1021,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> GCWork<VM> for ProcessIncs<VM, KIND> {
             | self.slow_lt16b.get()
             | self.slow_ge16b.get()
             | self.deferred.get()
+            | self.promoted
             != 0
         {
             let c = crate::counters();
@@ -1025,6 +1036,9 @@ impl<VM: VMBinding, const KIND: EdgeKind> GCWork<VM> for ProcessIncs<VM, KIND> {
             c.rc_true_max.fetch_max(self.true_max.get(), Ordering::Relaxed);
             c.inc_fast.fetch_add(self.fast.get(), Ordering::Relaxed);
             c.inc_deferred.fetch_add(self.deferred.get(), Ordering::Relaxed);
+            c.inc_promoted_objects.fetch_add(self.promoted, Ordering::Relaxed);
+            crate::LIVE_PROMOTED.fetch_add(self.promoted as isize, Ordering::Relaxed);
+            self.promoted = 0;
             self.fast.set(0);
             self.deferred.set(0);
             self.slow_lt16b.set(0);
@@ -1078,6 +1092,9 @@ pub struct ProcessDecs<VM: VMBinding> {
     cm_in_progress: bool,
     mature_sweeping_in_progress: bool,
     rc: RefCountHelper<VM>,
+    /// `s_rc_stats`: objects this packet freed; subtracted from `crate::LIVE_PROMOTED` at the end.
+    #[cfg(feature = "s_rc_stats")]
+    freed: usize,
 }
 
 impl<VM: VMBinding> ProcessDecs<VM> {
@@ -1100,6 +1117,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             cm_in_progress: false,
             mature_sweeping_in_progress: false,
             rc: RefCountHelper::NEW,
+            #[cfg(feature = "s_rc_stats")]
+            freed: 0,
         }
     }
 
@@ -1116,6 +1135,8 @@ impl<VM: VMBinding> ProcessDecs<VM> {
             cm_in_progress: false,
             mature_sweeping_in_progress: false,
             rc: RefCountHelper::NEW,
+            #[cfg(feature = "s_rc_stats")]
+            freed: 0,
         }
     }
 
@@ -1167,6 +1188,10 @@ impl<VM: VMBinding> ProcessDecs<VM> {
 
     #[cold]
     fn process_dead_object(&mut self, o: ObjectReference, lxr: &LXR<VM>) -> bool {
+        #[cfg(feature = "s_rc_stats")]
+        {
+            self.freed += 1;
+        }
         crate::stat(|s| {
             s.dead_mature_objects += 1;
             s.dead_mature_volume += o.get_size::<VM>();
@@ -1431,6 +1456,11 @@ impl<VM: VMBinding> GCWork<VM> for ProcessDecs<VM> {
             }
         }
         self.flush();
+        #[cfg(feature = "s_rc_stats")]
+        {
+            crate::LIVE_PROMOTED.fetch_sub(self.freed as isize, Ordering::Relaxed);
+            self.freed = 0;
+        }
         if cfg!(feature = "rust_mem_counter") {
             crate::rust_mem_counter::DEC_BUFFER_COUNTER.sub(count);
         }
