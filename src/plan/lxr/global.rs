@@ -772,14 +772,14 @@ impl<VM: VMBinding> LXR<VM> {
     }
 
     /// Apply `n` buffered mark decrements of `o`, whose RC field read `MAX_REF_COUNT` when they
-    /// were buffered. Called from a mark worker whose buffer filled up, and when mark ends.
+    /// were buffered. Called from a mark worker whose buffer reached half occupancy (`SatIncBuf::add` returned false), and when mark ends.
     #[cfg(feature = "lxr_defer_saturated_cc_decs")]
     pub(super) fn apply_saturated_cc_decs(&self, o: ObjectReference, n: u32) {
         let _replayed = self.rc_with_overflow.dec_saturated_n(o, n);
     }
 
     /// Apply `n` buffered increments of `o`, whose RC field is saturated, as one RMW on its
-    /// excess. Called from a worker whose `SatIncBuf` filled up, and from `release()`.
+    /// excess. Called from a worker whose `SatIncBuf` reached half occupancy (`add` returned false), and from `release()`.
     #[cfg(feature = "lxr_defer_saturated_incs")]
     pub(super) fn apply_saturated_incs(&self, o: ObjectReference, n: u32) {
         let _prev = self.rc_with_overflow.inc_saturated_n(o, n);

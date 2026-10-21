@@ -6,7 +6,7 @@
 //! Here each worker instead counts its saturated increments per object in a private table, and the
 //! totals are applied with one `fetch_add(n)` per (worker, object):
 //!
-//! * when a worker's table fills up mid-pause (`SatIncBuf::add` returns `false`), and
+//! * when a worker's table is half full mid-pause (`SatIncBuf::add` returns `false`), and
 //! * once per GC for every worker, in `LXR::release`, before `ImmixSpace::release_rc`.
 //!
 //! # Why applying late is safe
@@ -47,10 +47,16 @@ use crossbeam::utils::CachePadded;
 
 use crate::util::{Address, ObjectReference};
 
-/// Table size. Power of two. 12 KiB of keys and counts per worker.
-const CAPACITY: usize = 1024;
+/// Table size. Power of two; 12 bytes of key and count per slot, per worker. Depends on the RC
+/// field width: below 8 bits far more objects saturate, so the table is 4x larger (48 KiB) to keep
+/// it from filling and flushing as often; at 8 bits or more it is 1024 (12 KiB).
+const CAPACITY: usize = if crate::util::rc::REF_COUNT_BITS >= 8 { 1024 } else { 4096 };
 const LOG_CAPACITY: u32 = CAPACITY.trailing_zeros();
-/// Linear probing gives up after this many slots and reports the table full.
+/// The table takes no new object once it holds this many: kept at half occupancy so linear-probe
+/// runs stay short on every lookup.  Counting an object already present is always allowed.
+const MAX_ENTRIES: usize = CAPACITY / 2;
+/// Linear probing gives up after this many slots and reports the table full.  At most half full
+/// this is a backstop for an unlucky cluster, not the normal trigger.
 const MAX_PROBE: usize = 16;
 
 pub struct SatIncBuf {
@@ -76,8 +82,9 @@ impl SatIncBuf {
         ((key >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - LOG_CAPACITY)) as usize
     }
 
-    /// Count one increment of `o`. Returns `false`, changing nothing, if there is no room; the
-    /// caller then drains the table and retries.
+    /// Count one increment of `o`. Returns `false`, changing nothing, if `o` is not in the table
+    /// and the table already holds `MAX_ENTRIES` objects (or the probe run is too long); the caller
+    /// then drains the table and retries.
     #[inline(always)]
     pub fn add(&mut self, o: ObjectReference) -> bool {
         let key = o.to_raw_address().as_usize();
@@ -89,6 +96,9 @@ impl SatIncBuf {
                 return true;
             }
             if k == 0 {
+                if self.used.len() >= MAX_ENTRIES {
+                    return false;
+                }
                 self.keys[i] = key;
                 self.counts[i] = 1;
                 self.used.push(i as u16);
