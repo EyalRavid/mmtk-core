@@ -11,7 +11,22 @@ use crate::{
 use atomic::Ordering;
 
 //Strong reference count constants
-pub const LOG_STRONG_REF_COUNT_BITS: usize = 2; 
+
+#[cfg(feature="s_rc_bits_2")]
+pub const LOG_STRONG_REF_COUNT_BITS: usize = 1;
+#[cfg(feature="s_rc_bits_4")]
+pub const LOG_STRONG_REF_COUNT_BITS: usize = 2;
+#[cfg(feature="s_rc_bits_8")]
+pub const LOG_STRONG_REF_COUNT_BITS: usize = 3;
+
+// default
+#[cfg(not(any(
+    feature="s_rc_bits_2",
+    feature="s_rc_bits_4",
+    feature="s_rc_bits_8",
+)))]
+pub const LOG_STRONG_REF_COUNT_BITS: usize = 2; // default to 4 bits
+
 pub const STRONG_REF_COUNT_BITS: u8 = 1 << LOG_STRONG_REF_COUNT_BITS;
 pub const STRONG_REF_COUNT_MASK: u8 = (((1u16 << STRONG_REF_COUNT_BITS) - 1) & 0xff) as u8;
 pub const MAX_STRONG_REF_COUNT: u8 = STRONG_REF_COUNT_MASK;
@@ -412,9 +427,10 @@ pub mod cc {
     /// As [`super::RefCountHelper::inc_exclusive`]: the caller must be the only thread writing this
     /// entry for the duration of the call.
     ///
-    /// **The contract here is stronger than that one.**  `STRONG_RC_TABLE` is 4 bits per entry
-    /// (`LOG_STRONG_REF_COUNT_BITS = 2`), so **two adjacent objects share a byte**, and one nibble
-    /// cannot be written without rewriting the other object's nibble along with it.
+    /// **The contract here is stronger than that one.**  `STRONG_RC_TABLE` is 4 bits per entry by
+    /// default (`LOG_STRONG_REF_COUNT_BITS = 2`; 2 with `s_rc_bits_2`), so **adjacent objects share
+    /// a byte**, and one entry cannot be written without rewriting its neighbours' along with it.
+    /// (With `s_rc_bits_8` each object owns its byte, but the contract below is kept regardless.)
     /// `SideMetadataSpec::store_atomic_exclusive` does that read-merge-write with no CAS, so a
     /// concurrent write to the *neighbouring* object's strong count would be silently lost.  The
     /// caller must therefore guarantee no other thread writes **any entry in the same byte** — in

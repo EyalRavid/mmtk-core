@@ -945,8 +945,8 @@ impl<VM: VMBinding> CycleTraversal<VM>{
                 
                 let s_rc = self.rc.count(curr) - 1;
                 // SAFETY: single-threaded CycleFullRC -- see the impl header.  Note the
-                // obligation here is the *wider* one: `STRONG_RC_TABLE` is 4 bits per entry, so
-                // two adjacent objects share a byte and the exclusive store is a read-merge-write
+                // obligation here is the *wider* one: `STRONG_RC_TABLE` is 4 bits per entry by
+                // default (`s_rc_bits_*`), so adjacent objects share a byte and the exclusive store is a read-merge-write
                 // of that byte with no CAS.  No other thread may write *any* entry in the same
                 // byte -- in practice, nothing else may write this table at all.  That holds only
                 // because `ProcessDecs` has fully drained under the `decs -> sweep -> cc` order;
