@@ -7,7 +7,18 @@
 //! totals are applied with one `fetch_add(n)` per (worker, object):
 //!
 //! * when a worker's table is half full mid-pause (`SatIncBuf::add` returns `false`), and
-//! * once per GC for every worker, in `LXR::release`, before `ImmixSpace::release_rc`.
+//! * once per GC for every worker, at the end of the pause. With the 1024-slot table (RC field of
+//!   8 bits or more) `LXR::release` drains every table itself, on one thread. With a larger table
+//!   ([`PARALLEL_FLUSH`]) it instead adds one [`SatIncFlush`] packet per non-empty table to the
+//!   `Release` bucket, so the GC threads drain them in parallel, still inside the pause.
+//!
+//! The parallel flush keeps the same order as the old serial drain in `LXR::release`: `Release`
+//! opens only after every `ProcessIncs` has finished (all workers parked with every open bucket
+//! empty), and every reader of the true count comes later -- a `RefCount` pause's decrements are
+//! released only when the pause ends (`on_gc_finished`), which cannot happen while `Release` holds
+//! packets; `FullRC` (or STW) decrements run in `STWRCDecsAndSweep`, and `sanity` in `Final`, both
+//! stages that open only after `Release` is empty. Each packet owns one worker's table, so no two
+//! packets touch the same table.
 //!
 //! # Why applying late is safe
 //!
@@ -45,7 +56,11 @@ use std::cell::UnsafeCell;
 
 use crossbeam::utils::CachePadded;
 
+use super::LXR;
+use crate::scheduler::{GCWork, GCWorker};
 use crate::util::{Address, ObjectReference};
+use crate::vm::VMBinding;
+use crate::MMTK;
 
 /// Table size. Power of two; 12 bytes of key and count per slot, per worker. Depends on the RC
 /// field width: below 8 bits far more objects saturate, so the table is 4x larger (48 KiB) to keep
@@ -55,6 +70,10 @@ const LOG_CAPACITY: u32 = CAPACITY.trailing_zeros();
 /// The table takes no new object once it holds this many: kept at half occupancy so linear-probe
 /// runs stay short on every lookup.  Counting an object already present is always allowed.
 const MAX_ENTRIES: usize = CAPACITY / 2;
+/// Whether the end-of-pause flush is split into one `SatIncFlush` packet per table. At 1024 slots
+/// or fewer (at most 512 entries per table) one thread drains everything in `LXR::release`; with
+/// the 4096-slot table (RC field below 8 bits) the tables are large enough to split.
+pub const PARALLEL_FLUSH: bool = CAPACITY > 1024;
 /// Linear probing gives up after this many slots and reports the table full.  At most half full
 /// this is a backstop for an unlucky cluster, not the normal trigger.
 const MAX_PROBE: usize = 16;
@@ -109,7 +128,6 @@ impl SatIncBuf {
         false
     }
 
-    #[cfg(debug_assertions)]
     pub fn is_empty(&self) -> bool {
         self.used.is_empty()
     }
@@ -171,9 +189,50 @@ impl SatIncBuffers {
         }
     }
 
+    /// Ordinals of the buffers that hold anything, under the same rule as `drain_all`.
+    pub unsafe fn non_empty(&self) -> Vec<usize> {
+        (0..self.bufs.len())
+            .filter(|&i| !(*self.bufs[i].get()).is_empty())
+            .collect()
+    }
+
+    /// Drain one worker's buffer into `f`.
+    ///
+    /// # Safety
+    ///
+    /// As `drain_all`, for this buffer, and no other thread may drain it at the same time
+    /// ([`SatIncFlush`] packets each own one ordinal).
+    pub unsafe fn drain_one(&self, ordinal: usize, f: impl FnMut(ObjectReference, u32)) {
+        (*self.bufs[ordinal].get()).drain(f);
+    }
+
     /// True if every buffer is empty. For debug assertions, under the same rule as `drain_all`.
     #[cfg(debug_assertions)]
     pub unsafe fn all_empty(&self) -> bool {
         self.bufs.iter().all(|b| (*b.get()).is_empty())
+    }
+}
+
+/// Apply one worker's buffered saturated increments at the end of the pause, in the `Release`
+/// bucket. One packet per non-empty table (see the module doc for why the order is safe).
+pub struct SatIncFlush {
+    ordinal: usize,
+}
+
+impl SatIncFlush {
+    pub fn new(ordinal: usize) -> Self {
+        Self { ordinal }
+    }
+}
+
+impl<VM: VMBinding> GCWork<VM> for SatIncFlush {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
+        // SAFETY: `Release` -- no `ProcessIncs` is running or runnable, and this ordinal belongs
+        // to this packet alone.
+        unsafe {
+            lxr.sat_incs
+                .drain_one(self.ordinal, |o, n| lxr.apply_saturated_incs(o, n))
+        };
     }
 }

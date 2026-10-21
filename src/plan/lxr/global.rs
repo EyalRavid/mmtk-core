@@ -143,7 +143,9 @@ pub struct LXR<VM: VMBinding> {
     pub satb_map : DashMap<VM::VMSlot, Option<ObjectReference>>,
     pub in_cycle_collection: AtomicBool,
     pub rc_with_overflow: RefCountWithOverflow<VM>,
-    /// Saturated increments buffered per worker during the pause, applied in `release()`.
+    /// Saturated increments buffered per worker during the pause, applied at the end of the pause
+    /// by `release()` itself, or, for a table larger than 1024 slots, by the `SatIncFlush` packets
+    /// it adds to the `Release` bucket (`sat_inc_buf::PARALLEL_FLUSH`).
     #[cfg(feature = "lxr_defer_saturated_incs")]
     pub(super) sat_incs: super::sat_inc_buf::SatIncBuffers,
     /// Saturated decrements buffered per worker by the cycle collector's mark, applied when mark
@@ -482,15 +484,27 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             "    - ({:.3}ms) ix release start",
             crate::gc_start_time_ms(),
         );
-        // Apply the saturated increments buffered during this pause. MUST precede `release_rc`:
-        // for `FullRC` that call is what moves this pause's decrements into a runnable bucket
-        // (`process_lazy_decrement_packets`), and for `RefCount` they stay postponed until
-        // `on_gc_finished`. Every `ProcessIncs` has finished: `Release` opened only after all
-        // workers parked with every open bucket, `Unconstrained` included, empty.
+        // Apply the saturated increments buffered during this pause: on this thread for the
+        // 1024-slot table, or in parallel for a larger one (`sat_inc_buf::PARALLEL_FLUSH`), one
+        // `SatIncFlush` per non-empty table in this (`Release`) bucket. Every `ProcessIncs` has
+        // finished: `Release` opened only after all workers parked with every open bucket,
+        // `Unconstrained` included, empty. Every decrement comes later: `RefCount` decrements stay
+        // postponed until `on_gc_finished`, which waits for `Release` to drain, and `FullRC` (or
+        // STW) decrements run in `STWRCDecsAndSweep`, which opens after it (`sat_inc_buf.rs`).
         #[cfg(feature = "lxr_defer_saturated_incs")]
-        unsafe {
-            self.sat_incs
-                .drain_all(|o, n| self.apply_saturated_incs(o, n));
+        if !super::sat_inc_buf::PARALLEL_FLUSH {
+            // SAFETY: as above, no `ProcessIncs` is running or runnable.
+            unsafe {
+                self.sat_incs
+                    .drain_all(|o, n| self.apply_saturated_incs(o, n));
+            }
+        } else {
+            // SAFETY: as above, no `ProcessIncs` is running or runnable.
+            let tables = unsafe { self.sat_incs.non_empty() };
+            let bucket = &self.immix_space.scheduler().work_buckets[WorkBucketStage::Release];
+            for ordinal in tables {
+                bucket.add(super::sat_inc_buf::SatIncFlush::new(ordinal));
+            }
         }
         self.immix_space.release_rc(pause);
         self.update_fixed_alloc_trigger();
@@ -779,7 +793,7 @@ impl<VM: VMBinding> LXR<VM> {
     }
 
     /// Apply `n` buffered increments of `o`, whose RC field is saturated, as one RMW on its
-    /// excess. Called from a worker whose `SatIncBuf` reached half occupancy (`add` returned false), and from `release()`.
+    /// excess. Called from a worker whose `SatIncBuf` reached half occupancy (`add` returned false), and by the `SatIncFlush` packets at the end of the pause.
     #[cfg(feature = "lxr_defer_saturated_incs")]
     pub(super) fn apply_saturated_incs(&self, o: ObjectReference, n: u32) {
         let _prev = self.rc_with_overflow.inc_saturated_n(o, n);
