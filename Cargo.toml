@@ -108,7 +108,6 @@ default = [
     "immix_non_moving",
     "lxr_defer_saturated_incs",
     "lxr_defer_saturated_cc_decs",
-    #"graph_project",
     #"lxr_rc_path_stats",
 ]
 
@@ -193,6 +192,7 @@ lxr_rc_bits_8 = []
 lxr_rc_bits_16 = []
 lxr_rc_bits_32 = []
 lxr_rc_bits_64 = []
+s_rc_bits_1 = []
 s_rc_bits_2 = []
 s_rc_bits_4 = []
 s_rc_bits_8 = []

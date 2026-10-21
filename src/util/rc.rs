@@ -12,6 +12,8 @@ use atomic::Ordering;
 
 //Strong reference count constants
 
+#[cfg(feature="s_rc_bits_1")]
+pub const LOG_STRONG_REF_COUNT_BITS: usize = 0;
 #[cfg(feature="s_rc_bits_2")]
 pub const LOG_STRONG_REF_COUNT_BITS: usize = 1;
 #[cfg(feature="s_rc_bits_4")]
@@ -21,6 +23,7 @@ pub const LOG_STRONG_REF_COUNT_BITS: usize = 3;
 
 // default
 #[cfg(not(any(
+    feature="s_rc_bits_1",
     feature="s_rc_bits_2",
     feature="s_rc_bits_4",
     feature="s_rc_bits_8",
