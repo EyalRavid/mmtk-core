@@ -10,7 +10,9 @@
 //! * once per GC for every worker, at the end of the pause. With the 1024-slot table (RC field of
 //!   8 bits or more) `LXR::release` drains every table itself, on one thread. With a larger table
 //!   ([`PARALLEL_FLUSH`]) it instead adds one [`SatIncFlush`] packet per non-empty table to the
-//!   `Release` bucket, so the GC threads drain them in parallel, still inside the pause.
+//!   `Release` bucket, so the GC threads drain them in parallel, still inside the pause --
+//!   unless `lxr_sat_incs_serial_flush` is on, which keeps the one-thread drain at every table
+//!   size (the table itself stays 4096 slots below 8 RC bits).
 //!
 //! The parallel flush keeps the same order as the old serial drain in `LXR::release`: `Release`
 //! opens only after every `ProcessIncs` has finished (all workers parked with every open bucket
@@ -73,7 +75,10 @@ const MAX_ENTRIES: usize = CAPACITY / 2;
 /// Whether the end-of-pause flush is split into one `SatIncFlush` packet per table. At 1024 slots
 /// or fewer (at most 512 entries per table) one thread drains everything in `LXR::release`; with
 /// the 4096-slot table (RC field below 8 bits) the tables are large enough to split.
-pub const PARALLEL_FLUSH: bool = CAPACITY > 1024;
+/// `lxr_sat_incs_serial_flush` forces the one-thread drain for every table size, e.g. to compare
+/// the two under `lxr_rc_bits_4`. It changes only who applies the totals, not when: both drain in
+/// `Release`, before any decrement (see the module docs).
+pub const PARALLEL_FLUSH: bool = CAPACITY > 1024 && !cfg!(feature = "lxr_sat_incs_serial_flush");
 /// Linear probing gives up after this many slots and reports the table full.  At most half full
 /// this is a backstop for an unlucky cluster, not the normal trigger.
 const MAX_PROBE: usize = 16;

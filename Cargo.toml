@@ -263,6 +263,11 @@ lxr_rc_path_stats = []
 # of doing an atomic fetch_add on OVERFLOW_RC_TABLE; the totals are applied once per GC in
 # `LXR::release`, before any decrement can start (~/mmtk/SATURATED_INCS_DEFERRAL_PLAN.md, stage S1).
 lxr_defer_saturated_incs = []
+# With lxr_defer_saturated_incs: drain every worker's table on one thread at the end of the pause
+# (in `LXR::release`) even when the table is 4096 slots (RC field below 8 bits, e.g. lxr_rc_bits_4),
+# instead of one parallel `SatIncFlush` packet per table. No effect at 8 RC bits or more, where the
+# flush is already single-threaded. No effect without lxr_defer_saturated_incs.
+lxr_sat_incs_serial_flush = []
 # Cycle collector mark: a decrement that finds the RC field saturated adds 1 to a per-worker table
 # (the same `SatIncBuf` as above) instead of a CAS on OVERFLOW_RC_TABLE; the totals are applied
 # when the mark phase ends, before scan reads any count (`LXR::on_lazy_mark_finished`, and after

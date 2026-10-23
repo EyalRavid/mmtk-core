@@ -485,7 +485,8 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             crate::gc_start_time_ms(),
         );
         // Apply the saturated increments buffered during this pause: on this thread for the
-        // 1024-slot table, or in parallel for a larger one (`sat_inc_buf::PARALLEL_FLUSH`), one
+        // 1024-slot table (or any table under `lxr_sat_incs_serial_flush`), or in parallel for a
+        // larger one (`sat_inc_buf::PARALLEL_FLUSH`), one
         // `SatIncFlush` per non-empty table in this (`Release`) bucket. Every `ProcessIncs` has
         // finished: `Release` opened only after all workers parked with every open bucket,
         // `Unconstrained` included, empty. Every decrement comes later: `RefCount` decrements stay
